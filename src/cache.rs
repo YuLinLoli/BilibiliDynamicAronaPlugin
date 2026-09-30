@@ -5,11 +5,11 @@
 //! 缓存的意义在网络而不是磁盘：一条动态九张图、一个群几十个目标，
 //! 每轮检测都从 B 站图床重拉一遍既慢又容易被限流。
 //!
-//! 与原插件的两处不同，都记进 README：
-//! * 表情（`EMOJI`）没有单独一路。B 站动态里的表情是正文节点里的图片地址，
-//!   这里和配图走同一份缓存（`IMAGES`）；配置里那一项仍然生效——目录存在就照它清。
+//! 与原插件的一处不同，记进 README：
 //! * 卡片画好之后也写进 `DRAW`，于是重复看同一条动态（`/bili search`、链接解析）
-//!   不必重画一遍。
+//!   不必重画一遍。原插件只缓存素材，不缓存成品卡。
+//! * `OTHER` 这一路本插件没有对应素材（番剧封面、直播封面都归 `IMAGES`），
+//!   配置项留着是为了和原插件的键一致，清不到东西也不报错。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -18,8 +18,10 @@ use std::time::{Duration, SystemTime};
 
 /// 画好的动态/直播卡片
 pub(crate) const DRAW: &str = "DRAW";
-/// 动态配图与表情
+/// 动态配图、各种封面
 pub(crate) const IMAGES: &str = "IMAGES";
+/// 正文里的表情（`[笑]` 那种）
+pub(crate) const EMOJI: &str = "EMOJI";
 /// UP 主头像
 pub(crate) const USER: &str = "USER";
 

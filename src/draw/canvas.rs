@@ -44,24 +44,6 @@ impl Color {
         }
     }
 
-    /// 配置里 `"#aabbcc;#ddeeff"` 这种两色写法：取第 index 个（只有一个色时两处都用它）。
-    /// 分号接受半角与全角两种，与原插件一致。
-    pub fn parse_pair(text: &str, index: usize) -> Color {
-        let normalized = text.replace('；', ";");
-        let parts: Vec<&str> = normalized
-            .split(';')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect();
-        let pick = if parts.len() > 1 {
-            parts.get(index).or(parts.first()).copied()
-        } else {
-            parts.first().copied()
-        };
-        pick.and_then(Color::parse)
-            .unwrap_or_else(|| Color::rgb(211, 237, 250))
-    }
-
     /// 按 t(0.0~1.0) 在两色之间线性插值
     pub fn mix(self, other: Color, t: f32) -> Color {
         let t = t.clamp(0.0, 1.0);
@@ -72,20 +54,6 @@ impl Color {
             at(self.0[2], other.0[2]),
             at(self.0[3], other.0[3]),
         ])
-    }
-
-    /// 调亮（amount>0）或压暗（amount<0），-1.0~1.0
-    pub fn shade(self, amount: f32) -> Color {
-        let f = |v: u8| {
-            if amount >= 0.0 {
-                (v as f32 + (255.0 - v as f32) * amount)
-                    .round()
-                    .clamp(0.0, 255.0) as u8
-            } else {
-                (v as f32 * (1.0 + amount)).round().clamp(0.0, 255.0) as u8
-            }
-        };
-        Color([f(self.0[0]), f(self.0[1]), f(self.0[2]), self.0[3]])
     }
 
     /// HSV 里的 H/S/B 换色：颜色生成器按 UID 取色相用得上
@@ -152,20 +120,12 @@ impl Canvas {
         }
     }
 
-    pub fn from_image(image: RgbaImage) -> Canvas {
-        Canvas { image }
-    }
-
     pub fn width(&self) -> u32 {
         self.image.width()
     }
 
     pub fn height(&self) -> u32 {
         self.image.height()
-    }
-
-    pub fn image(&self) -> &RgbaImage {
-        &self.image
     }
 
     /// 不判界的写入，公开方法都走它
@@ -241,6 +201,8 @@ impl Canvas {
     }
 
     /// 圆角边框：落在"外层圆角内 && 内缩框外"的差集上
+    // 落点、尺寸、圆角、线宽、颜色本来就该一次说全，包成结构体只是多一层搬运
+    #[allow(clippy::too_many_arguments)]
     pub fn stroke_round_rect(
         &mut self,
         x: u32,
@@ -360,6 +322,8 @@ impl Canvas {
         self.paste_area(x, y, src, 0, 0, src.width(), src.height());
     }
 
+    // 目标落点两个数、源矩形四个数，这就是贴图本身
+    #[allow(clippy::too_many_arguments)]
     pub fn paste_area(
         &mut self,
         x: u32,
@@ -385,27 +349,7 @@ impl Canvas {
         }
     }
 
-    /// 缩放后贴进目标框（不保持比例，调用方负责算好框）
-    pub fn paste_stretch(&mut self, x: u32, y: u32, width: u32, height: u32, src: &RgbaImage) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        let scaled = resize(src, width, height);
-        self.paste(x, y, &scaled);
-    }
-
-    /// 居中裁剪后贴满目标框：封面图用这个，不变形也不留白
-    pub fn paste_cover(&mut self, x: u32, y: u32, width: u32, height: u32, src: &RgbaImage) {
-        let Some((sw, sh)) = fit_cover(src.width(), src.height(), width, height) else {
-            return;
-        };
-        let scaled = resize(src, sw, sh);
-        let offset_x = (sw - width) / 2;
-        let offset_y = (sh - height) / 2;
-        self.paste_area(x, y, &scaled, offset_x, offset_y, width, height);
-    }
-
-    /// 圆角裁剪后贴进目标框：卡片里的图片都长这样
+    /// 居中裁剪后贴进目标框：卡片里的图片都长这样（圆角给 none 就是直角）
     pub fn paste_cover_rounded(
         &mut self,
         x: u32,
@@ -443,26 +387,6 @@ impl Canvas {
         }
         out.into_inner()
     }
-}
-
-/// 等比缩放到不超过框（长边贴合），任一边为 0 时给 None
-pub fn fit_inside(
-    source_width: u32,
-    source_height: u32,
-    box_width: u32,
-    box_height: u32,
-) -> Option<(u32, u32)> {
-    if source_width == 0 || source_height == 0 || box_width == 0 || box_height == 0 {
-        return None;
-    }
-    let scale = (box_width as f32 / source_width as f32)
-        .min(box_height as f32 / source_height as f32)
-        .min(1.0f32)
-        .max(f32::MIN_POSITIVE);
-    Some((
-        (source_width as f32 * scale).round().max(1.0) as u32,
-        (source_height as f32 * scale).round().max(1.0) as u32,
-    ))
 }
 
 /// 等比缩放到刚好盖住框（短边贴合），裁剪贴图用
@@ -578,24 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn gradient_pair_accepts_both_semicolons() {
-        let pair = Color::parse_pair("#112233;#445566", 1);
-        assert_eq!(pair, Color::rgb(0x44, 0x55, 0x66));
-        assert_eq!(
-            Color::parse_pair("#112233；#445566", 1),
-            Color::rgb(0x44, 0x55, 0x66)
-        );
-        assert_eq!(
-            Color::parse_pair("#112233", 1),
-            Color::rgb(0x11, 0x22, 0x33)
-        );
-        assert_eq!(
-            Color::parse_pair("#112233;", 1),
-            Color::rgb(0x11, 0x22, 0x33)
-        );
-    }
-
-    #[test]
     fn hsb_matches_the_billibili_blue() {
         let color = Color::from_hsb(204.0, 0.66, 0.95);
         // 只验个方向：B 站主色相在蓝色那一侧，红通道必须比蓝通道暗
@@ -606,8 +512,8 @@ mod tests {
     fn rounded_fill_leaves_the_corners_untouched() {
         let mut canvas = Canvas::new(20, 20, Color::rgb(0, 0, 0));
         canvas.fill_round_rect(0, 0, 20, 20, Corners::all(10.0), Color::rgb(255, 255, 255));
-        assert_eq!(canvas.image().get_pixel(0, 0).0[0], 0, "左上角该留在底色上");
-        assert_eq!(canvas.image().get_pixel(10, 10).0[0], 255, "圆心必须被填上");
+        assert_eq!(canvas.image.get_pixel(0, 0).0[0], 0, "左上角该留在底色上");
+        assert_eq!(canvas.image.get_pixel(10, 10).0[0], 255, "圆心必须被填上");
     }
 
     #[test]
@@ -634,23 +540,19 @@ mod tests {
     fn stroke_paints_the_band_and_leaves_the_hollow() {
         let mut canvas = Canvas::new(20, 20, Color::rgb(0, 0, 0));
         canvas.stroke_round_rect(0, 0, 20, 20, Corners::none(), 2, Color::rgb(255, 255, 255));
-        assert_eq!(canvas.image().get_pixel(0, 10).0[0], 255, "顶边该描到");
-        assert_eq!(canvas.image().get_pixel(2, 10).0[0], 0, "内缩两像素就该空");
-        assert_eq!(canvas.image().get_pixel(10, 10).0[0], 0, "中心不该动");
-        assert_eq!(canvas.image().get_pixel(19, 19).0[0], 255, "右下角该描到");
+        assert_eq!(canvas.image.get_pixel(0, 10).0[0], 255, "顶边该描到");
+        assert_eq!(canvas.image.get_pixel(2, 10).0[0], 0, "内缩两像素就该空");
+        assert_eq!(canvas.image.get_pixel(10, 10).0[0], 0, "中心不该动");
+        assert_eq!(canvas.image.get_pixel(19, 19).0[0], 255, "右下角该描到");
     }
 
     #[test]
     fn cover_crop_fills_the_box() {
         let src = ImageBuffer::from_pixel(200, 100, Rgba([10, 20, 30, 255]));
         let mut canvas = Canvas::new(50, 50, Color::rgb(0, 0, 0));
-        canvas.paste_cover(0, 0, 50, 50, &src);
+        canvas.paste_cover_rounded(0, 0, 50, 50, Corners::none(), &src);
         for (x, y) in [(0u32, 0u32), (49, 0), (0, 49), (49, 49)] {
-            assert_eq!(
-                canvas.image().get_pixel(x, y).0[0],
-                10,
-                "({x},{y}) 没被盖住"
-            );
+            assert_eq!(canvas.image.get_pixel(x, y).0[0], 10, "({x},{y}) 没被盖住");
         }
     }
 
@@ -659,7 +561,7 @@ mod tests {
         let mut canvas = Canvas::new(4, 4, Color::rgb(1, 1, 1));
         canvas.fill_rect(2, 2, 100, 100, Color::rgb(9, 9, 9));
         canvas.paste(3, 3, &ImageBuffer::from_pixel(5, 5, Rgba([7, 7, 7, 255])));
-        assert_eq!(canvas.image().get_pixel(3, 3).0, [7, 7, 7, 255]);
+        assert_eq!(canvas.image.get_pixel(3, 3).0, [7, 7, 7, 255]);
         assert_eq!(canvas.width(), 4);
     }
 

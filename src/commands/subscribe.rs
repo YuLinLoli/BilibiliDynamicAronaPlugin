@@ -126,10 +126,10 @@ async fn relation_guard(call: &Call, bili: &Bili, uid: i64) -> Result<(), String
             bili.follow(uid)
                 .await
                 .map_err(|reason| format!("关注失败: {reason}"))?;
-            if !account.follow_group.is_empty() {
-                if let Err(reason) = move_to_tag(bili, uid, &account.follow_group).await {
-                    arona::runtime::log::warning(format!("bilibili：移动分组失败：{reason}"));
-                }
+            if !account.follow_group.is_empty()
+                && let Err(reason) = move_to_tag(bili, uid, &account.follow_group).await
+            {
+                arona::runtime::log::warning(format!("bilibili：移动分组失败：{reason}"));
             }
             arona::runtime::log::info(format!("bilibili：账号已关注 {uid}"));
             Ok(())
@@ -217,23 +217,21 @@ pub(crate) async fn del(call: &Call) -> Reply {
     if let Some((kind, id)) = season_id(&raw) {
         return drop_season(call, &targets, kind, id).await;
     }
-    match match_uid(&raw) {
-        Match::None => reply("未匹配到用户哦"),
-        Match::Many(found) => reply(format!("有多个匹配项：\n{}", found.join("\n"))),
-        Match::One(uid) => {
-            if !already(&targets, uid) {
-                return reply("还未订阅此人哦");
-            }
-            let name = names(uid);
-            crate::store().write(|data| {
-                data.unsubscribe(&targets.keys, uid);
-                if let Some(cluster) = &targets.cluster {
-                    data.unfollow_cluster(cluster, uid);
-                }
-            });
-            reply(format!("{}取消订阅 {name} 成功", targets.grant()))
-        }
+    let uid = match match_uid(&raw) {
+        Match::One(uid) => uid,
+        found => return reply(found.explain().unwrap_or_default()),
+    };
+    if !already(&targets, uid) {
+        return reply("还未订阅此人哦");
     }
+    let name = names(uid);
+    crate::store().write(|data| {
+        data.unsubscribe(&targets.keys, uid);
+        if let Some(cluster) = &targets.cluster {
+            data.unfollow_cluster(cluster, uid);
+        }
+    });
+    reply(format!("{}取消订阅 {name} 成功", targets.grant()))
 }
 
 /// 取消追番：`ep` 那一路原插件也做不到（集数号换算不出唯一的季号），文案照抄
@@ -404,22 +402,20 @@ pub(crate) async fn list_user(call: &Call) -> Reply {
             keys.into_iter().collect::<Vec<String>>(),
         )
     } else {
-        match match_uid(&raw) {
-            Match::None => return reply("未匹配到用户哦"),
-            Match::Many(found) => return reply(format!("有多个匹配项：\n{}", found.join("\n"))),
-            Match::One(uid) => {
-                let known = crate::store().read(|data| {
-                    data.names.contains_key(&uid.to_string())
-                        || data.targets.values().any(|state| state.subs.contains(&uid))
-                });
-                if !known {
-                    return reply(format!("没有这个用户哦 [{uid}]"));
-                }
-                let name = names(uid);
-                let keys = crate::store().read(|data| data.targets_of(uid));
-                (format!("{name}[{uid}]"), keys)
-            }
+        let uid = match match_uid(&raw) {
+            Match::One(uid) => uid,
+            found => return reply(found.explain().unwrap_or_default()),
+        };
+        let known = crate::store().read(|data| {
+            data.names.contains_key(&uid.to_string())
+                || data.targets.values().any(|state| state.subs.contains(&uid))
+        });
+        if !known {
+            return reply(format!("没有这个用户哦 [{uid}]"));
         }
+        let name = names(uid);
+        let keys = crate::store().read(|data| data.targets_of(uid));
+        (format!("{name}[{uid}]"), keys)
     };
     let clusters = crate::store().read(|data| {
         data.follows

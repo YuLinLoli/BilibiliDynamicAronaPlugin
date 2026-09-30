@@ -2,7 +2,7 @@
 //!
 //! 这是 mirai 插件 `Colter23/bilibili-dynamic-mirai-plugin` 的 Arona 重写版：
 //! 功能面（订阅 UP 主动态与直播、番剧订阅、类型/正则双过滤器、@全体、分组、模板推送、
-//! 卡片绘图、扫码登录、链接解析、图片缓存清理、`/bili` 那一整棵子命令树）都对齐原插件，
+//! 卡片绘图、扫码登录、链接解析、机翻补译文、图片缓存清理、`/bili` 那一整棵子命令树）都对齐原插件，
 //! 但**不依赖任何前置插件**——原插件要 chat-command 才能解析命令、要 mirai-skia-plugin 才能绘图，
 //! 这里命令走框架的分发器，绘图用纯 Rust 的 image + fontdue 在插件里画完再交框架发图。
 //!
@@ -22,6 +22,7 @@ mod link;
 mod push;
 mod store;
 mod tasks;
+mod translate;
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};

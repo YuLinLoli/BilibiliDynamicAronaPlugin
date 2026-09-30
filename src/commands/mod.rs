@@ -414,9 +414,7 @@ fn help(call: &Call) -> Reply {
         });
     }
     out.push(String::new());
-    out.push(format!(
-        "[目标] 留空就是当前会话；可以写群号/好友号，也可以写分组名。配置改动即时生效，只有改名要重启。"
-    ));
+    out.push("[目标] 留空就是当前会话；可以写群号/好友号，也可以写分组名。配置改动即时生效，只有改名要重启。".to_string());
     lines(&out)
 }
 
@@ -565,14 +563,6 @@ impl Call {
                 .map_err(|_| "UID 要写数字，留空表示对该目标的全部订阅都生效".to_string()),
         }
     }
-
-    /// `[UP主UID|名字]` 这一档：数字直接用，名字在本地名单里模糊找。留空即 `0`。
-    pub(crate) fn matched_uid(&self, index: usize) -> Match {
-        match self.arg(index) {
-            None => Match::One(0),
-            Some(raw) => match_uid(raw),
-        }
-    }
 }
 
 /// 一条命令要操作的那批目标
@@ -620,15 +610,6 @@ impl Targets {
             return self.keys[0].clone();
         }
         format!("{}（共 {} 个目标）", self.keys.join("、"), self.keys.len())
-    }
-
-    /// 只在单个目标上生效的命令用它取那一个键
-    pub(crate) fn single(&self) -> Option<String> {
-        match self.keys.as_slice() {
-            [only] => Some(only.clone()),
-            [] => Some(self.current.clone()),
-            _ => None,
-        }
     }
 
     /// 写操作落地的目标键。分组还没加成员时 `keys` 是空的，这里给一句人话，
@@ -699,12 +680,13 @@ pub(crate) enum Match {
 }
 
 impl Match {
-    /// 命中一个就交给 `then`，否则给一句回话
-    pub(crate) fn then_with(self, then: impl FnOnce(i64) -> Reply) -> Reply {
+    /// 没命中或命中多个时该回的那句；命中一个给 None。
+    /// 三处命令都要这句话，写在一处才不会各写各的。
+    pub(crate) fn explain(&self) -> Option<String> {
         match self {
-            Match::One(uid) => then(uid),
-            Match::None => reply("未匹配到用户哦"),
-            Match::Many(names) => reply(format!("有多个匹配项：\n{}", names.join("\n"))),
+            Match::One(_) => None,
+            Match::None => Some("未匹配到用户哦".to_string()),
+            Match::Many(found) => Some(format!("有多个匹配项：\n{}", found.join("\n"))),
         }
     }
 }

@@ -235,6 +235,11 @@ mod tests {
         let stops = background("#112233;#445566", 30.0, false, 0.25, 1.0);
         assert_eq!(stops.len(), 2);
         assert_eq!(stops[0], Color::rgb(0x11, 0x22, 0x33));
+        // 全角分号也得认：中文输入法下打出来的配置是这个字符
+        assert_eq!(
+            background("#112233；#445566", 30.0, false, 0.25, 1.0),
+            stops
+        );
     }
 
     #[test]

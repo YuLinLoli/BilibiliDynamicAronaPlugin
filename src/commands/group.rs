@@ -43,14 +43,16 @@ fn failed(fail: &str, verb: &str) -> String {
 
 /// `/bili create <分组名>`
 pub(crate) fn create(call: &Call) -> Reply {
-    let Some(name) = call.arg(0) else {
+    // 分组名可以带空格：框架按空格切参数，这里把剩下的 token 拼回去
+    let name = call.rest(0);
+    if name.is_empty() {
         return reply(usage_str(call, super::Cmd::Create));
-    };
+    }
     if name.chars().all(|ch| ch.is_ascii_digit()) {
         return reply("分组名不能全为数字");
     }
     let creator = call.current_id();
-    let created = crate::store().write(|data| data.create_cluster(name, creator));
+    let created = crate::store().write(|data| data.create_cluster(&name, creator));
     reply(if created {
         "创建成功"
     } else {
@@ -62,7 +64,8 @@ pub(crate) fn create(call: &Call) -> Reply {
 pub(crate) fn list(call: &Call) -> Reply {
     let operator = call.current_id();
     let admin = call.is_bot_admin();
-    let Some(name) = call.arg(0) else {
+    let name = call.rest(0);
+    if name.is_empty() {
         let lines = crate::store().read(|data| {
             data.clusters
                 .iter()
@@ -74,11 +77,11 @@ pub(crate) fn list(call: &Call) -> Reply {
             return reply("没有创建或管理任何分组哦");
         }
         return reply(lines.join("\n"));
-    };
+    }
     let found = crate::store().read(|data| {
-        let cluster = data.clusters.get(name)?;
+        let cluster = data.clusters.get(&name)?;
         Some(ClusterText {
-            name: name.to_string(),
+            name: name.clone(),
             creator: cluster.creator,
             admins: cluster
                 .admins
@@ -156,13 +159,14 @@ fn owner_only(call: &Call, name: &str, denied: &str) -> Result<(), String> {
 
 /// `/bili delgroup <分组名>`
 pub(crate) fn remove(call: &Call) -> Reply {
-    let Some(name) = call.arg(0) else {
+    let name = call.rest(0);
+    if name.is_empty() {
         return reply(usage_str(call, super::Cmd::DelGroup));
-    };
-    if let Err(reason) = owner_only(call, name, "无权删除") {
+    }
+    if let Err(reason) = owner_only(call, &name, "无权删除") {
         return reply(reason);
     }
-    let gone = crate::store().write(|data| data.remove_cluster(name));
+    let gone = crate::store().write(|data| data.remove_cluster(&name));
     reply(if gone {
         "删除成功"
     } else {

@@ -453,8 +453,9 @@ async fn show(call: &Call, bili: &Arc<Bili>, dynamic: &Dynamic) -> Reply {
 fn one_uid(raw: &str) -> Result<i64, String> {
     match match_uid(raw) {
         Match::One(uid) => Ok(uid),
-        Match::None => Err("未匹配到用户哦".to_string()),
-        Match::Many(names) => Err(format!("有多个匹配项：\n{}", names.join("\n"))),
+        found => Err(found
+            .explain()
+            .unwrap_or_else(|| "未匹配到用户哦".to_string())),
     }
 }
 

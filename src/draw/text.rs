@@ -64,14 +64,6 @@ impl Flow {
     pub fn rows(&self) -> usize {
         self.rows.len()
     }
-
-    /// 最宽那一行的宽度：定徽章、居中之类的地方要拿它当文本宽
-    pub fn width(&self) -> f32 {
-        self.rows
-            .iter()
-            .map(|row| row.iter().map(|token| token.width).sum::<f32>())
-            .fold(0.0f32, f32::max)
-    }
 }
 
 /// 表情名（`[笑]` 这种带方括号的原文）→ 图。绘图层只认这份，不负责下载。
@@ -93,7 +85,8 @@ impl EmojiSet {
 }
 
 impl Typeface {
-    /// `configured` 是 `bili-image.font` 的值：常规字体路径，可用 `;` 再跟一个粗体路径。
+    /// `configured` 是 `bili-image.font` 的值：字体文件路径，或放在
+    /// `config/bilibili/font/` 下的文件名（后缀可省），可用 `;` 再跟一个粗体。
     /// 留空则按系统候选路径找。找不到任何中文字体就报错，由调用方退回纯文本推送。
     pub fn discover(configured: &str) -> Result<Arc<Typeface>, String> {
         let key = configured.trim().to_string();
@@ -202,29 +195,29 @@ impl Typeface {
         if !current.is_empty() || rows.is_empty() {
             rows.push(current);
         }
-        if let Some(limit) = max_lines {
-            if rows.len() > limit {
-                rows.truncate(limit);
-                let reserve = face.metrics('…', px).advance_width;
-                let base_color = spans
-                    .first()
-                    .map(|span| span.color)
-                    .unwrap_or_else(|| Color::rgb(0x22, 0x22, 0x22));
-                if let Some(row) = rows.last_mut() {
-                    let mut width: f32 = row.iter().map(|token| token.width).sum();
-                    while width + reserve > max_width {
-                        match row.pop() {
-                            Some(dropped) => width -= dropped.width,
-                            None => break,
-                        }
+        if let Some(limit) = max_lines
+            && rows.len() > limit
+        {
+            rows.truncate(limit);
+            let reserve = face.metrics('…', px).advance_width;
+            let base_color = spans
+                .first()
+                .map(|span| span.color)
+                .unwrap_or_else(|| Color::rgb(0x22, 0x22, 0x22));
+            if let Some(row) = rows.last_mut() {
+                let mut width: f32 = row.iter().map(|token| token.width).sum();
+                while width + reserve > max_width {
+                    match row.pop() {
+                        Some(dropped) => width -= dropped.width,
+                        None => break,
                     }
-                    row.push(Token {
-                        text: "…".to_string(),
-                        color: base_color,
-                        emoji: None,
-                        width: reserve,
-                    });
                 }
+                row.push(Token {
+                    text: "…".to_string(),
+                    color: base_color,
+                    emoji: None,
+                    width: reserve,
+                });
             }
         }
         Flow { rows }
@@ -236,6 +229,8 @@ impl Typeface {
     }
 
     /// 从 `first_baseline` 开始逐行画下去，返回下一段的基线位置
+    // 一次排版调用要的就是这一整组：画布、断行结果、落点、字号、行距、表情表
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
         canvas: &mut Canvas,
@@ -276,6 +271,7 @@ impl Typeface {
     }
 
     /// 徽章、页脚那种单行文字：不换行，返回这行占的宽度
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_line(
         &self,
         canvas: &mut Canvas,
@@ -319,15 +315,15 @@ fn units(text: &str) -> Vec<Unit> {
     let mut index = 0usize;
     while index < chars.len() {
         let ch = chars[index];
-        if ch == '[' {
-            if let Some(end) = find_emoji(&chars, index) {
-                if !chunk.is_empty() {
-                    out.push(word(std::mem::take(&mut chunk)));
-                }
-                out.push(emoji(chars[index..=end].iter().collect()));
-                index = end + 1;
-                continue;
+        if ch == '['
+            && let Some(end) = find_emoji(&chars, index)
+        {
+            if !chunk.is_empty() {
+                out.push(word(std::mem::take(&mut chunk)));
             }
+            out.push(emoji(chars[index..=end].iter().collect()));
+            index = end + 1;
+            continue;
         }
         if ch.is_ascii_alphanumeric() {
             chunk.push(ch);
@@ -361,8 +357,8 @@ fn emoji(text: String) -> Unit {
 fn find_emoji(chars: &[char], start: usize) -> Option<usize> {
     let tail = chars.get(start + 1..)?;
     let limit = tail.len().min(EMOJI_MAX_LEN);
-    for offset in 0..limit {
-        match tail[offset] {
+    for (offset, ch) in tail.iter().take(limit).enumerate() {
+        match ch {
             ']' if offset >= 1 => return Some(start + offset + 1),
             '[' | '\n' => return None,
             _ => {}
@@ -435,7 +431,9 @@ const CANDIDATES: &[(&str, Option<&str>)] = &[
     ("/System/Library/Fonts/PingFang.ttc", None),
 ];
 
-/// 配置留空时在系统里找；配置给了路径就只认它（粗体可选，`;` 或 `,` 分隔）。
+/// 配置里的 `font`：给了绝对路径就直接用；只给文件名（后缀可省）就到
+/// `config/bilibili/font/` 下找；两者都留空才去系统候选里挑。
+/// 粗体用 `;` 或 `,` 跟在后面，同样按这两条规则找。
 fn resolve(configured: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
     let configured = configured.trim();
     if !configured.is_empty() {
@@ -443,11 +441,16 @@ fn resolve(configured: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
             Some((main, bold)) => (main.trim().to_string(), Some(bold.trim().to_string())),
             None => (configured.to_string(), None),
         };
-        let path = PathBuf::from(&main);
-        return match path.is_file() {
-            true => Ok((path, bold.map(PathBuf::from))),
-            false => Err(format!("配置里指定的字体不存在：{main}")),
+        let regular = locate(&main).ok_or_else(|| {
+            format!("配置里指定的字体不存在：{main}（写绝对路径，或把字体文件放进 config/bilibili/font/）")
+        })?;
+        let bold = match bold {
+            Some(name) => {
+                Some(locate(&name).ok_or_else(|| format!("配置里指定的粗体字体不存在：{name}"))?)
+            }
+            None => None,
         };
+        return Ok((regular, bold));
     }
     CANDIDATES
         .iter()
@@ -460,6 +463,32 @@ fn resolve(configured: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
             "系统里找不到中文字体，请在 config/bilibili/arona.yml 的 bili-image.font 指定字体文件路径"
                 .to_string()
         })
+}
+
+/// 先当路径试，再当 `config/bilibili/font/` 下的文件名试（`.ttf/.otf/.ttc` 可省）
+fn locate(name: &str) -> Option<PathBuf> {
+    locate_in(name, &crate::config_dir().join("font"))
+}
+
+/// 按配置里那一个词找字体文件：能直接当路径用就用，否则到 `folder` 里按文件名找，
+/// 后缀 `.ttf/.otf/.ttc` 可省（写了路径分隔符的只在 `folder` 内查最后那一段）。
+fn locate_in(name: &str, folder: &Path) -> Option<PathBuf> {
+    let direct = PathBuf::from(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let file = Path::new(name).file_name()?;
+    for extension in ["", ".ttf", ".otf", ".ttc"] {
+        let candidate = if extension.is_empty() {
+            folder.join(file)
+        } else {
+            folder.join(format!("{}{extension}", file.to_string_lossy()))
+        };
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// 读一个字体文件。`.ttc` 是字体集合，第 0 个 face 就是常规字重。
@@ -478,6 +507,37 @@ fn open(path: &Path) -> Result<Font, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bili-image.font` 只写文件名时，得能在 `config/bilibili/font/` 下命中（后缀可省）
+    #[test]
+    fn font_name_resolves_inside_the_config_font_folder() {
+        let folder = std::env::temp_dir().join(format!("bili-font-locate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        let real = folder.join("MyFont.ttf");
+        std::fs::write(&real, b"placeholder").unwrap();
+
+        assert_eq!(
+            locate_in("MyFont", &folder).as_deref(),
+            Some(real.as_path())
+        );
+        assert_eq!(
+            locate_in("MyFont.ttf", &folder).as_deref(),
+            Some(real.as_path())
+        );
+        assert_eq!(
+            locate_in("sub/MyFont", &folder).as_deref(),
+            Some(real.as_path()),
+            "配置里手滑带上目录时，只认最后那一段，不去翻别处"
+        );
+        assert_eq!(locate_in("NoSuchFont", &folder), None);
+        // 给了完整路径就走"当路径试"那一档，跟 folder 无关
+        assert_eq!(
+            locate_in(real.to_string_lossy().as_ref(), &folder).as_deref(),
+            Some(real.as_path())
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
 
     #[test]
     fn emoji_scan_pairs_only_the_nearest_bracket() {
@@ -542,11 +602,12 @@ mod tests {
             "200 宽的框该断成好几行，实得 {}",
             flow.rows()
         );
-        assert!(
-            flow.width() <= 200.0,
-            "有一行顶破了 max_width：{}",
-            flow.width()
-        );
+        let widest = flow
+            .rows
+            .iter()
+            .map(|row| row.iter().map(|token| token.width).sum::<f32>())
+            .fold(0.0, f32::max);
+        assert!(widest <= 200.0, "有一行顶破了 max_width：{}", widest);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use super::quality::Quality;
 use super::text::{EmojiSet, Flow, Span, Typeface};
 use super::theme::Theme;
 use crate::bili::model::{Attached, Dynamic, Node};
+use crate::translate::Rendered;
 
 /// 画一张卡要的全部素材。绘图层不碰网络，缺图就按缺图的样子画——
 /// 不能因为一张封面下不下来就不推这条动态。
@@ -57,9 +58,16 @@ pub struct Style {
     pub qr: Option<String>,
 }
 
-/// 一条动态的完整卡片，返回 PNG 字节
-pub fn dynamic_card(dynamic: &Dynamic, art: &Art, style: &Style) -> Vec<u8> {
-    let height = measure(dynamic, art, style).ceil() as u32;
+/// 一条动态的完整卡片，返回 PNG 字节。
+/// `translation` 是机翻出来的那段（[`crate::translate`]），有值就接在正文后面；
+/// 只影响动态卡，直播卡与转发原文都不贴。
+pub fn dynamic_card(
+    dynamic: &Dynamic,
+    art: &Art,
+    style: &Style,
+    translation: Option<&Rendered>,
+) -> Vec<u8> {
+    let height = measure(dynamic, art, style, translation).ceil() as u32;
     let mut canvas = Canvas::new(style.quality.image_width, height, Color::rgb(255, 255, 255));
     paint_background(&mut canvas, &style.background);
     let mut board = Board {
@@ -67,7 +75,7 @@ pub fn dynamic_card(dynamic: &Dynamic, art: &Art, style: &Style) -> Vec<u8> {
         art,
         canvas: Some(canvas),
     };
-    board.whole(dynamic);
+    board.whole(dynamic, translation);
     match board.canvas.take() {
         Some(done) => done.to_png(),
         None => Vec::new(),
@@ -75,13 +83,13 @@ pub fn dynamic_card(dynamic: &Dynamic, art: &Art, style: &Style) -> Vec<u8> {
 }
 
 /// 只量高不画：建画布之前得先知道总高
-fn measure(dynamic: &Dynamic, art: &Art, style: &Style) -> f32 {
+fn measure(dynamic: &Dynamic, art: &Art, style: &Style, translation: Option<&Rendered>) -> f32 {
     Board {
         style,
         art,
         canvas: None,
     }
-    .whole(dynamic)
+    .whole(dynamic, translation)
 }
 
 /// 一遍绘制。`canvas` 是 None 就只累加坐标。
@@ -106,24 +114,32 @@ impl<'a> Board<'a> {
     }
 
     /// 整图：上下留 cardMargin，顶部徽章条，中间一张主卡
-    fn whole(&mut self, dynamic: &Dynamic) -> f32 {
+    fn whole(&mut self, dynamic: &Dynamic, translation: Option<&Rendered>) -> f32 {
         let q = self.style.quality;
         let style = self.style;
         let badge_h = q.badge_height_for(style.badge) as f32;
         let card_x = q.card_margin;
         let card_w = q.card_width();
         let top = q.card_margin as f32 + badge_h;
-        let body = self.probe(|quiet| quiet.card(card_x, card_w, top, dynamic, false));
+        let body = self.probe(|quiet| quiet.card(card_x, card_w, top, dynamic, false, translation));
         self.card_background(card_x, card_w, top, body + q.card_padding as f32);
         if style.badge {
             self.badges(card_x, top - badge_h, &dynamic.kind, dynamic.id);
         }
-        let used = self.card(card_x, card_w, top, dynamic, false);
+        let used = self.card(card_x, card_w, top, dynamic, false, translation);
         top + used + q.card_margin as f32
     }
 
     /// 一张卡的主体（不含底板），返回占用高度
-    fn card(&mut self, x: u32, width: u32, y: f32, dynamic: &Dynamic, sub: bool) -> f32 {
+    fn card(
+        &mut self,
+        x: u32,
+        width: u32,
+        y: f32,
+        dynamic: &Dynamic,
+        sub: bool,
+        translation: Option<&Rendered>,
+    ) -> f32 {
         let q = self.style.quality;
         let space = q.content_space as f32;
         let content_x = x + q.card_padding;
@@ -134,7 +150,7 @@ impl<'a> Board<'a> {
             cursor += space;
             cursor += self.blocked(content_x, content_w, cursor, tips);
         }
-        let body = self.body_spans(dynamic);
+        let body = self.body_spans(dynamic, translation);
         if !body.is_empty() {
             cursor += space;
             cursor += self.text_block(content_x, content_w, cursor, &body, q.content_font, None);
@@ -260,45 +276,56 @@ impl<'a> Board<'a> {
         // 原插件让二维码在作者行里垂直居中，1000w 那一档算出来是负的，所以不许它顶出卡片
         let offset = (face_side - side as f32 + q.content_space as f32) / 2.0;
         let at_y = (y + offset.max(0.0)).round() as u32;
-        if let Some(image) = qr_image(code, side, theme.title) {
-            if let Some(canvas) = &mut self.canvas {
-                canvas.paste(
-                    x + width.saturating_sub(side + q.card_padding),
-                    at_y,
-                    &image,
-                );
-            }
+        if let Some(image) = qr_image(code, side, theme.title)
+            && let Some(canvas) = &mut self.canvas
+        {
+            canvas.paste(
+                x + width.saturating_sub(side + q.card_padding),
+                at_y,
+                &image,
+            );
         }
         height
     }
 
-    /// 正文的分段：话题、链接、投票这些用链接色，其余用正文色
-    fn body_spans<'d>(&self, dynamic: &'d Dynamic) -> Vec<Span<'d>> {
+    /// 正文的分段：话题、链接、投票这些用链接色，其余用正文色。
+    /// 有机翻译文时按原插件那一步追加两格——分割线在前、译文在后，都走正文色。
+    fn body_spans<'d>(
+        &self,
+        dynamic: &'d Dynamic,
+        translation: Option<&'d Rendered>,
+    ) -> Vec<Span<'d>> {
         let theme = &self.style.theme;
-        if dynamic.nodes.is_empty() {
-            return if dynamic.text.is_empty() {
+        let mut spans = if dynamic.nodes.is_empty() {
+            if dynamic.text.is_empty() {
                 Vec::new()
             } else {
                 vec![Span::new(&dynamic.text, theme.content)]
-            };
-        }
-        dynamic
-            .nodes
-            .iter()
-            .map(|node| {
-                let color = match node {
-                    Node::Text(_) | Node::At(_) | Node::Emoji { .. } => theme.content,
-                    other => {
-                        if other.is_link_like() {
-                            theme.link
-                        } else {
-                            theme.content
+            }
+        } else {
+            dynamic
+                .nodes
+                .iter()
+                .map(|node| {
+                    let color = match node {
+                        Node::Text(_) | Node::At(_) | Node::Emoji { .. } => theme.content,
+                        other => {
+                            if other.is_link_like() {
+                                theme.link
+                            } else {
+                                theme.content
+                            }
                         }
-                    }
-                };
-                Span::new(node.text(), color)
-            })
-            .collect()
+                    };
+                    Span::new(node.text(), color)
+                })
+                .collect()
+        };
+        if let Some(done) = translation {
+            spans.push(Span::new(&done.cut_line, theme.content));
+            spans.push(Span::new(&done.text, theme.content));
+        }
+        spans
     }
 
     /// 一块多行文字，返回占用高度
@@ -808,7 +835,7 @@ impl<'a> Board<'a> {
         let q = self.style.quality;
         let inner_x = x + q.card_padding;
         let inner_w = width - q.card_padding * 2;
-        let body = self.probe(|quiet| quiet.card(inner_x, inner_w, y, source, true));
+        let body = self.probe(|quiet| quiet.card(inner_x, inner_w, y, source, true, None));
         let height = body + q.card_padding as f32 * 2.0;
         if let Some(canvas) = &mut self.canvas {
             canvas.fill_round_rect(
@@ -820,7 +847,14 @@ impl<'a> Board<'a> {
                 Color::rgb(0xF4, 0xF5, 0xF7),
             );
         }
-        self.card(inner_x, inner_w, y + q.card_padding as f32, source, true);
+        self.card(
+            inner_x,
+            inner_w,
+            y + q.card_padding as f32,
+            source,
+            true,
+            None,
+        );
         height
     }
 
@@ -1058,7 +1092,6 @@ mod tests {
             name: "测试Up".to_string(),
             face: "https://face/1.jpg".to_string(),
             kind: "动态".to_string(),
-            type_str: "DYNAMIC_TYPE_DRAW".to_string(),
             time: 1738470120,
             text: text.to_string(),
             nodes: vec![Node::Text(text.to_string())],
@@ -1068,12 +1101,7 @@ mod tests {
             extra: Vec::new(),
             live: None,
             origin: None,
-            top: false,
-            only_fans: false,
             blocked: None,
-            comment: 0,
-            forward_count: 0,
-            like: 0,
             label: String::new(),
         }
     }
@@ -1082,7 +1110,7 @@ mod tests {
     fn a_card_without_any_downloaded_image_still_renders() {
         // 素材一张都没有（下载全失败）也必须出图：不能因为图没下来就不推
         let style = style("1000w");
-        let bytes = dynamic_card(&sample("一条纯文字动态"), &Art::default(), &style);
+        let bytes = dynamic_card(&sample("一条纯文字动态"), &Art::default(), &style, None);
         let back = image::load_from_memory(&bytes).unwrap();
         assert_eq!(back.width(), 1000);
         assert!(back.height() > 200, "总高异常：{}", back.height());
@@ -1090,8 +1118,18 @@ mod tests {
 
     #[test]
     fn higher_quality_makes_a_taller_image() {
-        let small = measure(&sample("同样一段正文"), &Art::default(), &style("800w"));
-        let large = measure(&sample("同样一段正文"), &Art::default(), &style("1500w"));
+        let small = measure(
+            &sample("同样一段正文"),
+            &Art::default(),
+            &style("800w"),
+            None,
+        );
+        let large = measure(
+            &sample("同样一段正文"),
+            &Art::default(),
+            &style("1500w"),
+            None,
+        );
         assert!(large > small, "{large} 该大于 {small}");
     }
 
@@ -1104,12 +1142,12 @@ mod tests {
         let art = Art::default();
         let style = style("1000w");
         assert!(
-            measure(&with_source, &art, &style) > measure(&plain, &art, &style),
+            measure(&with_source, &art, &style, None) > measure(&plain, &art, &style, None),
             "转发原文没占高度"
         );
         // 底板要提前探一次高度，递归只能多出一层原文的高，不能失控
         assert!(
-            measure(&with_source, &art, &style) < measure(&plain, &art, &style) * 4.0,
+            measure(&with_source, &art, &style, None) < measure(&plain, &art, &style, None) * 4.0,
             "递归跑飞了"
         );
     }
@@ -1122,8 +1160,24 @@ mod tests {
         let art = Art::default();
         let style = style("1000w");
         assert!(
-            measure(&hidden, &art, &style) > measure(&plain, &art, &style),
+            measure(&hidden, &art, &style, None) > measure(&plain, &art, &style, None),
             "遮挡提示条没占高度"
+        );
+    }
+
+    /// 译文挂在正文后面：同一张卡该比不译时高出一截
+    #[test]
+    fn a_translation_adds_height_below_the_body() {
+        let plain = sample("本日の新活動です");
+        let art = Art::default();
+        let style = style("1000w");
+        let done = Rendered {
+            cut_line: "\n\n〓〓〓 翻译 〓〓〓\n".to_string(),
+            text: "今日的新活动开始了".to_string(),
+        };
+        assert!(
+            measure(&plain, &art, &style, Some(&done)) > measure(&plain, &art, &style, None),
+            "译文没占高度"
         );
     }
 
@@ -1131,7 +1185,7 @@ mod tests {
     fn image_grid_lays_two_and_three_columns() {
         let style = style("1000w");
         let q = style.quality;
-        let width = q.content_width();
+        let width = q.card_width() - q.card_padding * 2;
         let mut art = Art::default();
         for index in 0..5 {
             art.pictures.insert(
@@ -1186,8 +1240,9 @@ mod tests {
             art: &Art::default(),
             canvas: None,
         };
-        let big = board.attached(0, style.quality.content_width(), 0.0, &item, true);
-        let small = board.attached(0, style.quality.content_width(), 0.0, &item, false);
+        let content = style.quality.card_width() - style.quality.card_padding * 2;
+        let big = board.attached(0, content, 0.0, &item, true);
+        let small = board.attached(0, content, 0.0, &item, false);
         assert!(big > small, "大卡 {big} 该比小卡 {small} 高");
     }
 
@@ -1218,6 +1273,6 @@ mod tests {
         });
         item.kind = "直播".to_string();
         let style = style("1000w");
-        assert!(measure(&item, &Art::default(), &style) > 0.0);
+        assert!(measure(&item, &Art::default(), &style, None) > 0.0);
     }
 }

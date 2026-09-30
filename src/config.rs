@@ -116,6 +116,8 @@ impl PluginConfig for BiliConfig {
             "proxy" => "代理列表，如 http://127.0.0.1:7890；留空跟随系统环境变量",
             "translate" => "翻译（给非中文动态补一段译文）",
             "translate.enable" => "翻译开关",
+            "translate.appId" => "百度翻译开放平台的 APP ID",
+            "translate.securityKey" => "百度翻译的密钥，与 APP ID 成对；留空则不调翻译接口",
             "translate.cutLine" => "正文与译文之间的分割线",
             "linkResolve" => {
                 "链接解析：把 B 站视频/专栏/番剧/动态/直播间/用户主页/短链这些地址画成一张卡回回去"
@@ -154,24 +156,13 @@ impl Default for CommandConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+#[derive(Default)]
 pub struct AccountConfig {
     pub cookie: String,
     pub uid: i64,
     pub csrf: String,
     pub auto_follow: bool,
     pub follow_group: String,
-}
-
-impl Default for AccountConfig {
-    fn default() -> Self {
-        AccountConfig {
-            cookie: String::new(),
-            uid: 0,
-            csrf: String::new(),
-            auto_follow: false,
-            follow_group: String::new(),
-        }
-    }
 }
 
 impl AccountConfig {
@@ -292,6 +283,10 @@ impl Default for CacheConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct TranslateConfig {
     pub enable: bool,
+    /// 百度翻译开放平台的 APP ID
+    pub app_id: String,
+    /// 百度翻译的密钥，与 APP ID 成对
+    pub security_key: String,
     pub cut_line: String,
 }
 
@@ -299,6 +294,8 @@ impl Default for TranslateConfig {
     fn default() -> Self {
         TranslateConfig {
             enable: false,
+            app_id: String::new(),
+            security_key: String::new(),
             cut_line: "\n\n〓〓〓 翻译 〓〓〓\n".into(),
         }
     }

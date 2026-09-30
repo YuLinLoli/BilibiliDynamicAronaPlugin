@@ -14,18 +14,13 @@ use std::path::Path;
 use std::sync::RwLock;
 
 /// 目标种类过滤器与正则过滤器各自的模式
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Mode {
     /// 命中就不推
+    #[default]
     Black,
     /// 只有命中才推
     White,
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Black
-    }
 }
 
 impl Mode {
@@ -351,10 +346,10 @@ impl Data {
             .map(|(key, _)| key.clone())
             .collect();
         for (name, follow) in &self.follows {
-            if follow.uids.contains(&uid) || follow.uids.contains(&0) {
-                if let Some(cluster) = self.clusters.get(name) {
-                    keys.extend(cluster.members.iter().cloned());
-                }
+            if (follow.uids.contains(&uid) || follow.uids.contains(&0))
+                && let Some(cluster) = self.clusters.get(name)
+            {
+                keys.extend(cluster.members.iter().cloned());
             }
         }
         keys.into_iter().collect()
@@ -434,15 +429,6 @@ impl Data {
             return vec![raw.to_string()];
         }
         Vec::new()
-    }
-
-    /// 这批目标里已经在记录中的那些（命令的列表类输出用它筛掉空记录）
-    pub fn live_targets(&self) -> Vec<(String, TargetState)> {
-        self.targets
-            .iter()
-            .filter(|(_, state)| !state.subs.is_empty() || !state.seasons.is_empty())
-            .map(|(key, state)| (key.clone(), state.clone()))
-            .collect()
     }
 
     /// 订阅：把这批目标都订上这个 uid。`name` 是接口拿到的 UP 主名。返回新增的目标数。
@@ -845,10 +831,6 @@ impl Store {
         }
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// 只读取一次快照
     pub fn read<T>(&self, f: impl FnOnce(&Data) -> T) -> T {
         f(&self.data.read().unwrap())
@@ -856,7 +838,7 @@ impl Store {
 
     /// 改完之后自动落盘；落盘失败只记日志，不回滚内存（否则命令会表现为"没反应"）
     pub fn write<T>(&self, f: impl FnOnce(&mut Data) -> T) -> T {
-        let result = {
+        {
             let mut guard = self.data.write().unwrap();
             let result = f(&mut guard);
             if let Err(reason) = guard.save(&self.path) {
@@ -865,8 +847,7 @@ impl Store {
                 ));
             }
             result
-        };
-        result
+        }
     }
 
     /// 改内存但不落盘：批量导入时用，之后自己调一次 [`Store::flush`]
@@ -945,7 +926,6 @@ mod tests {
             types: vec!["音乐".into()],
             reg_mode: Mode::Black,
             regs: vec!["抽奖".into()],
-            ..Default::default()
         };
         assert!(!both.passes("音乐", "普通"));
         assert!(!both.passes("动态", "有抽奖"));

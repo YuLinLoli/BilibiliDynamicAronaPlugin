@@ -161,11 +161,6 @@ impl Quality {
         self.image_width - self.card_margin * 2
     }
 
-    /// 内容区宽：`imageWidth - 2*(cardMargin+cardPadding)`，正文与网格都按这个宽排
-    pub fn content_width(&self) -> u32 {
-        self.card_width() - self.card_padding * 2
-    }
-
     /// 关掉顶部徽章时这一档的高度归零（原插件就是把 badgeHeight 置 0，连带偏移一起收）
     pub fn badge_height_for(&self, enabled: bool) -> u32 {
         if enabled { self.badge_height } else { 0 }
@@ -185,11 +180,12 @@ mod tests {
 
     #[test]
     fn derived_widths_match_the_original_card() {
-        // 原插件 1000w 下 cardRect.width=940、cardContentRect.width=880
+        // 原插件 1000w 下 cardRect.width=940、cardContentRect.width=880；
+        // 内容宽就是 card.rs 排版时那句 `width - card_padding*2`，这里按同一式子核对
         assert_eq!(W1000.card_width(), 940);
-        assert_eq!(W1000.content_width(), 880);
+        assert_eq!(W1000.card_width() - W1000.card_padding * 2, 880);
         assert_eq!(W800.card_width(), 760);
-        assert_eq!(W800.content_width(), 720);
+        assert_eq!(W800.card_width() - W800.card_padding * 2, 720);
     }
 
     #[test]

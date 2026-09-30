@@ -30,10 +30,6 @@ pub(crate) fn number(root: &Value, keys: &[&str]) -> Option<i64> {
     }
 }
 
-fn flag(root: &Value, keys: &[&str]) -> bool {
-    matches!(at(root, keys), Some(Value::Bool(true)))
-}
-
 /// 数组里每项取一个字段；`field` 为空表示数组本身就是字符串列表
 fn list(root: &Value, keys: &[&str], field: &str) -> Vec<String> {
     let Some(items) = at(root, keys).and_then(Value::as_array) else {
@@ -180,8 +176,6 @@ pub struct Dynamic {
     pub face: String,
     /// 类型中文名：动态 / 转发动态 / 视频 / 音乐 / 专栏 / 直播 / 番剧 / 活动
     pub kind: String,
-    /// 原始的 DYNAMIC_TYPE_XXX
-    pub type_str: String,
     pub time: i64,
     pub text: String,
     /// 正文的分段（话题、表情、链接…），绘图按它上色贴图
@@ -194,14 +188,8 @@ pub struct Dynamic {
     pub live: Option<LiveInfo>,
     /// 转发动态里被转的那条
     pub origin: Option<Box<Dynamic>>,
-    pub top: bool,
-    /// 粉丝专属：画占位卡并提示去详情看
-    pub only_fans: bool,
     /// B 站把内容挡掉了（屏蔽 / 仅粉丝 / 已删除），这句是它给的提示语
     pub blocked: Option<String>,
-    pub comment: i64,
-    pub forward_count: i64,
-    pub like: i64,
     /// 作者身上的那一格标签（"直播中"、"专属动态"…）
     pub label: String,
 }
@@ -557,15 +545,15 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
         .as_ref()
         .map(|item| item.cover.clone())
         .filter(|c| !c.is_empty())
+        && !images.contains(&cover)
     {
-        if !images.contains(&cover) {
-            images.push(cover);
-        }
+        images.push(cover);
     }
-    if let Some(room) = &live {
-        if !room.cover.is_empty() && !images.contains(&room.cover) {
-            images.push(room.cover.clone());
-        }
+    if let Some(room) = &live
+        && !room.cover.is_empty()
+        && !images.contains(&room.cover)
+    {
+        images.push(room.cover.clone());
     }
 
     let origin = item.get("orig").and_then(parse_item).map(Box::new);
@@ -596,16 +584,16 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
             url: source.link(),
         });
     }
-    if let Some(extra) = &attached {
-        if !extra.url.is_empty() {
-            links.insert(
-                0,
-                Link {
-                    label: extra.kind.clone(),
-                    url: extra.url.clone(),
-                },
-            );
-        }
+    if let Some(extra) = &attached
+        && !extra.url.is_empty()
+    {
+        links.insert(
+            0,
+            Link {
+                label: extra.kind.clone(),
+                url: extra.url.clone(),
+            },
+        );
     }
     if let Some(room) = &live {
         links.insert(
@@ -623,7 +611,6 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
         name: text(author, &["name"]).unwrap_or_default(),
         face: text(author, &["face"]).unwrap_or_default(),
         kind: kind_name(&type_str),
-        type_str,
         time: number(author, &["pub_ts"]).unwrap_or_else(|| time_of_id(id)),
         text: body,
         nodes,
@@ -632,13 +619,7 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
         attached,
         extra,
         live,
-        top: flag(item, &["modules", "module_author", "is_top"]),
-        only_fans: flag(item, &["basic", "is_only_fans"]) || label == "专属动态",
         blocked,
-        comment: number(item, &["modules", "module_stat", "comment", "count"]).unwrap_or_default(),
-        forward_count: number(item, &["modules", "module_stat", "forward", "count"])
-            .unwrap_or_default(),
-        like: number(item, &["modules", "module_stat", "like", "count"]).unwrap_or_default(),
         label,
         origin,
     })
@@ -792,7 +773,6 @@ mod tests {
             "modules": {
                 "module_author": {"mid": 3546838751775383i64, "name": "优妮", "face": "https://i2.hdslb.com/a.jpg", "pub_time": "2025年02月02日 12:22", "label": ""},
                 "module_dynamic": {"desc": {"text": "分享图片"}, "major": {"type": "MAJOR_TYPE_DRAW", "draw": {"items": [{"src": "https://i0.hdslb.com/1.png", "width": 1080, "height": 1920}]}}},
-                "module_stat": {"comment": {"count": 128}, "forward": {"count": 10}, "like": {"count": 391}}
             }
         })
     }
@@ -806,12 +786,7 @@ mod tests {
         assert_eq!(item.text, "分享图片");
         assert_eq!(item.images, vec!["https://i0.hdslb.com/1.png".to_string()]);
         assert_eq!(item.link(), "https://t.bilibili.com/1029210402684141574");
-        assert_eq!(
-            (item.comment, item.forward_count, item.like),
-            (128, 10, 391)
-        );
         assert!(item.origin.is_none());
-        assert!(!item.only_fans);
     }
 
     #[test]
@@ -839,17 +814,15 @@ mod tests {
         assert!(!parsed.text.is_empty());
     }
 
-    /// 粉丝专属：原插件画一张"此动态为专属动态"的占位卡，识别依据要留住
+    /// B 站把正文挡掉了（仅粉丝 / 已删除）时，卡片上就照抄它给的那句提示
     #[test]
-    fn blocked_and_only_fans_are_marked() {
+    fn blocked_hint_is_carried_out() {
         let mut item = draw_item();
-        item["basic"]["is_only_fans"] = json!(true);
         item["modules"]["module_dynamic"]["major"] = json!({
             "type": "MAJOR_TYPE_BLOCKED",
             "blocked": {"hint_text": "你当前不是他的粉丝"}
         });
         let parsed = parse_item(&item).unwrap();
-        assert!(parsed.only_fans);
         assert_eq!(parsed.blocked.as_deref(), Some("你当前不是他的粉丝"));
     }
 

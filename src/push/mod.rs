@@ -206,24 +206,6 @@ pub async fn push_state(ctx: &PluginContext, key: &str, state: &TargetState, pos
     sent
 }
 
-/// 推给订阅了某个 uid 的全部目标（分组已展开），返回收到推送的目标数
-pub async fn push_uid(ctx: &PluginContext, uid: i64, post: &Post) -> usize {
-    let keys = crate::store().read(|data| data.targets_of(uid));
-    let push = ctx.config::<BiliConfig>(SECTION).get().push;
-    let mut hit = 0usize;
-    for key in keys {
-        // 分组新加进来的成员可能还没写过记录，按默认状态推（过滤器全空、没静音）
-        let state = crate::store()
-            .read(|data| data.targets.get(&key).cloned())
-            .unwrap_or_default();
-        if push_state(ctx, &key, &state, post).await > 0 {
-            hit += 1;
-            pause(push.push_interval).await;
-        }
-    }
-    hit
-}
-
 /// 命令侧的"看一眼"：按这个目标当前生效的模板把渲染结果发出去。
 /// 与真实推送同一条渲染路径，只是不看 `muted`、也不挂 @全体——预览是用户主动要的。
 pub async fn send_preview(ctx: &PluginContext, key: &str, post: &Post) -> usize {

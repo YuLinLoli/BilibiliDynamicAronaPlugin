@@ -20,7 +20,7 @@ use arona::plugin::PluginContext;
 use arona::quartz::JobFn;
 
 use crate::bili::api::{self, Bili};
-use crate::bili::model::{Dynamic, LiveInfo, format_time};
+use crate::bili::model::{Dynamic, LiveInfo, Node, format_time};
 use crate::cache;
 use crate::config::{
     BiliConfig, CheckConfig, IMAGE_SECTION, ImageConfig, SECTION, low_speed_window,
@@ -28,11 +28,12 @@ use crate::config::{
 use crate::draw::card::{Art, Style, dynamic_card};
 use crate::draw::live::live_card;
 use crate::draw::quality::Quality;
-use crate::draw::text::Typeface;
+use crate::draw::text::{EmojiSet, Typeface};
 use crate::draw::theme::{Theme, background};
 use crate::push::template::{Supply, Vals};
 use crate::push::{self, Kind, Post};
 use crate::store::{LiveState, TargetState};
+use crate::translate::{self, Rendered};
 use crate::{CACHE_JOB, DYNAMIC_JOB, LIVE_JOB, RESCHEDULE_JOB};
 
 /// 低频窗口的复核周期（秒）：进出窗口的最大延迟就是它
@@ -318,10 +319,17 @@ async fn push_one(
         bili,
         &face_urls(dynamic),
         &picture_urls(dynamic),
+        &emoji_pairs(dynamic),
         conf.cache.download_original,
     )
     .await;
     let link = link_of(bili, conf.push.to_short_link, dynamic).await;
+    // 机翻只贴动态卡：原插件那一路也只在画动态卡时调 trans，直播卡与文本模板都不带译文
+    let translation = if living {
+        None
+    } else {
+        translate::translate(&conf.translate, &dynamic.text).await
+    };
     let vals = if living {
         let live = dynamic.live.clone().unwrap_or_default();
         Vals::live(&live, link.clone(), &format_time(now()))
@@ -344,7 +352,14 @@ async fn push_one(
         let bucket = if living { "live" } else { "dynamic" };
         let card = painted(
             &mut drawn,
-            card_key(bucket, &dynamic.id.to_string(), &color, &link, appearance),
+            card_key(
+                bucket,
+                &dynamic.id.to_string(),
+                &color,
+                &link,
+                translation.as_ref(),
+                appearance,
+            ),
             // 动态内容不会再变，画好的卡值得落到盘上；直播卡带着在线人数与标题，只在这一轮里复用
             !living,
             || {
@@ -352,7 +367,14 @@ async fn push_one(
                     let live = dynamic.live.clone().unwrap_or_default();
                     paint_live(appearance, &color, &live, &material, &link)
                 } else {
-                    paint_dynamic(appearance, &color, dynamic, &material, &link)
+                    paint_dynamic(
+                        appearance,
+                        &color,
+                        dynamic,
+                        &material,
+                        &link,
+                        translation.as_ref(),
+                    )
                 }
             },
         );
@@ -494,7 +516,8 @@ async fn broadcast_live(
     let material = gather(
         bili,
         &faces,
-        &[info.cover.clone()],
+        std::slice::from_ref(&info.cover),
+        &[],
         conf.cache.download_original,
     )
     .await;
@@ -508,7 +531,14 @@ async fn broadcast_live(
         let color = state.color.clone().unwrap_or_default();
         let card = painted(
             &mut drawn,
-            card_key("live", &info.room_id.to_string(), &color, &link, appearance),
+            card_key(
+                "live",
+                &info.room_id.to_string(),
+                &color,
+                &link,
+                None,
+                appearance,
+            ),
             false,
             || paint_live(appearance, &color, info, &material, &link),
         );
@@ -605,7 +635,8 @@ async fn run_seasons(ctx: PluginContext) {
         let material = gather(
             &bili,
             &[],
-            &[season.cover.clone()],
+            std::slice::from_ref(&season.cover),
+            &[],
             conf.cache.download_original,
         )
         .await;
@@ -712,11 +743,32 @@ fn picture_urls(dynamic: &Dynamic) -> Vec<String> {
         .chain(dynamic.live.iter().map(|live| live.cover.clone()))
         .collect();
     for url in candidates {
-        if !url.is_empty() && !urls.iter().any(|have| *have == url) {
+        if !url.is_empty() && !urls.contains(&url) {
             urls.push(url);
         }
     }
     urls
+}
+
+/// 一条动态涉及哪些表情：正文里 `[笑]` 这种原文 → B 站给的图地址。
+/// 转发动态被转的那条正文里也带表情，所以连 origin 一起收。
+fn emoji_pairs(dynamic: &Dynamic) -> Vec<(String, String)> {
+    let mut lists: Vec<&Vec<Node>> = vec![&dynamic.nodes];
+    if let Some(old) = &dynamic.origin {
+        lists.push(&old.nodes);
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for nodes in lists {
+        for node in nodes {
+            if let Node::Emoji { text, url } = node
+                && !url.is_empty()
+                && !out.iter().any(|(have, _)| have == text)
+            {
+                out.push((text.clone(), url.clone()));
+            }
+        }
+    }
+    out
 }
 
 /// 逐个下素材：单张失败只跳过那张，不拖垮整条推送（缺图的样子画卡里自会体现）
@@ -724,6 +776,7 @@ async fn gather(
     bili: &Arc<Bili>,
     faces: &[String],
     pictures: &[String],
+    emojis: &[(String, String)],
     original: bool,
 ) -> Material {
     let mut art = Art::default();
@@ -740,6 +793,14 @@ async fn gather(
             art.pictures.insert(url.clone(), image);
         }
     }
+    // 表情只画进卡片，不作为附件发出去，所以只要解码后的那一份
+    let mut set = HashMap::new();
+    for (name, url) in emojis {
+        if let Some((_, image)) = fetch(bili, url, cache::EMOJI, true).await {
+            set.insert(name.clone(), image);
+        }
+    }
+    art.emojis = EmojiSet::new(set);
     Material { art, bytes }
 }
 
@@ -810,10 +871,8 @@ fn painted(
         Some(raw) if sticky => Some(raw),
         _ => {
             let made = paint();
-            if sticky {
-                if let Some(png) = &made {
-                    cache::write(cache::DRAW, &key, png);
-                }
+            if sticky && let Some(png) = &made {
+                cache::write(cache::DRAW, &key, png);
             }
             made
         }
@@ -822,11 +881,23 @@ fn painted(
     found
 }
 
-/// 缓存键：哪一类、哪一条、哪个配色都写进去，再把外观与链接折成一小段指纹。
+/// 缓存键：哪一类、哪一条、哪个配色都写进去，再把外观、链接与译文折成一小段指纹。
 /// 改了主题/宽度/水印，或把 `push.toShortLink` 打开了，盘上那些旧卡就该作废——
-/// 卡片画的正是那两者决定的内容，所以它们必须在键里。
-fn card_key(bucket: &str, id: &str, color: &str, link: &str, appearance: &ImageConfig) -> String {
-    let digest = format!("{:x}", md5::compute(format!("{appearance:?}|{link}")));
+/// 卡片画的正是那两者决定的内容，所以它们必须在键里。译文也得进去：
+/// 把 `translate.enable` 关掉之后，贴过译文的旧卡不该再被复用。
+fn card_key(
+    bucket: &str,
+    id: &str,
+    color: &str,
+    link: &str,
+    translation: Option<&Rendered>,
+    appearance: &ImageConfig,
+) -> String {
+    let seen = translation.map_or(String::new(), |done| done.text.clone());
+    let digest = format!(
+        "{:x}",
+        md5::compute(format!("{appearance:?}|{link}|{seen}"))
+    );
     let stamp = &digest[..8];
     format!("{bucket}/{id}/{color}#{stamp}")
 }
@@ -838,6 +909,7 @@ fn paint_dynamic(
     dynamic: &Dynamic,
     material: &Material,
     link: &str,
+    translation: Option<&Rendered>,
 ) -> Option<Vec<u8>> {
     let style = match style_for(
         appearance,
@@ -854,7 +926,7 @@ fn paint_dynamic(
             return None;
         }
     };
-    Some(dynamic_card(dynamic, &material.art, &style))
+    Some(dynamic_card(dynamic, &material.art, &style, translation))
 }
 
 /// 画一张直播卡
@@ -948,6 +1020,7 @@ pub(crate) async fn preview(
         bili,
         &face_urls(dynamic),
         &picture_urls(dynamic),
+        &emoji_pairs(dynamic),
         conf.cache.download_original,
     )
     .await;
@@ -959,6 +1032,7 @@ pub(crate) async fn preview(
         return Post::live(vals, card, material.bytes.get(&live.cover).cloned());
     }
     let vals = Vals::dynamic(dynamic, link.clone());
+    let translation = translate::translate(&conf.translate, &dynamic.text).await;
     let mut drawn: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     let card = painted(
         &mut drawn,
@@ -967,10 +1041,20 @@ pub(crate) async fn preview(
             &dynamic.id.to_string(),
             color,
             &link,
+            translation.as_ref(),
             &appearance,
         ),
         true,
-        || paint_dynamic(&appearance, color, dynamic, &material, &link),
+        || {
+            paint_dynamic(
+                &appearance,
+                color,
+                dynamic,
+                &material,
+                &link,
+                translation.as_ref(),
+            )
+        },
     );
     let images: Vec<Vec<u8>> = dynamic
         .images
@@ -1001,7 +1085,8 @@ pub(crate) async fn preview_live(
     let material = gather(
         bili,
         &faces,
-        &[info.cover.clone()],
+        std::slice::from_ref(&info.cover),
+        &[],
         conf.cache.download_original,
     )
     .await;
@@ -1084,6 +1169,45 @@ mod tests {
         assert_eq!(season_id(""), None);
     }
 
+    /// 卡片上要画的表情：正文与转发原文里的都收，同名只留一份，没地址的不收
+    #[test]
+    fn emoji_pairs_cover_the_quote_and_dedupe() {
+        let dynamic = Dynamic {
+            nodes: vec![
+                Node::Text("正文 ".to_string()),
+                Node::Emoji {
+                    text: "[笑]".to_string(),
+                    url: "https://i0.hdslb.com/e1.png".to_string(),
+                },
+                Node::Emoji {
+                    text: "[哭]".to_string(),
+                    url: "https://i0.hdslb.com/e2.png".to_string(),
+                },
+                Node::Emoji {
+                    text: "[笑]".to_string(),
+                    url: "https://i0.hdslb.com/e1.png".to_string(),
+                },
+                Node::Emoji {
+                    text: "[没图]".to_string(),
+                    url: String::new(),
+                },
+            ],
+            origin: Some(Box::new(Dynamic {
+                nodes: vec![Node::Emoji {
+                    text: "[脱单delta]".to_string(),
+                    url: "https://i0.hdslb.com/e3.png".to_string(),
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let names: Vec<String> = emoji_pairs(&dynamic)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["[笑]", "[哭]", "[脱单delta]"]);
+    }
+
     #[test]
     fn picture_urls_cover_the_quote_and_the_attached_card() {
         let dynamic = Dynamic {
@@ -1092,7 +1216,6 @@ mod tests {
             name: "测试Up".to_string(),
             face: "https://i0.hdslb.com/face.jpg".to_string(),
             kind: "动态".to_string(),
-            type_str: "DYNAMIC_TYPE_DRAW".to_string(),
             time: 1_738_470_120,
             text: "正文".to_string(),
             nodes: Vec::new(),
@@ -1109,12 +1232,7 @@ mod tests {
                 face: "https://i0.hdslb.com/oldface.jpg".to_string(),
                 ..Default::default()
             })),
-            top: false,
-            only_fans: false,
             blocked: None,
-            comment: 0,
-            forward_count: 0,
-            like: 0,
             label: String::new(),
         };
         let faces = face_urls(&dynamic);
@@ -1136,7 +1254,6 @@ mod tests {
             name: "测试Up".to_string(),
             face: String::new(),
             kind: "直播".to_string(),
-            type_str: "DYNAMIC_TYPE_LIVE".to_string(),
             time: 1_738_470_120,
             text: String::new(),
             nodes: Vec::new(),
@@ -1146,12 +1263,7 @@ mod tests {
             extra: Vec::new(),
             live: Some(LiveInfo::default()),
             origin: None,
-            top: false,
-            only_fans: false,
             blocked: None,
-            comment: 0,
-            forward_count: 0,
-            like: 0,
             label: String::new(),
         };
         assert_eq!(kind_of(&dynamic), "直播");

@@ -47,13 +47,6 @@ const SHORT_LINK: &str = "https://api.bilibili.com/x/share/click";
 const QRCODE_GENERATE: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
 const QRCODE_POLL: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
 
-/// 动态流的分页参数：feed/all 用 page，feed/space 用 offset
-#[derive(Clone, Debug, Default)]
-pub struct Page {
-    pub page: u32,
-    pub offset: String,
-}
-
 /// WBI 密钥缓存：B 站一天换一次，跟着换就行
 static MIXIN: std::sync::LazyLock<RwLock<Option<(String, i64)>>> =
     std::sync::LazyLock::new(|| RwLock::new(None));
@@ -80,10 +73,6 @@ impl Bili {
 
     pub fn uid(&self) -> i64 {
         self.account.uid
-    }
-
-    pub fn account(&self) -> &AccountConfig {
-        &self.account
     }
 
     fn headers(&self, referer: &str) -> Vec<(String, String)> {
@@ -166,7 +155,6 @@ impl Bili {
             headers: self.headers(referer),
             body: arona::runtime::http::Body::Form(form),
             timeout: Some(self.timeout),
-            ..Default::default()
         };
         unwrap_envelope(self.send(request).await?)
     }
@@ -181,7 +169,6 @@ impl Bili {
                 text: json.to_string(),
             },
             timeout: Some(self.timeout),
-            ..Default::default()
         };
         unwrap_envelope(self.send(request).await?)
     }
@@ -208,10 +195,10 @@ impl Bili {
         let today = wbi::now_seconds() / 86_400;
         {
             let cache = MIXIN.read().await;
-            if let Some((key, day)) = cache.as_ref() {
-                if *day == today {
-                    return Ok(key.clone());
-                }
+            if let Some((key, day)) = cache.as_ref()
+                && *day == today
+            {
+                return Ok(key.clone());
             }
         }
         let nav = self.call(NAV, &[], "https://www.bilibili.com/").await?;
@@ -307,11 +294,8 @@ impl Bili {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let body = serde_json::to_string(&BTreeMap::from([(
-            "uid_list",
-            uids.iter().copied().collect::<Vec<i64>>(),
-        )]))
-        .map_err(|err| err.to_string())?;
+        let body = serde_json::to_string(&BTreeMap::from([("uid_list", uids.to_vec())]))
+            .map_err(|err| err.to_string())?;
         let data = self
             .post_json(LIVE_STATUS_BATCH, &body, "https://live.bilibili.com/")
             .await?;
@@ -393,16 +377,6 @@ impl Bili {
             .await?;
         let result = data.get("result").unwrap_or(&data);
         parse_season(result).ok_or_else(|| format!("B 站没给番剧 {season_id} 的信息"))
-    }
-
-    /// 用户追番/番剧更新入口（`pgc/review/user` 带 recent 更新）
-    pub async fn pgc_review(&self, uid: i64) -> Result<Value, String> {
-        self.call(
-            PGC_REVIEW,
-            &[("mid", &uid.to_string())],
-            "https://space.bilibili.com/",
-        )
-        .await
     }
 
     /// `ep` 号那一路：同一个 season 接口换 `ep_id` 查，拿回来的就是季度信息
@@ -593,7 +567,6 @@ impl Bili {
             headers: self.headers("https://www.bilibili.com/"),
             body: arona::runtime::http::Body::Form(pairs),
             timeout: Some(self.timeout),
-            ..Default::default()
         };
         let value = self.send(request).await.ok()?;
         unwrap_envelope(value)
@@ -650,15 +623,15 @@ fn cookie_from_url(url: &str) -> Option<String> {
     let query = url.split_once('?').map(|(_, rest)| rest).unwrap_or(url);
     let mut picked = BTreeMap::new();
     for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            if ["SESSDATA", "bili_jct", "DedeUserID", "sid"].contains(&key) {
-                picked.insert(
-                    key.to_string(),
-                    percent_encoding::percent_decode_str(value)
-                        .decode_utf8_lossy()
-                        .into_owned(),
-                );
-            }
+        if let Some((key, value)) = pair.split_once('=')
+            && ["SESSDATA", "bili_jct", "DedeUserID", "sid"].contains(&key)
+        {
+            picked.insert(
+                key.to_string(),
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            );
         }
     }
     if picked.contains_key("SESSDATA") {
