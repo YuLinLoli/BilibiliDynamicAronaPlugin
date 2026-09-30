@@ -332,6 +332,13 @@ async fn push_one(
     }
     let live = live_of(dynamic).filter(|_| kind == "直播");
     let living = live.is_some();
+    // 机翻只贴动态卡：原插件那一路也只在画动态卡时调 trans，直播卡与文本模板都不带译文。
+    // 绘图总开关关掉时连翻译都不必出门——那张卡本来就不会画。
+    let translation = if living || !appearance.draw_enable {
+        None
+    } else {
+        translate::translate(&conf.translate, &dynamic.text).await
+    };
     let material = gather(
         bili,
         &face_urls(dynamic),
@@ -341,12 +348,6 @@ async fn push_one(
     )
     .await;
     let link = link_of(bili, conf.push.to_short_link, dynamic).await;
-    // 机翻只贴动态卡：原插件那一路也只在画动态卡时调 trans，直播卡与文本模板都不带译文
-    let translation = if living {
-        None
-    } else {
-        translate::translate(&conf.translate, &dynamic.text).await
-    };
     let vals = match &live {
         Some(info) => Vals::live(info, link.clone(), &format_time(now())),
         None => Vals::dynamic(dynamic, link.clone()),
@@ -364,30 +365,36 @@ async fn push_one(
     for (key, state) in chosen {
         let color = state.color.clone().unwrap_or_default();
         let bucket = if living { "live" } else { "dynamic" };
-        let card = painted(
-            &mut drawn,
-            card_key(
-                bucket,
-                &dynamic.id.to_string(),
-                &color,
-                &link,
-                translation.as_ref(),
-                appearance,
-            ),
-            // 动态内容不会再变，画好的卡值得落到盘上；直播卡带着在线人数与标题，只在这一轮里复用
-            !living,
-            || match &live {
-                Some(info) => paint_live(appearance, &color, info, &material, &link),
-                None => paint_dynamic(
-                    appearance,
+        // `drawEnable=false` 时这两条推送路径都不画卡（原插件 gate 的也正是这两处：
+        // DynamicMessageTasker.kt:217 与 LiveMessageTasker.kt:48），命令的「先看一眼」照旧出图
+        let card = if appearance.draw_enable {
+            painted(
+                &mut drawn,
+                card_key(
+                    bucket,
+                    &dynamic.id.to_string(),
                     &color,
-                    dynamic,
-                    &material,
                     &link,
                     translation.as_ref(),
+                    appearance,
                 ),
-            },
-        );
+                // 动态内容不会再变，画好的卡值得落到盘上；直播卡带着在线人数与标题，只在这一轮里复用
+                !living,
+                || match &live {
+                    Some(info) => paint_live(appearance, &color, info, &material, &link),
+                    None => paint_dynamic(
+                        appearance,
+                        &color,
+                        dynamic,
+                        &material,
+                        &link,
+                        translation.as_ref(),
+                    ),
+                },
+            )
+        } else {
+            None
+        };
         let post = if living {
             Post::live(vals.clone(), card, cover.clone())
         } else {
@@ -488,7 +495,11 @@ async fn run_live(ctx: PluginContext) {
                         },
                     );
                 });
-                announce_close(&ctx, &bili, uid, &previous, &info, &targets).await;
+                // 原插件那档 `liveCloseNotifyEnable` 关的就是这条播报（`BiliBiliDynamic.kt:65`、
+                // `LiveCheckTasker.kt:15`）：状态照记，只是不再向目标发消息
+                if conf.push.live_close_notify {
+                    announce_close(&ctx, &bili, uid, &previous, &info, &targets).await;
+                }
             }
             (true, true) => {
                 let Some(previous) = prev else { continue };
@@ -565,19 +576,23 @@ async fn broadcast_live(
             continue;
         }
         let color = state.color.clone().unwrap_or_default();
-        let card = painted(
-            &mut drawn,
-            card_key(
-                "live",
-                &info.room_id.to_string(),
-                &color,
-                &link,
-                None,
-                appearance,
-            ),
-            false,
-            || paint_live(appearance, &color, info, &material, &link),
-        );
+        let card = if appearance.draw_enable {
+            painted(
+                &mut drawn,
+                card_key(
+                    "live",
+                    &info.room_id.to_string(),
+                    &color,
+                    &link,
+                    None,
+                    appearance,
+                ),
+                false,
+                || paint_live(appearance, &color, info, &material, &link),
+            )
+        } else {
+            None
+        };
         let post = Post::live(vals.clone(), card, material.bytes.get(&info.cover).cloned());
         push::push_state(ctx, key, state, &post).await;
     }
@@ -975,13 +990,7 @@ fn paint_dynamic(
     link: &str,
     translation: Option<&Rendered>,
 ) -> Option<Vec<u8>> {
-    let style = match style_for(
-        appearance,
-        color,
-        link,
-        &appearance.footer.dynamic_footer,
-        true,
-    ) {
+    let style = match style_for(appearance, color, link, &appearance.footer.dynamic_footer) {
         Ok(style) => style,
         Err(reason) => {
             arona::runtime::log::warning(format!(
@@ -1001,13 +1010,7 @@ fn paint_live(
     material: &Material,
     link: &str,
 ) -> Option<Vec<u8>> {
-    let style = match style_for(
-        appearance,
-        color,
-        link,
-        &appearance.footer.live_footer,
-        false,
-    ) {
+    let style = match style_for(appearance, color, link, &appearance.footer.live_footer) {
         Ok(style) => style,
         Err(reason) => {
             arona::runtime::log::warning(format!(
@@ -1025,7 +1028,6 @@ fn style_for(
     color: &str,
     link: &str,
     footer: &str,
-    show_id: bool,
 ) -> Result<Style, String> {
     let generator = &appearance.color_generator;
     let stops = background(
@@ -1040,8 +1042,8 @@ fn style_for(
         theme: Theme::find(&appearance.theme),
         face: typeface(&appearance.font)?,
         background: stops,
-        badge: appearance.badge_enable,
-        show_id,
+        badge_left: appearance.badge_enable.left,
+        badge_right: appearance.badge_enable.right,
         footer: footer.to_string(),
         qr: if appearance.card_ornament.eq_ignore_ascii_case("qrcode") {
             Some(link.to_string())

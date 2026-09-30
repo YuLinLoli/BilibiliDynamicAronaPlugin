@@ -49,10 +49,10 @@ pub struct Style {
     pub face: Arc<Typeface>,
     /// 整图背景的渐变停靠点（1~N 个）
     pub background: Vec<Color>,
-    /// 顶部徽章条
-    pub badge: bool,
-    /// 徽章条右边那一格显示动态 id
-    pub show_id: bool,
+    /// 顶部徽章条左边那一档（动态类型 / 直播分区）
+    pub badge_left: bool,
+    /// 徽章条右边那一档显示动态 id（直播卡是房间号）
+    pub badge_right: bool,
     pub footer: String,
     /// 有值就在作者行右侧画二维码（`card_ornament: QrCode`）
     pub qr: Option<String>,
@@ -117,13 +117,13 @@ impl<'a> Board<'a> {
     fn whole(&mut self, dynamic: &Dynamic, translation: Option<&Rendered>) -> f32 {
         let q = self.style.quality;
         let style = self.style;
-        let badge_h = q.badge_height_for(style.badge) as f32;
+        let badge_h = q.badge_height_for(style.badge_left || style.badge_right) as f32;
         let card_x = q.card_margin;
         let card_w = q.card_width();
         let top = q.card_margin as f32 + badge_h;
         let body = self.probe(|quiet| quiet.card(card_x, card_w, top, dynamic, false, translation));
         self.card_background(card_x, card_w, top, body + q.card_padding as f32);
-        if style.badge {
+        if style.badge_left || style.badge_right {
             self.badges(card_x, top - badge_h, &dynamic.kind, dynamic.id);
         }
         let used = self.card(card_x, card_w, top, dynamic, false, translation);
@@ -926,7 +926,8 @@ pub(crate) fn paint_board(
     );
 }
 
-/// 顶部徽章条。`id` 是右边那一格：动态卡给动态 id，直播卡给房间号。
+/// 顶部徽章条。`label` 是左边那一档（动态类型或「直播」），`id` 是右边那一档：动态卡给动态
+/// id，直播卡给房间号。两档各由 `badge_left`/`badge_right` 管，与原插件 `BadgeEnable` 同形。
 pub(crate) fn paint_badges(
     canvas: &mut Canvas,
     style: &Style,
@@ -952,32 +953,35 @@ pub(crate) fn paint_badges(
     let top = y.round() as u32;
     // 基线：徽章条内垂直居中
     let baseline = y + height as f32 - (height as f32 - font) / 2.0;
-    canvas.fill_round_rect(x, top, left_w, height, radius, theme.main_left_badge.1);
-    // 徽标是 SVG，这里不引解码器：用品牌色圆角块顶上去
-    canvas.fill_round_rect(
-        x + q.badge_padding * 2,
-        (y + (height as f32 - icon) / 2.0).round() as u32,
-        icon.round() as u32,
-        icon.round() as u32,
-        Corners::all(icon / 4.0),
-        theme.main_left_badge.0,
-    );
-    style.face.draw_line(
-        canvas,
-        x as f32 + q.badge_padding as f32 * 2.0 + icon * 1.6,
-        baseline,
-        label,
-        font,
-        theme.main_left_badge.0,
-        true,
-    );
-    if !style.show_id {
+    if style.badge_left {
+        canvas.fill_round_rect(x, top, left_w, height, radius, theme.main_left_badge.1);
+        // 徽标是 SVG，这里不引解码器：用品牌色圆角块顶上去
+        canvas.fill_round_rect(
+            x + q.badge_padding * 2,
+            (y + (height as f32 - icon) / 2.0).round() as u32,
+            icon.round() as u32,
+            icon.round() as u32,
+            Corners::all(icon / 4.0),
+            theme.main_left_badge.0,
+        );
+        style.face.draw_line(
+            canvas,
+            x as f32 + q.badge_padding as f32 * 2.0 + icon * 1.6,
+            baseline,
+            label,
+            font,
+            theme.main_left_badge.0,
+            true,
+        );
+    }
+    if !style.badge_right {
         return;
     }
     let code = id.to_string();
     let width = (style.face.measure(&code, font, false, &art.emojis) + q.badge_padding as f32 * 8.0)
         .round() as u32;
-    let at = x + left_w + 2;
+    // 左边那一档关掉时右边这档就顶到条的起点，别留一截空白
+    let at = x + if style.badge_left { left_w + 2 } else { 0 };
     canvas.fill_round_rect(at, top, width, height, radius, theme.main_right_badge.1);
     style.face.draw_line(
         canvas,
@@ -1078,8 +1082,8 @@ mod tests {
             theme: Theme::find("v3"),
             face: Typeface::discover("").unwrap(),
             background: vec![Color::rgb(211, 237, 250)],
-            badge: true,
-            show_id: false,
+            badge_left: true,
+            badge_right: false,
             footer: "测试页脚".to_string(),
             qr: None,
         }
@@ -1131,6 +1135,30 @@ mod tests {
             None,
         );
         assert!(large > small, "{large} 该大于 {small}");
+    }
+
+    /// 两档标签都关掉时，那条徽章带的高度要一起收掉（原插件 `BadgeEnable` 就是这个语义）
+    #[test]
+    fn turning_both_badges_off_shrinks_the_card() {
+        let art = Art::default();
+        let on = style("1000w");
+        let mut both_off = style("1000w");
+        both_off.badge_left = false;
+        both_off.badge_right = false;
+        let body = sample("同样一段正文");
+        assert!(
+            measure(&body, &art, &both_off, None) < measure(&body, &art, &on, None),
+            "两档标签都关了，那条徽章带的高度却没收掉"
+        );
+        // 只关左边那一档时标签带仍然在，高度不该动——右边那档只是顶到条的起点
+        let mut only_right = style("1000w");
+        only_right.badge_left = false;
+        only_right.badge_right = true;
+        assert_eq!(
+            measure(&body, &art, &only_right, None),
+            measure(&body, &art, &on, None),
+            "只关一档时标签带不该消失"
+        );
     }
 
     #[test]

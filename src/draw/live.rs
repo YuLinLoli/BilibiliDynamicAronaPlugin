@@ -30,7 +30,7 @@ pub fn live_card(live: &LiveInfo, art: &Art, style: &Style) -> Vec<u8> {
     let pad = q.card_padding as f32;
     let card_x = q.card_margin;
     let card_w = q.card_width();
-    let badge_h = q.badge_height_for(style.badge) as f32;
+    let badge_h = q.badge_height_for(style.badge_left || style.badge_right) as f32;
     let outline_half = q.card_outline as f32 / 2.0;
     let box_w = card_w as f32 - outline_half;
     let head_h = q.face_size as f32 + pad * 2.0;
@@ -60,7 +60,7 @@ pub fn live_card(live: &LiveInfo, art: &Art, style: &Style) -> Vec<u8> {
     let mut canvas = Canvas::new(q.image_width, height, Color::rgb(255, 255, 255));
     paint_background(&mut canvas, &style.background);
     paint_board(&mut canvas, style, card_x, card_w, top, body);
-    if style.badge {
+    if style.badge_left || style.badge_right {
         paint_badges(
             &mut canvas,
             style,
@@ -201,8 +201,8 @@ mod tests {
             theme: Theme::find("v3"),
             face: Typeface::discover("").unwrap(),
             background: vec![Color::rgb(211, 237, 250)],
-            badge: true,
-            show_id: true,
+            badge_left: true,
+            badge_right: true,
             footer: String::new(),
             qr: None,
         }

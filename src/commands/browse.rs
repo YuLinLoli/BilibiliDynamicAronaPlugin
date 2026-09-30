@@ -226,7 +226,7 @@ pub(crate) async fn config(call: &Call) -> Reply {
             bili.check.low_speed
         ),
         format!(
-            "节流 消息间 {} 毫秒 / 目标间 {} 毫秒｜短链 {}｜@全体 挂法 {}",
+            "节流 消息间 {} 毫秒 / 目标间 {} 毫秒｜短链 {}｜@全体 挂法 {}｜结束通知 {}",
             bili.push.message_interval,
             bili.push.push_interval,
             if bili.push.to_short_link {
@@ -234,7 +234,12 @@ pub(crate) async fn config(call: &Call) -> Reply {
             } else {
                 "关"
             },
-            bili.push.at_all_plus
+            bili.push.at_all_plus,
+            if bili.push.live_close_notify {
+                "开"
+            } else {
+                "关"
+            }
         ),
         format!(
             "B 站账号 uid={} 登录态 {}",
@@ -242,7 +247,18 @@ pub(crate) async fn config(call: &Call) -> Reply {
             if bili.account.signed() { "有" } else { "无" }
         ),
         format!(
-            "绘图 画质={} 主题={} 默认配色={} 页脚={}",
+            "绘图 {}（标签 左{} 右{}）画质={} 主题={} 默认配色={} 页脚={}",
+            if appearance.draw_enable { "开" } else { "关" },
+            if appearance.badge_enable.left {
+                "开"
+            } else {
+                "关"
+            },
+            if appearance.badge_enable.right {
+                "开"
+            } else {
+                "关"
+            },
             appearance.quality,
             appearance.theme,
             appearance.default_color,

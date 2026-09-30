@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arona::runtime::http::{self, Method, Request};
@@ -764,7 +765,77 @@ fn encode(value: &str) -> String {
 
 /// 给命令与任务用的便捷构造：从三块配置里拼出一个出口
 pub fn client(account: AccountConfig, timeout_secs: u64) -> Arc<Bili> {
-    Arc::new(Bili::new(account, timeout_secs))
+    Arc::new(Bili::new(with_cookie_file(account), timeout_secs))
+}
+
+/// 原插件启动时会读 `dataFolder/cookies.json`——浏览器扩展 EditThisCookie 导出的那一份
+/// （`Init.kt:24-36`），并且**文件优先**：拼得出登录态就不用 `accountConfig.cookie`。
+/// 挂在这唯一的构造口上，任务与命令两条路径都吃到，热重载之后下一轮也会重读。
+fn with_cookie_file(mut account: AccountConfig) -> AccountConfig {
+    let path = crate::data_dir().join("cookies.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return account;
+    };
+    let found: Vec<Value> = match serde_json::from_str(&raw) {
+        Ok(list) => list,
+        Err(reason) => {
+            warn_cookie(
+                modified(&path),
+                format!("bilibili：cookies.json 读不出来（{reason}），这一轮仍用配置里的 cookie"),
+            );
+            return account;
+        }
+    };
+    let Some(cookie) = cookie_from_editthis(&found) else {
+        warn_cookie(
+            modified(&path),
+            "bilibili：cookies.json 里缺少 SESSDATA 或 bili_jct，这一轮仍用配置里的 cookie".into(),
+        );
+        return account;
+    };
+    account.cookie = cookie;
+    account
+}
+
+/// 文件的修改时间（拿不到就记 0）
+fn modified(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// 同一份坏文件只提醒一次：检测每 15 秒就要构造一个出口，文件没换过就别把日志刷满
+fn warn_cookie(stamp: u64, reason: String) {
+    if COOKIE_WARNED_ON.swap(stamp, Ordering::SeqCst) != stamp {
+        arona::runtime::log::warning(reason);
+    }
+}
+
+/// 上次提醒针对的是哪一份文件（初值取不可能出现的时间戳，保证头一次一定提醒）
+static COOKIE_WARNED_ON: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// EditThisCookie 那份数组 → 能直接发出去的 Cookie 串。只取 SESSDATA 与 bili_jct 两项
+/// （原插件的 `toCookie()` 也只要这两项，`BiliCookie.kt:60`），缺任何一项就不算登录态。
+fn cookie_from_editthis(items: &[Value]) -> Option<String> {
+    let pick = |name: &str| {
+        items
+            .iter()
+            .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|item| item.get("value").and_then(Value::as_str))
+            .filter(|value| !value.is_empty())
+    };
+    let sess = pick("SESSDATA")?;
+    let jct = pick("bili_jct")?;
+    // 扩展导出的是解码过的值，发回 B 站要原样那串：SESSDATA 里的 `,` 与 `*` 得还原成
+    // `%2C`/`%2A`（原插件同一对手工替换在 BiliCookie.kt:17）
+    Some(format!(
+        "SESSDATA={}; bili_jct={}",
+        sess.replace(',', "%2C").replace('*', "%2A"),
+        jct
+    ))
 }
 
 #[cfg(test)]
@@ -782,6 +853,28 @@ mod tests {
             unwrap_envelope(serde_json::json!({"code": 0, "ttl": 1})).unwrap(),
             Value::Null
         );
+    }
+
+    /// cookies.json（EditThisCookie 导出）只认 SESSDATA 与 bili_jct 两项，且要还原 `%2C`/`%2A`
+    #[test]
+    fn cookie_file_needs_both_keys_and_keeps_them_encoded() {
+        let list: Vec<Value> = serde_json::from_str(
+            r#"[{"name":"SESSDATA","value":"abc,def*gh"},{"name":"bili_jct","value":"jct"},{"name":"buvid3","value":"别的都不看"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cookie_from_editthis(&list).as_deref(),
+            Some("SESSDATA=abc%2Cdef%2Agh; bili_jct=jct")
+        );
+        // 缺 bili_jct 不算登录态：宁可继续用配置里那串，也别发出去一份半残的 Cookie
+        let partial: Vec<Value> =
+            serde_json::from_str(r#"[{"name":"SESSDATA","value":"abc"}]"#).unwrap();
+        assert_eq!(cookie_from_editthis(&partial), None);
+        let blank: Vec<Value> = serde_json::from_str(
+            r#"[{"name":"SESSDATA","value":""},{"name":"bili_jct","value":"jct"}]"#,
+        )
+        .unwrap();
+        assert_eq!(cookie_from_editthis(&blank), None);
     }
 
     #[test]

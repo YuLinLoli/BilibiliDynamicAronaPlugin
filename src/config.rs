@@ -109,6 +109,9 @@ impl PluginConfig for BiliConfig {
                 "@全体 拼在哪：SINGLE_MESSAGE=单独一条，PLUS_END=追加到最后一条后面"
             }
             "push.toShortLink" => "是否把推送里的长链换成短链（依赖第三方，不推荐）",
+            "push.liveCloseNotify" => {
+                "是否在直播结束时发一条结束通知；关掉只记状态，不再向订阅目标播报"
+            }
             "cache" => "图片缓存",
             "cache.downloadOriginal" => "是否下载动态里的原图（关了就只画卡片，不缓存原图）",
             "cache.expires" => {
@@ -234,6 +237,8 @@ pub struct PushConfig {
     pub push_interval: u64,
     pub at_all_plus: String,
     pub to_short_link: bool,
+    /// 直播结束通知开关：关掉之后下播只记状态，不再向订阅目标播报那一条
+    pub live_close_notify: bool,
 }
 
 impl Default for PushConfig {
@@ -243,6 +248,7 @@ impl Default for PushConfig {
             push_interval: 1000,
             at_all_plus: "SINGLE_MESSAGE".into(),
             to_short_link: false,
+            live_close_notify: true,
         }
     }
 }
@@ -387,6 +393,8 @@ fn covers(host: &str, pattern: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ImageConfig {
+    /// 绘图总开关：关掉之后动态与直播推送只走模板文本，一张卡都不画
+    pub draw_enable: bool,
     /// 图片宽度档位：800w / 1000w / 1200w / 1500w
     pub quality: String,
     /// 主题：v3 / v3RainbowOutline / v2
@@ -397,8 +405,8 @@ pub struct ImageConfig {
     pub default_color: String,
     /// 卡片装饰：FanCard / QrCode / None
     pub card_ornament: String,
-    /// 卡片顶部标签
-    pub badge_enable: bool,
+    /// 卡片顶部的标签，左右两档各一个开关
+    pub badge_enable: BadgeEnable,
     /// 渐变生成
     pub color_generator: ColorGenerator,
     /// 页脚
@@ -408,12 +416,13 @@ pub struct ImageConfig {
 impl Default for ImageConfig {
     fn default() -> Self {
         ImageConfig {
+            draw_enable: true,
             quality: "1000w".into(),
             theme: "v3".into(),
             font: String::new(),
             default_color: "#d3edfa".into(),
             card_ornament: "None".into(),
-            badge_enable: true,
+            badge_enable: BadgeEnable::default(),
             color_generator: ColorGenerator::default(),
             footer: FooterConfig::default(),
         }
@@ -440,7 +449,13 @@ impl PluginConfig for ImageConfig {
                 "卡片装饰：QrCode(右下角画动态链接二维码) / None(不装饰)。FanCard(粉丝勋章) 这一档当前\
                  不出效果——插件没铺 B 站的勋章数据，填了等同 None"
             }
-            "badgeEnable" => "卡片顶部的标签",
+            "badgeEnable" => "卡片顶部的标签，左右两档各一个开关",
+            "badgeEnable.left" => "左边那一档：动态类型（直播卡是分区）那枚标签",
+            "badgeEnable.right" => "右边那一档：动态 id（直播卡是房间号）",
+            "drawEnable" => {
+                "绘图总开关：关掉之后动态与直播推送只发模板文本，一张卡都不画\
+                 （原插件同样只管这两条推送路径，命令的「先看一眼」和链接解析不受它管）"
+            }
             "colorGenerator" | "colorGenerator.hueStep" => {
                 "渐变色生成器（仅当主题色只给了一个值时生效）"
             }
@@ -455,6 +470,25 @@ impl PluginConfig for ImageConfig {
             "footer.footerAlign" => "页脚对齐：LEFT / CENTER / RIGHT",
             _ => return None,
         })
+    }
+}
+
+/// 卡片顶部那两枚标签的开关。左右是两档独立的键（原插件 `BadgeEnable` 就是这个形状，
+/// 默认左边开、右边关），两个都关时整条标签带的高度一起收掉。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BadgeEnable {
+    pub left: bool,
+    pub right: bool,
+}
+
+/// 默认值照原插件：左边开、右边关（`BiliConfig.kt:187-189`）
+impl Default for BadgeEnable {
+    fn default() -> Self {
+        BadgeEnable {
+            left: true,
+            right: false,
+        }
     }
 }
 
@@ -662,6 +696,13 @@ mod tests {
         assert!(!plus_end.at_all_is_single());
     }
 
+    /// 结束通知默认开着，而且这条键得在配置模板里露出来（原插件 `liveCloseNotifyEnable`）
+    #[test]
+    fn live_close_notify_defaults_on_and_is_documented() {
+        assert!(PushConfig::default().live_close_notify);
+        assert!(BiliConfig::comment("push.liveCloseNotify").is_some());
+    }
+
     #[test]
     fn link_allowlist_blocks_foreign_hosts() {
         let config = LinkResolveConfig::default();
@@ -689,6 +730,19 @@ mod tests {
                 .dynamic_push
                 .contains_key(&config.default_dynamic_push)
         );
+    }
+
+    /// 绘图这两档开关的默认值要跟原插件一致：总开关开、徽章左开右关（`BiliConfig.kt:145,187-189`）
+    #[test]
+    fn drawing_defaults_match_the_original() {
+        let appearance = ImageConfig::default();
+        assert!(appearance.draw_enable);
+        assert!(appearance.badge_enable.left);
+        assert!(!appearance.badge_enable.right);
+        // 这三条键都得在配置模板里有注释，否则用户看不见有这个东西
+        assert!(ImageConfig::comment("drawEnable").is_some());
+        assert!(ImageConfig::comment("badgeEnable.left").is_some());
+        assert!(ImageConfig::comment("badgeEnable.right").is_some());
     }
 
     /// 序列化回来的键名必须是 camelCase，否则老用户的配置抄不过来
