@@ -159,8 +159,10 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 ### `bili-template` — 推送模板
 
-内置模板名：动态 `OnlyDraw` / `SimpleMsg` / `ForwardMsg` / `NoDraw`，
-直播 `OnlyDraw` / `SimpleMsg` / `TextOnly`，直播结束 `SimpleMsg`。
+内置模板名：动态 `OnlyDraw` / `SimpleMsg` / `ForwardMsg` / `NoDraw`，另附原插件那五档
+`DrawOnly` / `TextOnly` / `OneMsg` / `TwoMsg` / `ForwardMsg`；直播 `OnlyDraw` / `SimpleMsg` / `TextOnly`，
+另附 `DrawOnly` / `OneMsg` / `TwoMsg`；直播结束 `SimpleMsg` / `ComplexMsg`。
+两边同名的档位内容一致，改名那一档见「已知差别」第 37 条。
 `defaultDynamicPush` / `defaultLivePush` / `defaultLiveClose` 都指向 `SimpleMsg`。
 表是自己加项的：键名就是 `/bili template` 里写的模板名。
 
@@ -279,6 +281,19 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     实测**同一秒连打两次就回 `-352 风控校验失败`**（响应只有 120 字节），未登录时等级还回 Lv0。
     链接解析里 `t.bilibili.com/<动态ID>` 那一族仍必须签名（B 站只有那条给单条动态），所以连点会吃到 -352，
     插件如实回一句「把检测间隔调大一些再试」，不静默、不假装成功。
+37. **模板名与原插件一档不改名，另外多三档**：原插件 `TemplateConfig` 那几档（动态
+    `DrawOnly`/`TextOnly`/`OneMsg`/`TwoMsg`/`ForwardMsg`、直播 `DrawOnly`/`TextOnly`/`OneMsg`/`TwoMsg`、
+    结束 `SimpleMsg`/`ComplexMsg`，`BiliConfig.kt:227-247`）名字与模板串都照搬，那边配置里写
+    `defaultDynamicPush: OneMsg` 的换过来不用改。这边另有 `OnlyDraw` / `SimpleMsg` / `NoDraw` 三档，
+    其中 `SimpleMsg` 用 `\r` 把卡片、正文、配图拆成三条，是默认的推送形态。
+    **配置文件是按当前代码生成的**：旧那份 yml 的 `dynamicPush` 表里没有新补的那几档，把默认指过去会查不到
+    而回退到 `SimpleMsg`——删掉 `config/bilibili/arona.yml` 让框架重生成就行（实测重生成出来九档齐全）。
+38. **几处默认值刻意保守**：`account.autoFollow` 原 `true` → `false`（订阅不擅自替你关注）、
+    `account.followGroup` 原 `"Bot关注"` → 留空（不预设分组名）、`cache.downloadOriginal` 原 `true` → `false`
+    （默认不落地原图，附件仍照发）、`cardOrnament` 原 `FanCard` → `None`（见第 29 条）、
+    `push.messageInterval`/`pushInterval` 从 100/500 毫秒放宽到 500/1000（连打会被 B 站判 -352）、
+    `check.interval` 从 15 秒放宽到 30、`check.timeout` 从 10 秒放宽到 20、`footerAlign` 从 LEFT 改 CENTER、
+    `defaultDynamicPush` 从 `OneMsg` 改成 `SimpleMsg`。
 
 ## 预留问题
 
@@ -397,6 +412,12 @@ PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有�
   `status: 0 / closed: true`——状态照记，只是不播；改回 `true` 复跑同一份伪造状态，逼出 1 条完整结束通知：
   「老番茄 的直播已结束／标题：最手忙脚乱的一集／分区：其他单机／房间号：21852／开播：2026年09月30日 17:41:38／
   结束：2026年09月30日 21:39:58／时长：3:58:20」。这是这一族通知第二次被真数据驱动。
+- 原插件那几档模板名补齐之后实压过一遍：删掉 `config/bilibili/arona.yml` 让框架按新代码重生成，`dynamicPush`
+  表里 `DrawOnly`/`TextOnly`/`OneMsg`/`TwoMsg` 四档都出现了（旧那份 yml 里确实没有，所以先前把
+  `defaultDynamicPush` 指到 `OneMsg` 会查不到而回退成 `SimpleMsg`——F 轮就是这么撞上的，不是渲染 bug）。
+  重生成之后配 `defaultDynamicPush: OneMsg` + `drawEnable: false` 逼一轮，12 条推送**每条恰好三行**：
+  「[绘制动态失败]⏎老番茄@视频⏎https://t.bilibili.com/1253703543616962617」，`{type}` 真给出「视频／转发动态」，
+  带图 0 条——`OneMsg` 本来就不含 `{images}`，与原插件那串一模一样。
 
 同一天还修了一处真缺陷：**番剧检测原先只在启动/热重载时跑一次**（`schedule()` 里一次性 `spawn_as`，注释却
 写着「跟着动态那一轮跑」），追番的新集永远不会推。现在挂在 `dynamic_job` 里跟动态同轮，`run_seasons` 自带的
