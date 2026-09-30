@@ -23,9 +23,10 @@ mod subscribe;
 
 use std::sync::Arc;
 
+use arona::bot::Bot;
 use arona::plugin::PluginContext;
 use arona::runtime::dispatcher::{CommandContext, CommandRegistration, handler};
-use arona::runtime::message::OutgoingMessage;
+use arona::runtime::message::{MessageSegment, MessageTarget, OutgoingMessage};
 
 use crate::bili::api::{self, Bili};
 use crate::config::{BiliConfig, CommandConfig, SECTION};
@@ -43,6 +44,29 @@ pub(crate) fn reply(text: impl Into<String>) -> Reply {
 /// 回一句并且拼上换行（多处用 `Vec::join` 组段，别在字符串里手写 `\n`）
 pub(crate) fn lines(items: &[String]) -> Reply {
     reply(items.join("\n"))
+}
+
+/// 通报里那句「结果」：只取回复的文本段，超过 120 字截断——
+/// 卡片图与合并转发那些进不了这一行，写清"这条自己发了"就够管理员看懂
+fn summary(answer: &Reply) -> String {
+    let Some(message) = answer else {
+        return "（结果由命令自己发出）".to_string();
+    };
+    let text = message
+        .segments
+        .iter()
+        .filter_map(|segment| match segment {
+            MessageSegment::Text(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > 120 {
+        format!("{}…", chars[..120].iter().collect::<String>())
+    } else {
+        text
+    }
 }
 
 /// [`SUBS`] 表里那条子命令的用法串，参数不全时回显它
@@ -354,7 +378,9 @@ async fn run(context: PluginContext, from: Arc<CommandContext>, arguments: Vec<S
         ));
     };
     call.args.remove(0);
-    dispatch(cmd, &call).await
+    let answer = dispatch(cmd, &call).await;
+    call.notify(cmd, &head, &answer).await;
+    answer
 }
 
 /// 子命令分发。`match` 打全 [`Cmd`]，加了变体忘了分支就编译不过。
@@ -394,6 +420,33 @@ async fn dispatch(cmd: Cmd, call: &Call) -> Reply {
         Cmd::Ban => group::members(call, false).await,
         Cmd::Clear => browse::clear(call).await,
     }
+}
+
+/// 会动数据的子命令：这批要做操作通报（原插件 `General.kt:448` 的 `actionNotify`
+/// 就挂在订阅、分组、模板、过滤、@全体 那几类操作上，查看类不报）。
+fn mutates(cmd: Cmd) -> bool {
+    matches!(
+        cmd,
+        Cmd::Color
+            | Cmd::Add
+            | Cmd::Del
+            | Cmd::DelAll
+            | Cmd::FilterMode
+            | Cmd::FilterType
+            | Cmd::FilterReg
+            | Cmd::FilterDel
+            | Cmd::Template
+            | Cmd::Login
+            | Cmd::AtAll
+            | Cmd::DelAtAll
+            | Cmd::Create
+            | Cmd::DelGroup
+            | Cmd::AddGroupAdmin
+            | Cmd::BanGroupAdmin
+            | Cmd::Push
+            | Cmd::Ban
+            | Cmd::Clear
+    )
 }
 
 /// 帮助文本。原插件发的是一张 `HELP.png`，本插件没随包图，直接列文本——
@@ -489,6 +542,75 @@ impl Call {
                 .from
                 .group_id
                 .is_some_and(|group_id| self.conf.admin.contains(&group_id))
+    }
+
+    /// 非管理员动了数据就给管理员发一条通报（`bili.notifyEnable`）。
+    /// 通报发不进会话时不吭声：`admin` 里写的号机器人可能确实不认识。
+    pub(crate) async fn notify(&self, cmd: Cmd, sub: &str, answer: &Reply) {
+        if !self.conf.notify_enable || !mutates(cmd) || self.is_bot_admin() {
+            return;
+        }
+        let who = match self.from.sender_name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => format!("{}（{}）", name, self.from.user_id),
+            _ => self.from.user_id.to_string(),
+        };
+        let where_ = match self.from.group_id {
+            Some(group_id) => format!("群 {group_id}"),
+            None => "私聊".to_string(),
+        };
+        let note = format!(
+            "bilibili 操作通报\n操作人: {who}\n位置: {where_}\n操作: {} {sub} {}\n结果: {}",
+            self.prefix(),
+            self.args.join(" "),
+            summary(answer),
+        );
+        let bot = Bot::of(self.ctx.framework());
+        for admin in &self.conf.admin {
+            bot.send(
+                self.admin_target(*admin),
+                OutgoingMessage::text(note.clone()),
+            )
+            .await;
+        }
+    }
+
+    /// 管理员那个号发到哪儿：订阅表里认得出是哪个会话就发那个，
+    /// 两边都没出现过就按私聊试——`admin` 里写的多数是 QQ 号
+    fn admin_target(&self, id: i64) -> MessageTarget {
+        crate::store().read(|data| {
+            if data.targets.contains_key(&store::group_key(id))
+                && !data.targets.contains_key(&store::friend_key(id))
+            {
+                MessageTarget::Group(id)
+            } else {
+                MessageTarget::Private(id)
+            }
+        })
+    }
+
+    /// 慢命令开场：按 `bili.showLoadingMessage` 发一条「加载中…」占位。
+    /// 拿到号就交给 [`dismiss_loading`](Self::dismiss_loading) 撤，关着或发不出去回 `None`。
+    pub(crate) async fn loading(&self) -> Option<i64> {
+        if !self.conf.show_loading_message {
+            return None;
+        }
+        Bot::of(self.ctx.framework())
+            .send(self.from.target(), OutgoingMessage::text("加载中..."))
+            .await
+            .message_id
+    }
+
+    /// 结果到手，把那条占位撤掉
+    pub(crate) async fn dismiss_loading(&self, message_id: Option<i64>) {
+        let Some(message_id) = message_id else {
+            return;
+        };
+        let _ = Bot::of(self.ctx.framework())
+            .recall(message_id)
+            .await
+            .inspect_err(|error| {
+                arona::runtime::log::debug(format!("bilibili：那条「加载中...」没撤掉（{error}）"));
+            });
     }
 
     /// 按当前配置起一个 B 站接口客户端
@@ -694,6 +816,51 @@ impl Match {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 通报里的「结果」那一行：文本段拼起来，图片那些不进这一行
+    #[test]
+    fn the_note_summarises_only_the_text_segments() {
+        let text = summary(&reply("订阅 老番茄 成功"));
+        assert_eq!(text, "订阅 老番茄 成功");
+        assert_eq!(summary(&None), "（结果由命令自己发出）");
+        let mixed = OutgoingMessage::new(vec![
+            MessageSegment::Text("看这张".into()),
+            MessageSegment::At(12345),
+        ]);
+        assert_eq!(summary(&Some(mixed)), "看这张");
+    }
+
+    /// 长回复截到 120 字，通报不能比原话还长
+    #[test]
+    fn a_long_answer_is_cut_for_the_note() {
+        let long = "动".repeat(200);
+        assert_eq!(summary(&reply(long)).chars().count(), 121);
+    }
+
+    /// 查看类命令不进通报名单，动数据的才进
+    #[test]
+    fn only_state_changing_subcommands_are_reported() {
+        for cmd in [
+            Cmd::Add,
+            Cmd::Del,
+            Cmd::Template,
+            Cmd::Push,
+            Cmd::Clear,
+            Cmd::Login,
+        ] {
+            assert!(mutates(cmd), "{cmd:?} 动了数据却不通报");
+        }
+        for cmd in [
+            Cmd::Help,
+            Cmd::List,
+            Cmd::ListAll,
+            Cmd::FilterList,
+            Cmd::Config,
+            Cmd::Search,
+        ] {
+            assert!(!mutates(cmd), "{cmd:?} 只是查看，不该通报");
+        }
+    }
 
     #[test]
     fn aliases_are_unique_across_the_whole_tree() {

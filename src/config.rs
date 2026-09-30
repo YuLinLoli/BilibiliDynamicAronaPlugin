@@ -36,6 +36,10 @@ pub struct BiliConfig {
     pub enable: bool,
     /// 框架管理员之外的额外管理员（QQ 号或群号）
     pub admin: Vec<i64>,
+    /// 非管理员的操作是否给管理员发一条通报
+    pub notify_enable: bool,
+    /// 慢命令是否先发一条「加载中…」再撤回
+    pub show_loading_message: bool,
     /// 主命令名与别名
     pub command: CommandConfig,
     /// B 站账号（Cookie 可手填，也可用 /bili login 扫码登录自动写入）
@@ -59,6 +63,8 @@ impl Default for BiliConfig {
         BiliConfig {
             enable: true,
             admin: Vec::new(),
+            notify_enable: true,
+            show_loading_message: true,
             command: CommandConfig::default(),
             account: AccountConfig::default(),
             check: CheckConfig::default(),
@@ -81,6 +87,13 @@ impl PluginConfig for BiliConfig {
         Some(match path {
             "enable" => "总开关：关掉后检测任务不再推送，命令仍然可用",
             "admin" => "框架管理员之外的额外管理员，写 QQ 号或群号",
+            "notifyEnable" => {
+                "别人（不在 admin 里的人）动了订阅/分组/模板/过滤/@全体 时，\
+                 是否给每个管理员发一条私聊通报\n关掉就只在日志里记"
+            }
+            "showLoadingMessage" => {
+                "慢命令（模板列表、搜索、最新动态、最新视频）是否先发一条「加载中…」，\n出结果后撤回"
+            }
             "command" | "command.names" => {
                 "主命令名与别名，必须带前缀\n多个名字都指向同一棵子命令树\n改名要重启才生效"
             }
@@ -100,7 +113,7 @@ impl PluginConfig for BiliConfig {
             "check.lowSpeed" => {
                 "低频时段，例 3-8x2 表示 3 点到 8 点间隔为正常间隔的 2 倍；留空表示全天同速"
             }
-            "check.reportInterval" => "在日志里汇报检测情况的间隔(分钟)，0 表示每次检测都汇报",
+            "check.reportInterval" => "接口失败时每隔多少分钟记一条日志，0 表示每次失败都记",
             "check.timeout" => "单次 B 站请求的超时(秒)",
             "push" => "推送节流",
             "push.messageInterval" => "同一个群连续发多条之间的间隔(毫秒)，防风控",

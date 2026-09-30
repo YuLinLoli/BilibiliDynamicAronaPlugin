@@ -6,8 +6,9 @@
 //! 用户在命令里看到的效果图，就是稍后订阅者收到的那张。
 //!
 //! 与原插件的几处刻意为之的差别，都记在 README：
-//! * 原插件有一档 `enableConfig.showLoadingMessage`（先发"加载中…"再撤回）。本插件没这一档配置，
-//!   慢的时候就是慢，不占一次额外发送。
+//! * 「加载中…」那一档（`bili.showLoadingMessage`）只挂在 `search`/`new`/`video` 这三条
+//!   要联网的命令上。原插件还挂在 `templateList` 上（`DynamicCommand.kt:224`），那边画图要时间，
+//!   这边模板预览用的是假数据、不联网也不绘图，占位一条只会闪一下，所以没挂。
 //! * `login` 成功之后多回一句"登录成功!"，原插件只默默写 Cookie。
 //! * `clear` 要等用户回一句"确定"，框架没有 `nextMessage` 这种"等下一条消息"的出口，
 //!   所以改成两步命令（见 [`clear`]）。
@@ -217,7 +218,13 @@ pub(crate) async fn config(call: &Call) -> Reply {
     let templates = call.ctx().config::<TemplateConfig>(TEMPLATE_SECTION).get();
     let mut out: Vec<String> = vec![
         "bilibili 全局配置".to_string(),
-        format!("总开关 {}｜管理员 {:?}", bili.enable, bili.admin),
+        format!(
+            "总开关 {}｜管理员 {:?}｜操作通报 {}｜加载中占位 {}",
+            bili.enable,
+            bili.admin,
+            on_off(bili.notify_enable),
+            on_off(bili.show_loading_message)
+        ),
         format!(
             "命令名 {}｜检测间隔 动态 {} 秒 / 直播 {} 秒｜低频 {}",
             call.prefix(),
@@ -348,8 +355,19 @@ fn dash(value: Option<&String>) -> String {
     value.cloned().unwrap_or_else(|| "—".to_string())
 }
 
-/// `/bili search <动态ID>`：取一条动态画出来给当前会话看
+/// `/bili search <动态ID>`：取一条动态画出来给当前会话看。
+///
+/// 要联网的慢命令统一包一层：按 `bili.showLoadingMessage` 先发「加载中…」，结果出来后撤掉
+/// （原插件 `DynamicCommand.kt:314/343/363` 那一档）。包在外面而不是写在正文里，是因为
+/// 这几条每条都有十来条提前 `return` 的失败支路，靠人记着撤占位迟早漏一条。
 pub(crate) async fn search(call: &Call) -> Reply {
+    let loading = call.loading().await;
+    let answer = search_body(call).await;
+    call.dismiss_loading(loading).await;
+    answer
+}
+
+async fn search_body(call: &Call) -> Reply {
     let raw = match call.need(0, &usage_str(call, Cmd::Search)) {
         Ok(value) => value,
         Err(reason) => return reply(reason),
@@ -401,8 +419,20 @@ pub(crate) async fn live(call: &Call) -> Reply {
     None
 }
 
+/// 配置回显里那两个字的开关写法
+fn on_off(flag: bool) -> &'static str {
+    if flag { "开" } else { "关" }
+}
+
 /// `/bili new <UID|名字> [条数]`：这个 UP 最新的几条
 pub(crate) async fn new(call: &Call) -> Reply {
+    let loading = call.loading().await;
+    let answer = new_body(call).await;
+    call.dismiss_loading(loading).await;
+    answer
+}
+
+async fn new_body(call: &Call) -> Reply {
     let raw = match call.need(0, &usage_str(call, Cmd::New)) {
         Ok(value) => value,
         Err(reason) => return reply(reason),
@@ -436,6 +466,13 @@ pub(crate) async fn new(call: &Call) -> Reply {
 /// 原插件走的是 `searchUserVideo`（拿 bvid 画一张视频卡），那个接口现在必须带登录态，
 /// 所以这里改成在动态流里挑第一条"视频"类型的——效果一样，少一次签名依赖。
 pub(crate) async fn video(call: &Call) -> Reply {
+    let loading = call.loading().await;
+    let answer = video_body(call).await;
+    call.dismiss_loading(loading).await;
+    answer
+}
+
+async fn video_body(call: &Call) -> Reply {
     let raw = match call.need(0, &usage_str(call, Cmd::Video)) {
         Ok(value) => value,
         Err(reason) => return reply(reason),
