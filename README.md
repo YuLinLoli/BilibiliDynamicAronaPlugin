@@ -105,7 +105,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `admin` | `[]` | 框架管理员之外的额外管理员（QQ 号或群号） |
 | `command.names` | `["/bili","/b","/动态"]` | 主命令名与别名，必须带前缀 |
 | `command.prefixFree` | `false` | 群聊里是否允许不带前缀直接发 |
-| `account.cookie` | `""` | 完整 Cookie 串，`/bili login` 成功后自动写回 |
+| `account.cookie` | `""` | 完整 Cookie 串，`/bili login` 成功后自动写回；同目录有 `cookies.json` 时以文件为准（见「导入浏览器 cookie」） |
 | `account.uid` | `0` | Cookie 所属 uid |
 | `account.csrf` | `""` | `bili_jct`，留空则从 cookie 里解析 |
 | `account.autoFollow` | `false` | 添加订阅时顺手关注这个 UP |
@@ -119,6 +119,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `push.pushInterval` | `1000` | 连续两个目标之间的间隔(毫秒) |
 | `push.atAllPlus` | `SINGLE_MESSAGE` | @全体 单独一条；`PLUS_END` = 追加到最后一条后面 |
 | `push.toShortLink` | `false` | 推送里的长链换成短链（依赖第三方，不推荐） |
+| `push.liveCloseNotify` | `true` | 下播时播一条结束通知；关掉只记状态，不再向订阅目标播报 |
 | `cache.downloadOriginal` | `false` | 是否下载动态里的原图 |
 | `cache.expires` | `DRAW:7 IMAGES:30 EMOJI:90 USER:90 OTHER:30` | 各类图多少天没再被用到就清理，0 = 不清 |
 | `proxy` | `[]` | 代理列表（见「已知差别」第 9 条） |
@@ -142,7 +143,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `font` | `""` | 字体文件**绝对路径**，或放在 `config/bilibili/font/` 下的**文件名**（后缀 `.ttf/.otf/.ttc` 可省）；留空自动找系统中文字体。后可跟 `;` 指定粗体 |
 | `defaultColor` | `#d3edfa` | 默认主题色，多个用 `;` 分隔构成渐变；单个值按 colorGenerator 自动生成 |
 | `cardOrnament` | `None` | 卡片装饰：`QrCode` / `None`；`FanCard` 这一档当前不出效果（见「已知差别」第 29 条） |
-| `badgeEnable` | `true` | 卡片顶部标签 |
+| `drawEnable` | `true` | 绘图总开关：关掉之后卡片不画，模板里的 `{draw}` 落文字占位 |
+| `badgeEnable.left` | `true` | 卡片顶部左标签（头像那枚） |
+| `badgeEnable.right` | `false` | 卡片顶部右标签（配色条那枚）；两档都关掉时整条标签带的高度一起收掉 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
 | `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度 |
 | `colorGenerator.saturation` | `0.25` | 锁定的饱和度 0.0-1.0 |
@@ -169,6 +172,21 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 * `\n` 换行；`\r` 拆成多条消息；`{>>}` … `{<<}` 之间的内容发成合并转发
 
 `forwardCard` 是 QQ 转发卡片的外观（`title` / `preview` / `summary` / `brief`），见「已知差别」第 6 条。
+
+`drawEnable: false` 时卡片不画，`{draw}` 那格会落成一句占位文本
+（动态 `[绘制动态失败]`、直播 `[绘制直播图片失败]`）——这与原插件关掉 `drawEnable` 后的行为一致。
+只想要卡片不要文字，把模板换成 `OnlyDraw`；想要文字不要卡片，换成 `NoDraw`。
+
+### 导入浏览器 cookie（`cookies.json`）
+
+不想在 QQ 里扫码，可以把浏览器里已登录的 B 站 cookie 导出来用：装 EditThisCookie 之类的扩展，
+在 `bilibili.com` 域下导出 JSON，存成 `data/bilibili/cookies.json`，重启插件即可。
+
+* 只认数组里的 `SESSDATA` 与 `bili_jct` 两项，**缺一不算登录态**；两项都空值也不算。
+* **文件优先**：文件里拼得出登录态时覆盖 `bili.account.cookie`；拼不出来（文件坏、缺项）时
+  回退用配置里那份，并往宿主日志记一条告警。
+* 同一份坏文件只告一次：插件每轮检测都会重读这个文件，按文件修改时间去重，改过一次文件才会再提醒。
+* 热重载配置或重启之后会重读，`/bili login` 成功则直接写配置那份 cookie，两者互不干扰。
 
 ## 已知差别
 
@@ -233,9 +251,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     不另发 `General.kt` 那类操作通知。
 31. **画质四档内置，字体不自动下载**：原插件允许 `customOverload` 逐档覆盖像素布局（`DynamicImageQuality.kt:14`），
     这里四档写死；原插件找不到字体会自动下一份默认字体（`Init.kt:77`），这里找不到就记一条日志、这条只发文本。
-32. **单 bot、没有分档开关**：原插件的 Napcat 多 bot 探测（`NapcatCheckTasker.kt`）和 `cacheClearEnable` /
-    `liveCloseNotifyEnable` 两个开关都没有对应项——一个框架实例对应的就是它自己那条连接，缓存清理与直播结束
-    通知总是随主流程跑，不单独关。
+32. **单 bot**：原插件的 Napcat 多 bot 探测（`NapcatCheckTasker.kt`）没有对应项——一个框架实例对应的就是它自己那条连接。
+    原插件那两个分档开关在这里各有归宿：`liveCloseNotifyEnable` 就是 `push.liveCloseNotify`（关掉下播只记状态、
+    不再向订阅目标播报）；`cacheClearEnable` 不单开开关，把 `cache.expires` 各类都填 `0` 就是不删。
 33. **`muted`（静音）是个只读字段**：`store.yml` 里有它，`/bili config` 会打「静音：是/否」，推送路径上三处都会
     跳过静音目标，但**没有任何命令或配置项能把它打开**（原插件没有这一功能面，`mute` 那几处命中全是 `Mutex`）。
     留着的代价是清单上有个改不动的开关，撤掉的代价是将来想做要重写读侧——这条留给你定。
@@ -300,6 +318,12 @@ node fake-onebot-link.mjs      # 链接解析钩子：七条带 at 段的消息�
 node fake-onebot-season.mjs    # 番剧跟跑：订一部番后静默四轮，看检测有没有每轮都查
 node fake-onebot-new.mjs       # 软限流探针：同一个 uid 连发 N 次 /bili new，数几次出真动态
 node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推送与其中的图片段
+node fake-onebot-cookie.mjs    # 只发 `/bili config`，把回话全文打出来（查配置项有没有真生效）
+node peek-images.mjs           # 不是服务端：把 sent log 里的图片段解成「PNG/JPEG 宽x高 字节数」
+```
+
+`peek-images.mjs` 是判「绘图开关有没有生效」的那把尺：图片段正文里 `iVBORw0KGgo` 开头是插件画的
+PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有没有 `iVBOR` 就够了，比数条数可靠。
 ```
 
 回话按「第 i 条命令下发到第 i+1 条之间收到的」归属，打到 `可疑 0 条` 才算过。宿主一律
@@ -349,6 +373,30 @@ node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推�
   `items` 空数组回「未找到动态」。要不要拿 `psource`/水位把这两种分开是你的取舍，不是缺陷清单。
 - 删掉 `config/bilibili/arona.yml` 让框架重生成，`linkResolve.enable` 出来是 `true`，跟
   `LinkResolveConfig::default()`（`config.rs:321`）一致——先前运行目录里那份 `false` 是手工关的，不是默认值。
+- `drawEnable` 两档都实压过：关掉那一轮假端收到 37 条推送、11 个图片段**全是 JPEG**（`/9j/4AAQSkZ` 开头，
+  也就是动态自带的原图），`iVBOR` 一张都没有——卡片确实没画；打开那一轮出 12 张 1000w PNG 卡片。
+  `{draw}` 那格落的是 `[绘制动态失败]` / `[绘制直播图片失败]` 两句文案，与原插件同分支同文案（`SendTasker.kt:327/432`），
+  不是这里画不出来。判开关只看图片段开头，别数条数。
+- `badgeEnable` 拆成 `left` / `right` 两档之后按卡片高度判定：两档都关掉时 13 张卡每张**恰好矮 45 px**
+  （那 45 px 就是这一档的 `badge_height`），只关一档时高度不变——右档顶到标签带起点，带子该多高还多高。
+  单测 `turning_both_badges_off_shrinks_the_card` 钉的是同一件事。
+- `cookies.json` 走的是**文件优先**，正反各压一轮（判据不用 `/bili config` 的「登录态」那格——它打的是
+  `BiliConfig.account.signed()`，看的是配置串，文件里的 cookie 根本不经它）：
+  配置里 `account.cookie` 留空，`subs` 加上通配档 `0`（`wants_all()` 为真），而「关注时间线」这一路
+  只在 `bili.signed()` 时才发（`tasks/mod.rs:253`），所以**宿主日志里有没有 `feed/all` 代发**就是硬判据。
+  放一份 EditThisCookie 形状的完整假 cookie（`SESSDATA` + `bili_jct`，另带一项干扰用的 `buvid3`）→
+  每轮真发 `feed/all`，110 秒窗口里 8 次，且 0 条 cookie 告警；假 cookie 被 B 站回
+  `code -400: 请求错误`，插件报「关注时间线读不出来：B 站返回 code -400: 请求错误」，不栈崩。
+  把文件移走复跑同一份订阅 → `feed/all` **一次都不发**，同窗口 `feed/space` 9 次照旧（其它路径没坏）。
+- 坏文件只告一次：放一份只给 `SESSDATA`、缺 `bili_jct` 的文件（`cookie_from_editthis` 判它不算登录态），
+  90 秒 / 约 6 轮检测里宿主日志恰好 **1 条**告警——「cookies.json 里缺少 SESSDATA 或 bili_jct，这一轮仍用配置里的
+  cookie」（21:30:28 那一条），同窗口 `feed/all` 0 次、`feed/space` 6 次。先前是每轮刷 3 条，
+  现在按文件 mtime 去重（`api.rs` 的 `warn_cookie`），改过一次文件才会再提醒。
+- `push.liveCloseNotify` 双向实压：把 `store.yml` 的 `live.'546195'` 伪造成 `status: 1 / closed: false`
+  （真人在 21:02 已下播，所以这一轮必然判定「结束」）。开关关掉时假端**0 条推送**，而 `store.yml` 被插件写成
+  `status: 0 / closed: true`——状态照记，只是不播；改回 `true` 复跑同一份伪造状态，逼出 1 条完整结束通知：
+  「老番茄 的直播已结束／标题：最手忙脚乱的一集／分区：其他单机／房间号：21852／开播：2026年09月30日 17:41:38／
+  结束：2026年09月30日 21:39:58／时长：3:58:20」。这是这一族通知第二次被真数据驱动。
 
 同一天还修了一处真缺陷：**番剧检测原先只在启动/热重载时跑一次**（`schedule()` 里一次性 `spawn_as`，注释却
 写着「跟着动态那一轮跑」），追番的新集永远不会推。现在挂在 `dynamic_job` 里跟动态同轮，`run_seasons` 自带的
@@ -401,7 +449,7 @@ node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推�
 ```
 cargo fmt
 cargo clippy --all-targets     # 目标：0 警告
-cargo test --lib               # 147 项（145 通过 + 2 项联网用例标了 #[ignore]）
+cargo test --lib               # 151 项（149 通过 + 2 项联网用例标了 #[ignore]）
 cargo build --release
 ```
 
