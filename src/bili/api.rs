@@ -444,7 +444,9 @@ impl Bili {
                 "https://www.bilibili.com/bangumi/",
             )
             .await?;
-        parse_season(&data).ok_or_else(|| format!("B 站没给剧集 {ep_id} 所属的番剧"))
+        // 这一路跟 `season()` 一样包在 `result` 里，直接递整份 data 会连 season_id 都取不到
+        let result = data.get("result").unwrap_or(&data);
+        parse_season(result).ok_or_else(|| format!("B 站没给剧集 {ep_id} 所属的番剧"))
     }
 
     /// `md` 号那一路：港澳台番剧在 `season` 表里查不到，只能从 review 接口按 media_id 换算
@@ -471,9 +473,9 @@ impl Bili {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            // 这份接口只给换算用的字段，最新集数由检测任务再查一次 season 接口
+            // 这份接口只给换算用的字段，最新集由检测任务再查一次 season 接口
+            newest_ep: 0,
             newest_title: String::new(),
-            publish_text: String::new(),
         })
     }
 

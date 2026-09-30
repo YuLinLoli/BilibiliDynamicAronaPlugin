@@ -617,6 +617,32 @@ async fn announce_close(
     }
 }
 
+/// 一轮番剧比对的结果
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeasonMove {
+    /// 这一条本轮不作数：读不到最新集，或者跟基线一模一样
+    Skip,
+    /// 只记基线，不推
+    Record,
+    /// 换集了：记基线并推一条
+    Push,
+}
+
+/// 基线认的是剧集号（`new_ep.id`）而不是集名文本：集号单调唯一，集名会撞车
+/// （同一话的中文配音版号不同、名子一样）。更要紧的是别拿空串去比——2026-09-30 实测里
+/// 那条尾巴空着的「更新了：」就是「接口没给最新集」被当成「换了集」推出去的。
+/// 认不出是数字的基线一律只重记不推（那是老格式按集名存下来的）。
+fn season_move(seen: Option<&str>, newest_ep: i64) -> SeasonMove {
+    if newest_ep == 0 {
+        return SeasonMove::Skip;
+    }
+    match seen.and_then(|seen| seen.parse::<i64>().ok()) {
+        Some(seen) if seen == newest_ep => SeasonMove::Skip,
+        Some(_) => SeasonMove::Push,
+        None => SeasonMove::Record,
+    }
+}
+
 /// 一轮番剧检测：新集标题变了才推
 async fn run_seasons(ctx: PluginContext) {
     let Some(_guard) = Busy::try_lock(&SEASON_BUSY) else {
@@ -660,15 +686,13 @@ async fn run_seasons(ctx: PluginContext) {
             }
         };
         let seen = crate::store().read(|data| data.seasons.get(&raw).cloned());
-        if seen.as_deref() == Some(season.newest_title.as_str()) {
+        let verdict = season_move(seen.as_deref(), season.newest_ep);
+        if verdict == SeasonMove::Skip {
             continue;
         }
-        let first = seen.is_none();
-        crate::store().write(|data| {
-            data.seasons
-                .insert(raw.clone(), season.newest_title.clone());
-        });
-        if first {
+        let baseline = season.newest_ep.to_string();
+        crate::store().write(|data| data.seasons.insert(raw.clone(), baseline.clone()));
+        if verdict == SeasonMove::Record {
             // 刚订阅：只记当前集，不把"已更新到第 N 集"当新集推一条
             continue;
         }
@@ -1251,6 +1275,25 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    /// 2026-09-30 实测到的坏推送：那一版按 `newest.title` 取最新集，而这个键接口压根不给，
+    /// 于是空串跟基线一比就判成「换集」，推了一条尾巴空着的「更新了：」。
+    #[test]
+    fn a_season_without_an_episode_id_never_moves_the_baseline() {
+        // 读不到最新一集：不推，也不动基线
+        assert_eq!(season_move(Some("6291966"), 0), SeasonMove::Skip);
+        assert_eq!(season_move(None, 0), SeasonMove::Skip);
+        // 没有基线、空基线、老格式（当年按集名存下来的）都只重记不推
+        assert_eq!(season_move(None, 6291966), SeasonMove::Record);
+        assert_eq!(season_move(Some(""), 6291966), SeasonMove::Record);
+        assert_eq!(
+            season_move(Some("第01集（占位旧基线）"), 6291966),
+            SeasonMove::Record
+        );
+        // 只有数字基线才进比对
+        assert_eq!(season_move(Some("6291966"), 6291966), SeasonMove::Skip);
+        assert_eq!(season_move(Some("6291908"), 6291966), SeasonMove::Push);
     }
 
     /// 卡片上要画的表情：正文与转发原文里的都收，同名只留一份，没地址的不收

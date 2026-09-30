@@ -834,19 +834,42 @@ pub struct Season {
     pub season_id: i64,
     pub title: String,
     pub cover: String,
-    /// 最新一集的标题
+    /// 最新一集的剧集号（`new_ep.id`）。基线比对认它——集号文本会撞车（同一话有中文配音版）
+    pub newest_ep: i64,
+    /// 最新一集给用户看的文本，如「第9话 命悬一线」
     pub newest_title: String,
-    pub publish_text: String,
 }
 
+/// 最新一集在 `new_ep` 那一格，集号是光秃秃的一个「9」，集名却在 `episodes` 对应项的
+/// `long_title` 里。`newest` 那个键是早年的接口形状：2026-09-30 实测三部（含未完结的
+/// ss298872）一个都不给，照它取等于最新集恒空——番剧更新因此从来没真推过一条。
 pub fn parse_season(data: &Value) -> Option<Season> {
     let season_id = number(data, &["season_id"]).or_else(|| number(data, &["id"]))?;
+    let newest_ep = number(data, &["new_ep", "id"]).unwrap_or_default();
+    let episode = at(data, &["episodes"])
+        .and_then(Value::as_array)
+        .and_then(|eps| eps.iter().find(|ep| number(ep, &["id"]) == Some(newest_ep)))
+        .cloned();
+    let index = episode
+        .as_ref()
+        .and_then(|ep| text(ep, &["title"]))
+        .or_else(|| text(data, &["new_ep", "title"]))
+        .unwrap_or_default();
+    let long = episode
+        .as_ref()
+        .and_then(|ep| text(ep, &["long_title"]))
+        .unwrap_or_default();
+    let newest_title = match (index.is_empty(), long.is_empty()) {
+        (true, _) => long,
+        (false, true) => format!("第{index}话"),
+        (false, false) => format!("第{index}话 {long}"),
+    };
     Some(Season {
         season_id,
         title: text(data, &["title"]).unwrap_or_default(),
         cover: text(data, &["cover"]).unwrap_or_default(),
-        newest_title: text(data, &["newest", "title"]).unwrap_or_default(),
-        publish_text: text(data, &["publish", "pub_time"]).unwrap_or_default(),
+        newest_ep,
+        newest_title,
     })
 }
 
@@ -1219,9 +1242,35 @@ mod tests {
         assert_eq!(sub.chars().count(), 32);
         assert!(parse_wbi_img(&json!({})).is_none());
 
-        let season = parse_season(&json!({"season_id": 12, "title": "某季", "cover": "c", "newest": {"title": "第 5 话"}, "publish": {"pub_time": "每周三 12:00"}})).unwrap();
-        assert_eq!(season.newest_title, "第 5 话");
-        assert_eq!(season.publish_text, "每周三 12:00");
+        // 结构照 2026-09-30 抓的 ss298872（未完结、在更）：最新一集只有 `new_ep` 给 id，集名在 `episodes` 里
+        let season = parse_season(&json!({
+            "season_id": 298872,
+            "title": "小车队大救援：自然护卫队",
+            "cover": "https://i0.hdslb.com/bfs/bangumi/image/4e0a.jpg",
+            "new_ep": {"desc": "连载中", "id": 6291966, "is_new": 1, "title": "9"},
+            "episodes": [
+                {"id": 6291908, "title": "1", "long_title": "命悬一线"},
+                {"id": 6291966, "title": "9", "long_title": "发烧不出门"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(season.season_id, 298872);
+        assert_eq!(season.newest_ep, 6291966);
+        assert_eq!(season.newest_title, "第9话 发烧不出门");
+        // `new_ep` 指的那一集不在 `episodes` 里（预售、番外那类）：退回它自己给的集号
+        let orphan = parse_season(&json!({
+            "season_id": 1, "new_ep": {"id": 777, "title": "3"}, "episodes": [{"id": 1, "title": "1"}]
+        }))
+        .unwrap();
+        assert_eq!(orphan.newest_title, "第3话");
+        // 最新集一格都没给：季度信息照收，文案留空由比对那侧决定不推
+        let blank = parse_season(&json!({
+            "season_id": 38942, "title": "爆笑罗米熊与丹米兔", "new_ep": null, "episodes": null
+        }))
+        .unwrap();
+        assert_eq!(blank.newest_ep, 0);
+        assert!(blank.newest_title.is_empty());
+        assert_eq!(blank.title, "爆笑罗米熊与丹米兔");
     }
 
     #[test]
