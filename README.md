@@ -103,6 +103,8 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | --- | --- | --- |
 | `enable` | `true` | 总开关：关掉后检测任务不再推送，命令仍可用 |
 | `admin` | `[]` | 框架管理员之外的额外管理员（QQ 号或群号） |
+| `notifyEnable` | `true` | 非管理员动了订阅/分组/模板/过滤/@全体 时，给每个 `admin` 发一条私聊通报 |
+| `showLoadingMessage` | `true` | `search`/`new`/`video` 这三条要联网的命令先回一句「加载中…」，结果出来后撤回 |
 | `command.names` | `["/bili","/b","/动态"]` | 主命令名与别名，必须带前缀 |
 | `command.prefixFree` | `false` | 群聊里是否允许不带前缀直接发 |
 | `account.cookie` | `""` | 完整 Cookie 串，`/bili login` 成功后自动写回；同目录有 `cookies.json` 时以文件为准（见「导入浏览器 cookie」） |
@@ -113,7 +115,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `check.interval` | `30` | 动态检测间隔(秒)，推荐 15-60 |
 | `check.liveInterval` | `15` | 直播检测间隔(秒) |
 | `check.lowSpeed` | `"3-8x2"` | 低频时段：3 点到 8 点把间隔乘以 2；留空全天同速 |
-| `check.reportInterval` | `0` | 日志汇报间隔(分钟)，0 = 每次都报 |
+| `check.reportInterval` | `0` | 接口失败时**每隔多少分钟**记一条日志，0 = 每次失败都记（节流的是上一条真正记出去的日志，不是上一次调用） |
 | `check.timeout` | `20` | 单次 B 站请求超时(秒) |
 | `push.messageInterval` | `500` | 同一个群连续多条之间的间隔(毫秒) |
 | `push.pushInterval` | `1000` | 连续两个目标之间的间隔(毫秒) |
@@ -248,9 +250,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     判定「该不该译」与原插件同口径：先摘掉 `[笑]` 这类中括号，含假名就译，整篇没有汉字也译。
 29. **卡片装饰只认 `QrCode`**：`FanCard`（粉丝牌）在原插件是画在作者行上的勋章装饰
     （`DynamicModuleDraw.kt:542` 那两档），本插件没铺 B 站的勋章数据，填了等同 `None`；键留着只为对齐配置面。
-30. **没有「加载中…」占位，也不给管理员补发操作通知**：原插件的 `enableConfig.showLoadingMessage` 会先发一条
-    「加载中…」再撤回，这里慢的时候就是慢，不多占一次发送；订阅、分组那些改动的提示也只回命令本身那一条，
-    不另发 `General.kt` 那类操作通知。
+30. **「加载中…」占位与操作通知都在（这两档先前记的是"没做"，2026-09-30 深夜补上）**：
+    `bili.showLoadingMessage` 与 `bili.notifyEnable` 对应原插件 `EnableConfig` 的同名两项，
+    具体口径与和原插件的差别见下面第 39、40 条。
 31. **画质四档内置，字体不自动下载**：原插件允许 `customOverload` 逐档覆盖像素布局（`DynamicImageQuality.kt:14`），
     这里四档写死；原插件找不到字体会自动下一份默认字体（`Init.kt:77`），这里找不到就记一条日志、这条只发文本。
 32. **单 bot**：原插件的 Napcat 多 bot 探测（`NapcatCheckTasker.kt`）没有对应项——一个框架实例对应的就是它自己那条连接。
@@ -294,6 +296,17 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     `push.messageInterval`/`pushInterval` 从 100/500 毫秒放宽到 500/1000（连打会被 B 站判 -352）、
     `check.interval` 从 15 秒放宽到 30、`check.timeout` 从 10 秒放宽到 20、`footerAlign` 从 LEFT 改 CENTER、
     `defaultDynamicPush` 从 `OneMsg` 改成 `SimpleMsg`。
+39. **操作通报（`bili.notifyEnable`）落在管理员的会话上**：非管理员动了订阅/分组/模板/过滤/@全体，
+    插件给 `bili.admin` 里每个号发一条「操作人/位置/操作/结果」的私聊。两个口径与原插件不同：
+    * 原插件把通报发给 `findContactAll(BiliConfig.admin)`——那只会命中机器人**已经认识的会话**；
+      这边也是：先在订阅表里认这个号出现过的是群还是好友，两边都没出现过就按私聊试一次。
+    * 通报比群里那句回话**先发出去**（它在命令返回之前跑）。实测两条只差 2 毫秒，看不出顺序。
+    * 「结果」那一行只取回复里的文本段并截到 120 字；卡片图与合并转发进不了这一行，
+      那种命令自己就把东西发走了，通报里写「（结果由命令自己发出）」。
+40. **「加载中…」只挂 `search`/`new`/`video` 这三条**：原插件那一档（`showLoadingMessage`）还挂在
+    `templateList` 上（`DynamicCommand.kt:224`），因为那边预览要画图。这边模板预览用假数据、
+    既不联网也不绘图，占位一条只会闪一下，所以没挂。撤回走框架的 `Bot::recall`，
+    占位号取的是自己那条发送回执的 `message_id`。
 
 ## 预留问题
 
@@ -324,7 +337,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 假 OneBot 端与运行目录都在本机 `C:\Users\cheng\Arona-e2e\`：运行目录 `run-bili\` 里
 `config/onebot.yml` 的 self_id 是 10000，`config/arona.yml` 的管理员写 100 与 12345，插件 dll 放
-`plugins\bilibili\`。五个工装各自起一个 ws-forward 服务（默认 9001），一次只跑一个：
+`plugins\bilibili\`。除了 `peek-images.mjs` 每个工装都起一个 ws-forward 服务（默认 9001），一次只跑一个：
 
 ```
 node fake-onebot-bili.mjs      # 命令序列：21 条本地 + 5 条联网
@@ -334,12 +347,12 @@ node fake-onebot-season.mjs    # 番剧跟跑：订一部番后静默四轮，�
 node fake-onebot-new.mjs       # 软限流探针：同一个 uid 连发 N 次 /bili new，数几次出真动态
 node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推送与其中的图片段
 node fake-onebot-cookie.mjs    # 只发 `/bili config`，把回话全文打出来（查配置项有没有真生效）
+node fake-onebot-notify.mjs    # 操作通报与「加载中…」：发命令的人刻意用 20002（不是框架管理员）
 node peek-images.mjs           # 不是服务端：把 sent log 里的图片段解成「PNG/JPEG 宽x高 字节数」
 ```
 
 `peek-images.mjs` 是判「绘图开关有没有生效」的那把尺：图片段正文里 `iVBORw0KGgo` 开头是插件画的
 PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有没有 `iVBOR` 就够了，比数条数可靠。
-```
 
 回话按「第 i 条命令下发到第 i+1 条之间收到的」归属，打到 `可疑 0 条` 才算过。宿主一律
 `ARONA_NO_ELEVATE=1 ./arona-rs.exe --nogui` 起，跑完 `taskkill //IM arona-rs.exe //F` 收尾。
@@ -464,13 +477,49 @@ PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有�
 真要转只是把 `raw` 换成重编码那几行；但这会改变附件字节与缓存那份的对应关系（缓存存原始字节），
 属于取舍不是缺陷，所以我停在这儿等你拍。
 
+2026-09-30 深夜这一轮补的是最后两档配置（`notifyEnable`、`showLoadingMessage`），工装换成
+`fake-onebot-notify.mjs`——**发命令的人刻意用 20002**，因为框架 `managers` 是 `[100, 12345]`，
+用老脚本那个 100 会被当成管理员，通报这条路根本不会走。两轮：
+
+- 两个开关都开：`/bili new 546195 1` 先出一条 `send_group_msg`「加载中...」（`message_id` 1002），
+  结果那几条发完后紧跟一条 `delete_msg {"message_id":1002}`；`/bili add 546195` 之后多出一条
+  `send_private_msg -> 12345`，正文是「bilibili 操作通报⏎操作人: 外人（20002）⏎位置: 群 20001⏎
+  操作: /bili add 546195⏎结果: 之前订阅过这个人哦」。`/bili config` 的回显里那行变成
+  「操作通报 开｜加载中占位 开」。脚本判定 `loading=1 / delete_msg=1 / 通报=1`，退出码 0。
+- 两个开关都关：同一个脚本连跑三条命令，出站只有 3 条 `send_group_msg`，
+  `send_private_msg` 0 条、`delete_msg` 0 条、占位 0 条——负例干净，说明这两档是真 gate 不是装饰。
+  这一轮 `/bili new` 回的是「未找到动态」（B 站那一路的抖动，先前 `fake-onebot-new.mjs` 那轮数过），
+  与开关无关。
+
+## 功能面差集收口
+
+判"改完了"用的是三面差集，每一面都比到具体条目，不是比总数：
+
+- **命令面**：`DynamicCommand.kt` 有 33 个 `@SubCommand`，本插件 [`SUBS`](src/commands/mod.rs) 33 行，
+  规范名逐条对齐（把驼峰统一成小写再比，diff 为空）；别名表除了照抄的那批还补了中文写法，
+  比对走 `to_lowercase`，所以原插件的 `delAll` / `listAll` / `filterType` 这些驼峰写法在这边同样命中。
+  不依赖 chat-command：命令名、别名、参数位次都在这份表里自己判。
+- **配置面**：`BiliConfig.kt` 的 `EnableConfig` 8 个开关逐个有下落——`drawEnable`（`bili-image` 那区）、
+  `liveCloseNotifyEnable`、`translateEnable`、`notifyEnable`、`showLoadingMessage` 是真开关，
+  `lowSpeedEnable` / `cacheClearEnable` / `proxyEnable` 在这边改成"留空即不开"（`check.lowSpeed` 空串、
+  `cache.expires` 全 0、`proxy` 空表），语义等价而少一个键。`CheckConfig` / `PushConfig` /
+  `TemplateConfig` / `CacheConfig` / `LinkResolveConfig` 的键逐条过，`TemplateConfig` 那几档模板名
+  一档不改名（第 37 条）。
+- **任务与类型面**：Kotlin 那 11 个 tasker 的归属——`DynamicCheck`/`LiveCheck`/`LiveCloseCheck` 进
+  `tasks`，`SendTasker` 的节流与 @全体 拼法进 `push`，`CacheClearTasker` 进 24 小时一轮的清理，
+  `ListenerTasker` 的链接解析进 `link.rs` 钩子、它那条 `BotLeaveEvent → removeAllSubscribe`
+  对应 `left_group`（`link.rs:319`，带 `user_id == bot.self_id()` 守卫，缺它会让任意成员退群清空整群订阅）；
+  `BiliTasker`/`BiliCheckTasker` 是协程基类与低频/汇报横切，框架的任务出口顶上；
+  `NapcatCheckTasker` 是 NapCat 那套在线状态轮询的旁路，连接归框架管，故意不移植。
+  `DynamicFilterType` 六项与 `AtAllType` 六项与 `/bili ft`、`/bili aa` 的参数表逐项一致。
+
 
 ## 开发
 
 ```
 cargo fmt
 cargo clippy --all-targets     # 目标：0 警告
-cargo test --lib               # 151 项（149 通过 + 2 项联网用例标了 #[ignore]）
+cargo test --lib               # 156 项（154 通过 + 2 项联网用例标了 #[ignore]）
 cargo build --release
 ```
 
