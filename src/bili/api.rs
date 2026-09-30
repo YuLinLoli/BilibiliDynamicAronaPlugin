@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 use crate::bili::model::{
     Dynamic, LiveInfo, Season, UserBrief, parse_feed, parse_live_list, parse_live_status,
-    parse_season, parse_user, parse_wbi_img,
+    parse_master, parse_room, parse_season, parse_user, parse_wbi_img,
 };
 use crate::bili::wbi;
 use crate::config::AccountConfig;
@@ -29,11 +29,12 @@ const NAV: &str = "https://api.bilibili.com/x/web-interface/nav";
 const FEED_ALL: &str = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all";
 const FEED_SPACE: &str = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space";
 const DYNAMIC_DETAIL: &str = "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail";
-const USER_INFO_WBI: &str = "https://api.bilibili.com/x/space/wbi/acc/info";
+const USER_CARD: &str = "https://api.bilibili.com/x/web-interface/card";
 const LIVE_LIST: &str = "https://api.live.bilibili.com/xlive/web-ucenter/v1/xfetter/GetWebList";
 const LIVE_STATUS_BATCH: &str =
     "https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids";
 const ROOM_INFO: &str = "https://api.live.bilibili.com/room/v1/Room/get_info";
+const LIVE_MASTER: &str = "https://api.live.bilibili.com/live_user/v1/Master/info";
 const SEASON_INFO: &str = "https://api.bilibili.com/pgc/view/web/season";
 const PGC_REVIEW: &str = "https://api.bilibili.com/pgc/review/user";
 const FOLLOW_PGC: &str = "https://api.bilibili.com/pgc/web/follow/add";
@@ -46,9 +47,14 @@ const RELATION_TAG_ADD: &str = "https://api.bilibili.com/x/relation/tags/addUser
 const SHORT_LINK: &str = "https://api.bilibili.com/x/share/click";
 const QRCODE_GENERATE: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
 const QRCODE_POLL: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
+const FINGER_SPI: &str = "https://api.bilibili.com/x/frontend/finger/spi";
 
 /// WBI 密钥缓存：B 站一天换一次，跟着换就行
 static MIXIN: std::sync::LazyLock<RwLock<Option<(String, i64)>>> =
+    std::sync::LazyLock::new(|| RwLock::new(None));
+
+/// 匿名设备凭证缓存：`buvid3`/`buvid4` 一次取到就长期有效，进程内问一次够了
+static BUVID: std::sync::LazyLock<RwLock<Option<(String, String)>>> =
     std::sync::LazyLock::new(|| RwLock::new(None));
 
 /// 一个 B 站账号的出口。克隆便宜（内部只握字符串）。
@@ -75,15 +81,77 @@ impl Bili {
         self.account.uid
     }
 
-    fn headers(&self, referer: &str) -> Vec<(String, String)> {
+    async fn headers(&self, referer: &str) -> Vec<(String, String)> {
         let mut headers = vec![
             ("user-agent".to_string(), USER_AGENT.to_string()),
             ("referer".to_string(), referer.to_string()),
         ];
-        if !self.account.cookie.is_empty() {
-            headers.push(("cookie".to_string(), self.account.cookie.clone()));
+        let cookie = self.cookie().await;
+        if !cookie.is_empty() {
+            headers.push(("cookie".to_string(), cookie));
         }
         headers
+    }
+
+    /// 发出去的 Cookie：配置里那份，前面补上匿名设备凭证。
+    ///
+    /// 必须带 `buvid3`。2026-09-30 实测：不带它时动态流直接 HTTP 412、nav 回 `-352 风控校验失败`，
+    /// 看起来像"要登录"，其实缺的是这个匿名浏览器指纹；带上了未登录也能正常回话。
+    /// 取不到指纹时不拦请求——手填 Cookie 的人本来就不靠 buvid。
+    async fn cookie(&self) -> String {
+        let (b3, b4) = self.buvid().await.unwrap_or_default();
+        let configured = self.account.cookie.trim();
+        let mut parts = Vec::new();
+        if !b3.is_empty() && !configured.contains("buvid3") {
+            parts.push(format!("buvid3={b3}"));
+        }
+        if !b4.is_empty() && !configured.contains("buvid4") {
+            parts.push(format!("buvid4={b4}"));
+        }
+        if !configured.is_empty() {
+            parts.push(configured.to_string());
+        }
+        parts.join("; ")
+    }
+
+    /// 匿名设备指纹：`x/frontend/finger/spi` 不要登录态，取到就缓存到进程结束
+    async fn buvid(&self) -> Result<(String, String), String> {
+        {
+            let cache = BUVID.read().await;
+            if let Some(pair) = cache.as_ref() {
+                return Ok(pair.clone());
+            }
+        }
+        // 这条请求自己拼头，不走 headers()——否则取指纹要先有指纹，绕成环
+        let bytes = http::send(Request {
+            method: Method::Get,
+            url: FINGER_SPI.to_string(),
+            headers: vec![
+                ("user-agent".to_string(), USER_AGENT.to_string()),
+                (
+                    "referer".to_string(),
+                    "https://www.bilibili.com/".to_string(),
+                ),
+            ],
+            timeout: Some(self.timeout),
+            ..Default::default()
+        })
+        .await?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|err| format!("指纹接口返回的不是 JSON（{err}）"))?;
+        let data = value.get("data").cloned().unwrap_or(Value::Null);
+        let read = |key: &str| {
+            data.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let pair = (read("b_3"), read("b_4"));
+        if pair.0.is_empty() {
+            return Err("指纹接口没给 buvid3".to_string());
+        }
+        *BUVID.write().await = Some(pair.clone());
+        Ok(pair)
     }
 
     /// GET 一个接口，拆掉 `{code,message,data}` 信封
@@ -93,24 +161,28 @@ impl Bili {
         params: &[(&str, &str)],
         referer: &str,
     ) -> Result<Value, String> {
-        let mut query: Vec<String> = params
-            .iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
-            .collect();
-        query.retain(|item| !item.is_empty());
-        let full = if query.is_empty() {
-            url.to_string()
-        } else {
-            format!("{url}?{}", query.join("&"))
-        };
-        let request = Request {
+        unwrap_envelope(self.call_raw(url, params, referer).await?)
+    }
+
+    /// GET 但不判 `code`，把整个信封原样交出去。
+    ///
+    /// 目前只有 nav 用得上：未登录时它回 `code -101`，可同一份响应里 `data.wbi_img` 照样带着，
+    /// 而 WBI 密钥本来就是公开值。走 [`call`] 的话这条随错误返回的载荷会被当成失败丢掉，
+    /// 于是所有签名接口在没有 Cookie 时都连密钥这一步都到不了（2026-09-30 curl 实测）。
+    async fn call_raw(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+        referer: &str,
+    ) -> Result<Value, String> {
+        self.send(Request {
             method: Method::Get,
-            url: full,
-            headers: self.headers(referer),
+            url: full_url(url, params),
+            headers: self.headers(referer).await,
             timeout: Some(self.timeout),
             ..Default::default()
-        };
-        unwrap_envelope(self.send(request).await?)
+        })
+        .await
     }
 
     /// 带 WBI 签名的 GET
@@ -131,7 +203,7 @@ impl Bili {
         let request = Request {
             method: Method::Get,
             url: format!("{url}?{query}"),
-            headers: self.headers(referer),
+            headers: self.headers(referer).await,
             timeout: Some(self.timeout),
             ..Default::default()
         };
@@ -152,7 +224,7 @@ impl Bili {
         let request = Request {
             method: Method::Post,
             url: url.to_string(),
-            headers: self.headers(referer),
+            headers: self.headers(referer).await,
             body: arona::runtime::http::Body::Form(form),
             timeout: Some(self.timeout),
         };
@@ -163,7 +235,7 @@ impl Bili {
         let request = Request {
             method: Method::Post,
             url: url.to_string(),
-            headers: self.headers(referer),
+            headers: self.headers(referer).await,
             body: arona::runtime::http::Body::Raw {
                 content_type: "application/json".to_string(),
                 text: json.to_string(),
@@ -183,7 +255,7 @@ impl Bili {
         http::send(Request {
             method: Method::Get,
             url: url.to_string(),
-            headers: self.headers(referer),
+            headers: self.headers(referer).await,
             timeout: Some(self.timeout),
             ..Default::default()
         })
@@ -201,8 +273,9 @@ impl Bili {
                 return Ok(key.clone());
             }
         }
-        let nav = self.call(NAV, &[], "https://www.bilibili.com/").await?;
-        let (img, sub) = parse_wbi_img(&nav).ok_or("nav 没返回 WBI 水印图，签不了名")?;
+        let nav = self.call_raw(NAV, &[], "https://www.bilibili.com/").await?;
+        let data = nav.get("data").cloned().unwrap_or(Value::Null);
+        let (img, sub) = parse_wbi_img(&data).ok_or("nav 没返回 WBI 水印图，签不了名")?;
         let key = wbi::mixin_key(&img, &sub);
         *MIXIN.write().await = Some((key.clone(), today));
         Ok(key)
@@ -262,19 +335,26 @@ impl Bili {
 
     // ==================== 用户 / 直播 / 番剧 ====================
 
+    /// 用户名片：昵称、头像、签名、等级、直播间号。
+    ///
+    /// 走 `x/web-interface/card`——不签名，带上匿名设备指纹就能取。以前走 `x/space/wbi/acc/info`，
+    /// 那条要 WBI 签名，一轮链接解析里同秒连打就被判风控（2026-09-30 两次实测 `-352`），
+    /// 匿名时等级还会掉成 Lv0。card 这一版不给房间号，那一格从主播资料接口补。
     pub async fn user(&self, uid: i64) -> Result<UserBrief, String> {
         let data = self
-            .call_wbi(
-                USER_INFO_WBI,
-                &[
-                    ("mid", &uid.to_string()),
-                    ("token", ""),
-                    ("platform", "web"),
-                ],
+            .call(
+                USER_CARD,
+                &[("mid", &uid.to_string())],
                 &format!("https://space.bilibili.com/{uid}"),
             )
             .await?;
-        parse_user(&data).ok_or_else(|| format!("B 站没给 {uid} 的名片"))
+        let mut brief = parse_user(&data).ok_or_else(|| format!("B 站没给 {uid} 的名片"))?;
+        if brief.room_id == 0
+            && let Ok(anchor) = self.master(uid).await
+        {
+            brief.room_id = anchor.room_id;
+        }
+        Ok(brief)
     }
 
     /// 关注列表里的直播间（要登录态）
@@ -290,19 +370,22 @@ impl Bili {
     }
 
     /// 批量查直播状态。这个是 POST + JSON，GET 那份 shape 早就不给全了。
+    ///
+    /// 请求体的键必须是 `uids`：写成 `uid_list` 时 B 站回 `code 1: invalid params`（2026-09-30 实测），
+    /// 返回的 `data` 是以 uid 字符串为键的表。
     pub async fn live_status(&self, uids: &[i64]) -> Result<Vec<LiveInfo>, String> {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        let body = serde_json::to_string(&BTreeMap::from([("uid_list", uids.to_vec())]))
-            .map_err(|err| err.to_string())?;
+        let body = serde_json::to_string(&BTreeMap::from([("uids", uids.to_vec())]))
+            .map_err(|e| e.to_string())?;
         let data = self
             .post_json(LIVE_STATUS_BATCH, &body, "https://live.bilibili.com/")
             .await?;
         Ok(parse_live_status(&data))
     }
 
-    /// 房间详情（直播结束通知补标题/分区用）
+    /// 房间详情（直播结束通知补标题/分区、`/bili add <直播链接>` 画直播卡都走这里）
     pub async fn room(&self, room_id: i64) -> Result<LiveInfo, String> {
         let data = self
             .call(
@@ -311,59 +394,32 @@ impl Bili {
                 &format!("https://live.bilibili.com/{room_id}"),
             )
             .await?;
-        Ok(LiveInfo {
-            uid: data
-                .get("uid")
-                .and_then(Value::as_i64)
-                .or_else(|| {
-                    data.get("room_info")
-                        .and_then(|v| v.get("uid"))
-                        .and_then(Value::as_i64)
-                })
-                .unwrap_or_default(),
-            room_id: data
-                .get("roomid")
-                .and_then(Value::as_i64)
-                .unwrap_or(room_id),
-            anchor: data
-                .get("anchor_info")
-                .and_then(|v| v.get("base_info"))
-                .and_then(|v| v.get("uname"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            face: data
-                .get("anchor_info")
-                .and_then(|v| v.get("base_info"))
-                .and_then(|v| v.get("face"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            area: data
-                .get("area_name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            title: data
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            cover: data
-                .get("cover")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            online: data
-                .get("online")
-                .and_then(Value::as_i64)
-                .unwrap_or_default(),
-            live_start: 0,
-            status: data
-                .get("live_status")
-                .and_then(Value::as_i64)
-                .unwrap_or_default(),
-        })
+        let mut info = parse_room(&data, room_id);
+        // 这个接口只给 uid，名字头像要再跑一次直播用户资料。取不到就留空：
+        // 卡片退回画灰圆、模板那格空着，不值得为它让整条链接解析失败。
+        if info.uid > 0
+            && let Ok(anchor) = self.master(info.uid).await
+        {
+            info.anchor = anchor.name;
+            info.face = anchor.face;
+        }
+        Ok(info)
+    }
+
+    /// 主播资料（`live_user/v1/Master/info`）：房间详情只给 uid，名字和头像从这儿补。
+    ///
+    /// 不用 [`user`]（名片接口）：那条要 WBI 签名，一轮链接解析里同秒连打两次就被判风控。
+    /// 2026-09-30 实测两次 `wbi/acc/info?mid=11153765` 都只回 120 字节，直播卡的主播名因此一直是空的；
+    /// 这个接口匿名可取、不签名，一次就回 `info.uname` + `info.face`。
+    pub async fn master(&self, uid: i64) -> Result<UserBrief, String> {
+        let data = self
+            .call(
+                LIVE_MASTER,
+                &[("uid", &uid.to_string())],
+                "https://live.bilibili.com/",
+            )
+            .await?;
+        parse_master(&data).ok_or_else(|| format!("B 站没给 {uid} 的主播资料"))
     }
 
     /// 番剧季度信息（`/bili add ss11111` 用；season_id 由 ss 后面的数字给出）
@@ -549,9 +605,18 @@ impl Bili {
         share_id: &str,
         origin: Option<&str>,
     ) -> Option<String> {
+        // 分享接口不校验这一位（原插件就写死 abcdefg），但既然手上有真指纹就没必要递假值
+        let buvid = {
+            let mine = self.buvid().await.unwrap_or_default().0;
+            if mine.is_empty() {
+                "abcdefg".to_string()
+            } else {
+                mine
+            }
+        };
         let mut pairs: Vec<(String, String)> = vec![
             ("build".to_string(), "6880300".to_string()),
-            ("buvid".to_string(), "abcdefg".to_string()),
+            ("buvid".to_string(), buvid),
             ("platform".to_string(), "android".to_string()),
             ("oid".to_string(), oid.to_string()),
             ("share_channel".to_string(), "QQ".to_string()),
@@ -564,7 +629,7 @@ impl Bili {
         let request = Request {
             method: Method::Post,
             url: SHORT_LINK.to_string(),
-            headers: self.headers("https://www.bilibili.com/"),
+            headers: self.headers("https://www.bilibili.com/").await,
             body: arona::runtime::http::Body::Form(pairs),
             timeout: Some(self.timeout),
         };
@@ -676,8 +741,23 @@ fn unwrap_envelope(value: Value) -> Result<Value, String> {
     Err(format!("B 站返回 code {code}: {message}"))
 }
 
+/// 拼查询串。值为空也照样发出去（`offset=` 在 B 站表示首页，参数不能缺席）
+fn full_url(url: &str, params: &[(&str, &str)]) -> String {
+    let query: Vec<String> = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", encode(key), encode(value)))
+        .collect();
+    if query.is_empty() {
+        url.to_string()
+    } else {
+        format!("{url}?{}", query.join("&"))
+    }
+}
+
 fn encode(value: &str) -> String {
-    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+    // URI_COMPONENT 不编码 `-._~`，与 JS 的 encodeURIComponent 同口径。
+    // 换成 NON_ALPHANUMERIC 会把 `host_mid` 发成 `host%5Fmid`，参数名就和签名时算的那串对不上了。
+    percent_encoding::utf8_percent_encode(value, crate::bili::URI_COMPONENT).to_string()
 }
 
 /// 给命令与任务用的便捷构造：从三块配置里拼出一个出口
@@ -753,31 +833,181 @@ mod tests {
     fn query_values_get_encoded() {
         assert_eq!(encode("你好"), "%E4%BD%A0%E5%A5%BD");
         assert_eq!(encode("a b&c=d"), "a%20b%26c%3Dd");
+        // 参数名里的下划线必须原样发出去，否则 B 站收到的 key 与签名时算的不是同一个
+        assert_eq!(encode("host_mid"), "host_mid");
+        assert_eq!(encode("timezone_offset"), "timezone_offset");
     }
 
-    /// 真联网：只在手动跑的时候验，避免 CI 与日常 `cargo test` 依赖外网
+    /// nav 未登录那份响应：`code` 是 `-101`，可 `data.wbi_img` 就在同一份包里。
+    /// WBI 密钥是公开值，签名这一步不该要登录态——这条钉住它，哪天有人把 `mixin_key`
+    /// 改回走 `call()`（非零 code 一律判失败），这里就会挂。
+    #[test]
+    fn wbi_keys_survive_the_not_logged_in_envelope() {
+        let envelope = serde_json::json!({
+            "code": -101, "message": "账号未登录", "ttl": 1,
+            "data": {"isLogin": false, "wbi_img": {
+                "img_url": "https://i0.hdslb.com/bfs/wbi/7cd71926bcd147c6b5e90b611c0b8d31.png",
+                "sub_url": "https://i0.hdslb.com/bfs/wbi/594527442bcf4e6b826b1606987ac484.png"
+            }}
+        });
+        assert!(
+            unwrap_envelope(envelope.clone()).is_err(),
+            "信封本身仍判为未登录"
+        );
+        let data = envelope.get("data").cloned().unwrap();
+        let (img, sub) = parse_wbi_img(&data).expect("未登录的 nav 也该给出水印图");
+        assert_eq!(wbi::mixin_key(&img, &sub).chars().count(), 32);
+    }
+
+    /// 真联网：只在手动跑的时候验，避免 CI 与日常 `cargo test` 依赖外网。
+    ///
+    /// 匿名能拿到什么，B 站一年改好几回，所以这里只对"必然该成立"的两件事下手（指纹可取、
+    /// 水印图拼得出 32 位密钥），动态流和名片只打印结果不定死方向。
+    ///
+    /// 上一版这里钉的是"匿名一定拿不到水印图"，那是个误判：`nav` 未登录时回 `-101`，
+    /// 可同一份响应里 `data.wbi_img` 照样带着，是我们拆信封的分支把它丢了，
+    /// 于是把自己的实现缺陷钉成了"B 站接口如此"（2026-09-30 curl 实测）。
     #[test]
     #[ignore = "要联网访问 B 站"]
-    fn nav_returns_wbi_keys() {
+    fn anonymous_access_reports_its_real_verdict() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let bili = Bili::new(AccountConfig::default(), 20);
-            let mixin = bili.mixin_key().await.expect("匿名也能从 nav 拿到水印图");
-            assert_eq!(mixin.chars().count(), 32);
-            let user = bili.user(546195).await.expect("咬人酱的公开名片");
-            assert!(!user.name.is_empty());
+            let (b3, b4) = bili.buvid().await.expect("指纹接口匿名可取");
+            assert!(!b3.is_empty() && !b4.is_empty(), "两个指纹都得有值");
+
+            let mixin = bili.mixin_key().await.expect("nav 该给出水印图");
+            assert_eq!(mixin.chars().count(), 32, "两张图名重排后取前 32 位当密钥");
+
+            let feed = bili.space(546195, "").await;
+            match &feed {
+                Ok(list) => println!("动态流：匿名可拉，{} 条", list.len()),
+                Err(reason) => println!("动态流：匿名被拒，{reason}"),
+            }
+            match bili.user(546195).await {
+                Ok(user) => println!(
+                    "名片：匿名可拉，昵称「{}」签名 {} 字，Lv{}，房间 {}",
+                    user.name,
+                    user.sign.chars().count(),
+                    user.level,
+                    user.room_id
+                ),
+                Err(reason) => println!("名片：匿名被拒，{reason}"),
+            }
+            match bili.timeline(1, "ALL").await {
+                Ok(list) => println!("关注时间线：匿名可拉，{} 条", list.len()),
+                Err(reason) => println!("关注时间线：匿名被拒，{reason}"),
+            }
+            // 开播检测、直播链接解析、单条动态这三条只读路径也一并记录，别只测动态流
+            match bili
+                .live_status(&[546195, 168887495, 209895665, 651852799])
+                .await
+            {
+                Ok(list) => {
+                    println!("开播状态：匿名可拉，{} 间", list.len());
+                    for live in &list {
+                        println!(
+                            "  uid {} 房 {} 状态 {} 封面{}\
+                             开播时间 {} 标题「{}」",
+                            live.uid,
+                            live.room_id,
+                            live.status,
+                            if live.cover.is_empty() { "缺" } else { "有" },
+                            live.live_start,
+                            live.title
+                        );
+                    }
+                }
+                Err(reason) => println!("开播状态：匿名被拒，{reason}"),
+            }
+            match bili.room(23058).await {
+                Ok(live) => println!(
+                    "房间：匿名可拉，主播「{}」头像 {} 字，标题「{}」分区「{}」状态 {} 开播 {}",
+                    live.anchor,
+                    live.face.chars().count(),
+                    live.title,
+                    live.area,
+                    live.status,
+                    live.started_text()
+                ),
+                Err(reason) => println!("房间：匿名被拒，{reason}"),
+            }
+            // 单条动态拿刚拉到的真实 id 去查，编造的 id 只会测到 B 站的报错分支
+            match feed.as_ref().ok().and_then(|list| list.first()) {
+                Some(first) => match bili.detail(first.id).await {
+                    Ok(Some(dy)) => {
+                        println!(
+                            "单条动态：匿名可拉，{} 字，{} 张图",
+                            dy.text.chars().count(),
+                            dy.images.len()
+                        );
+                    }
+                    Ok(None) => println!("单条动态：匿名可拉但这条查不到 id {}", first.id),
+                    Err(reason) => println!("单条动态：匿名被拒，{reason}"),
+                },
+                None => println!("单条动态：没拿到可查的 id，跳过"),
+            }
         });
     }
 
+    /// 真联网的一次形状核对：动态流里那条直播推荐把房间信息放在哪一层、`parse_feed` 认不认。
+    /// 只打印不定死方向（B 站一年改好几回），但 2026-09-30 就是靠它抓出
+    /// 「feed 这份包里 `major` 的兄弟键全是 null 占位」这一条，
+    /// 离线 fixture 只照 `detail` 写、照不出这个差别。
     #[test]
     #[ignore = "要联网访问 B 站"]
-    fn space_feed_works_without_login() {
+    fn dump_the_live_item_shape_from_the_space_feed() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let bili = Bili::new(AccountConfig::default(), 20);
-            let feed = bili.space(546195, "").await.unwrap();
-            assert!(!feed.is_empty(), "匿名拉单人动态应该有内容");
-            assert!(feed.windows(2).all(|pair| pair[0].time <= pair[1].time));
+            let data = bili
+                .call_wbi(
+                    FEED_SPACE,
+                    &[
+                        ("timezone_offset", "-480"),
+                        ("host_mid", "546195"),
+                        ("offset", ""),
+                        ("features", "itemOpusStyle"),
+                    ],
+                    "https://space.bilibili.com/546195/dynamic",
+                )
+                .await
+                .expect("动态流匿名可拉");
+            let items = data
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            println!("动态流原始 {} 条", items.len());
+            for item in &items {
+                let kind = item.get("type").and_then(Value::as_str).unwrap_or("?");
+                if !kind.contains("LIVE") {
+                    continue;
+                }
+                println!(
+                    "--- {kind} id {}",
+                    item.get("id_str").and_then(Value::as_str).unwrap_or("?")
+                );
+                // module_author 那一大坨头像图层先把输出挤满，只看动态正文这一层
+                match item.pointer("/modules/module_dynamic") {
+                    Some(module) => {
+                        println!(
+                            "module_dynamic 键：{:?}",
+                            module
+                                .as_object()
+                                .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        );
+                        let dump = serde_json::to_string_pretty(module).unwrap_or_default();
+                        println!("{}", dump.chars().take(2600).collect::<String>());
+                    }
+                    None => println!("这条没有 module_dynamic"),
+                }
+            }
+            for dynamic in parse_feed(&data) {
+                if dynamic.kind == "直播" {
+                    println!("解析结果 id {} live {:?}", dynamic.id, dynamic.live);
+                }
+            }
         });
     }
 }

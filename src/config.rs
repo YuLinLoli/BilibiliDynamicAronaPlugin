@@ -86,7 +86,8 @@ impl PluginConfig for BiliConfig {
             }
             "command.prefixFree" => "群聊里是否允许不带前缀直接发（默认要 @机器人 或带 /）",
             "account" => {
-                "B 站账号 Cookie\n手填写法: SESSDATA=xxx; bili_jct=yyy\n留空则匿名拉动态，功能不变但关注/分组不可用"
+                "B 站账号 Cookie\n手填写法: SESSDATA=xxx; bili_jct=yyy\n留空也能起：插件会自己去取匿名设备指纹，\
+                 订阅检测/番剧/开播/链接解析都不必登录；只有关注时间线、自动关注与分组才要扫码"
             }
             "account.cookie" => "完整 Cookie 串；/bili login 扫码成功后框架会把它写回这里",
             "account.uid" => "本 Cookie 所属的 B 站 uid，扫码登录会自动填；手填也行",

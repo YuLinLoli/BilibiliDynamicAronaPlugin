@@ -292,6 +292,22 @@ async fn timeline_round(
     }
 }
 
+/// 直播版式要的那份房间信息。`DYNAMIC_TYPE_LIVE_RCMD` 的 content 里只有房间号、标题和封面，
+/// 主播名与头像都不带，缺的那两格用动态作者那两格顶上——这一条动态本来就是主播自己发的。
+fn live_of(dynamic: &Dynamic) -> Option<LiveInfo> {
+    let mut live = dynamic.live.clone()?;
+    if live.anchor.is_empty() {
+        live.anchor = dynamic.name.clone();
+    }
+    if live.face.is_empty() {
+        live.face = dynamic.face.clone();
+    }
+    if live.uid == 0 {
+        live.uid = dynamic.uid;
+    }
+    Some(live)
+}
+
 /// 一条新动态推给一批目标：先按目标筛，再取素材，卡片按配色缓存，最后逐个发。
 /// `slot` 是水位所在的那一档——按 UP 主订阅时就是那个 uid，走关注时间线时传 `0`。
 async fn push_one(
@@ -314,7 +330,8 @@ async fn push_one(
         save(&conf.check);
         return;
     }
-    let living = kind == "直播";
+    let live = live_of(dynamic).filter(|_| kind == "直播");
+    let living = live.is_some();
     let material = gather(
         bili,
         &face_urls(dynamic),
@@ -330,21 +347,18 @@ async fn push_one(
     } else {
         translate::translate(&conf.translate, &dynamic.text).await
     };
-    let vals = if living {
-        let live = dynamic.live.clone().unwrap_or_default();
-        Vals::live(&live, link.clone(), &format_time(now()))
-    } else {
-        Vals::dynamic(dynamic, link.clone())
+    let vals = match &live {
+        Some(info) => Vals::live(info, link.clone(), &format_time(now())),
+        None => Vals::dynamic(dynamic, link.clone()),
     };
     let images: Vec<Vec<u8>> = dynamic
         .images
         .iter()
         .filter_map(|url| material.bytes.get(url).cloned())
         .collect();
-    let cover = dynamic
-        .live
+    let cover = live
         .as_ref()
-        .and_then(|live| material.bytes.get(&live.cover).cloned());
+        .and_then(|info| material.bytes.get(&info.cover).cloned());
     // 同一档配色只画一张卡：一个群一个色，二十个群别画二十遍
     let mut drawn: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     for (key, state) in chosen {
@@ -362,20 +376,16 @@ async fn push_one(
             ),
             // 动态内容不会再变，画好的卡值得落到盘上；直播卡带着在线人数与标题，只在这一轮里复用
             !living,
-            || {
-                if living {
-                    let live = dynamic.live.clone().unwrap_or_default();
-                    paint_live(appearance, &color, &live, &material, &link)
-                } else {
-                    paint_dynamic(
-                        appearance,
-                        &color,
-                        dynamic,
-                        &material,
-                        &link,
-                        translation.as_ref(),
-                    )
-                }
+            || match &live {
+                Some(info) => paint_live(appearance, &color, info, &material, &link),
+                None => paint_dynamic(
+                    appearance,
+                    &color,
+                    dynamic,
+                    &material,
+                    &link,
+                    translation.as_ref(),
+                ),
             },
         );
         let post = if living {
@@ -421,17 +431,27 @@ async fn run_live(ctx: PluginContext) {
     let found: HashMap<i64, LiveInfo> = infos.into_iter().map(|live| (live.uid, live)).collect();
     let appearance = image_of(&ctx);
     for uid in uids {
-        let info = found.get(&uid).cloned().unwrap_or_default();
+        // 这一轮接口没给这个 uid 就不判定。拿默认值顶上去会把「读不到」当成数据用：
+        // 于是「在播」被判成「下播」（乱发一条结束通知），「换了标题」也被判成立（空标题不等于换标题）。
+        // 批量接口对开通过直播的 uid 恒给条目、未开播也给 live_status 0，所以查不到就是这轮真的没数据。
+        let Some(info) = found.get(&uid).cloned() else {
+            continue;
+        };
         let living = info.living();
         let prev = crate::store().read(|data| data.live.get(&uid.to_string()).cloned());
         let was_living = prev.as_ref().is_some_and(|state| state.status == 1);
+        // 基线里上一次记着的标题：接口这轮给的是空壳时就靠它兜住，别让空值把基线清空
+        let last_title = prev
+            .as_ref()
+            .map(|state| state.title.clone())
+            .unwrap_or_default();
         let targets = states_of(uid);
         match (was_living, living) {
             (false, true) => {
                 let state = LiveState {
                     status: 1,
                     room_id: info.room_id,
-                    title: info.title.clone(),
+                    title: keep(info.title.clone(), &last_title),
                     started_at: if info.live_start > 0 {
                         info.live_start
                     } else {
@@ -462,7 +482,7 @@ async fn run_live(ctx: PluginContext) {
                         LiveState {
                             status: 0,
                             room_id: previous.room_id,
-                            title: info.title.clone(),
+                            title: keep(info.title.clone(), &last_title),
                             started_at: previous.started_at,
                             closed: true,
                         },
@@ -478,20 +498,36 @@ async fn run_live(ctx: PluginContext) {
                         LiveState {
                             status: 1,
                             room_id: info.room_id,
-                            title: info.title.clone(),
+                            title: keep(info.title.clone(), &last_title),
                             started_at: previous.started_at,
                             closed: false,
                         },
                     );
                 });
-                // 换标题就当一次开播重推（原插件那套 updateLive 的口径）
-                if !previous.title.is_empty() && previous.title != info.title && !targets.is_empty()
+                // 换标题就当一次开播重推（原插件那套 updateLive 的口径）。
+                // 这一轮标题空着是接口没给，不是换了标题——那种不重推，不然推出去一张空卡。
+                if !previous.title.is_empty()
+                    && !info.title.is_empty()
+                    && previous.title != info.title
+                    && !targets.is_empty()
                 {
                     broadcast_live(&ctx, &conf, &bili, &appearance, &info, &targets).await;
                 }
             }
             (false, false) => {}
         }
+    }
+}
+
+/// 接口这轮给的是空值就沿用基线里那个，不拿空串把已知信息抹掉。
+///
+/// 基线里的标题一旦被空串覆盖，下一轮接口给了真标题就又会判成「换了标题」而重推，
+/// 而那张重推的卡用的还是这一轮的空数据——所以空值既不该写进基线，也不该触发推送。
+fn keep(value: String, previous: &str) -> String {
+    if value.is_empty() {
+        previous.to_string()
+    } else {
+        value
     }
 }
 
@@ -508,9 +544,9 @@ async fn broadcast_live(
     if !info.face.is_empty() {
         faces.push(info.face.clone());
     } else {
-        // batch 接口有时不给头像，补一次用户名片
-        if let Ok(brief) = bili.user(info.uid).await {
-            faces.push(brief.face);
+        // batch 接口有时不给头像，补一次直播用户资料——名片那条要 WBI 签名，连打会被判风控
+        if let Ok(anchor) = bili.master(info.uid).await {
+            faces.push(anchor.face);
         }
     }
     let material = gather(
@@ -566,6 +602,10 @@ async fn announce_close(
     }
     if live.title.is_empty() {
         live.title = previous.title.clone();
+    }
+    // 房间详情只给 uid，主播名靠名片补；名片被风控时退回批量接口那份 uname
+    if live.anchor.is_empty() {
+        live.anchor = info.anchor.clone();
     }
     let vals = Vals::live_close(&live, live.link(), previous.started_at, now());
     let post = Post::live_close(vals);
@@ -1025,8 +1065,8 @@ pub(crate) async fn preview(
     )
     .await;
     let link = link_of(bili, conf.push.to_short_link, dynamic).await;
-    if kind_of(dynamic) == "直播" {
-        let live = dynamic.live.clone().unwrap_or_default();
+    // 只有真带着房间信息才走直播版式：没有 live 还按直播画就推出一张空名空题的卡
+    if let Some(live) = live_of(dynamic).filter(|_| kind_of(dynamic) == "直播") {
         let vals = Vals::live(&live, link.clone(), &format_time(now()));
         let card = paint_live(&appearance, color, &live, &material, &link);
         return Post::live(vals, card, material.bytes.get(&live.cover).cloned());
@@ -1075,9 +1115,9 @@ pub(crate) async fn preview_live(
     let appearance = image_of(ctx);
     let mut faces: Vec<String> = Vec::new();
     if info.face.is_empty() {
-        // batch 接口有时不给头像，补一次用户名片
-        if let Ok(brief) = bili.user(info.uid).await {
-            faces.push(brief.face);
+        // batch 接口有时不给头像，补一次直播用户资料——名片那条要 WBI 签名，连打会被判风控
+        if let Ok(anchor) = bili.master(info.uid).await {
+            faces.push(anchor.face);
         }
     } else {
         faces.push(info.face.clone());
@@ -1167,6 +1207,50 @@ mod tests {
         assert_eq!(season_id("ep1234"), None);
         assert_eq!(season_id("md556"), None);
         assert_eq!(season_id(""), None);
+    }
+
+    /// 直播推荐动态的那张卡：content 里没有主播名与头像，缺的这两格由动态作者顶上，
+    /// 而「没有 live 载荷」的动态绝不能走直播版式——那样推出去是一张空名空题的卡。
+    #[test]
+    fn live_of_borrows_the_author_slot_when_the_room_envelope_is_silent() {
+        let with_room = Dynamic {
+            uid: 546195,
+            name: "老番茄".to_string(),
+            face: "https://i0.hdslb.com/bfs/face/bc5ca1.jpg".to_string(),
+            kind: "直播".to_string(),
+            live: Some(LiveInfo {
+                room_id: 21852,
+                title: "最手忙脚乱的一集".to_string(),
+                area: "其他单机".to_string(),
+                status: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let live = live_of(&with_room).expect("带着房间信息的直播该有直播版式");
+        assert_eq!(live.anchor, "老番茄");
+        assert_eq!(live.face, "https://i0.hdslb.com/bfs/face/bc5ca1.jpg");
+        assert_eq!(live.uid, 546195);
+        assert_eq!(live.title, "最手忙脚乱的一集");
+        // content 自己给了主播名时不改写它
+        let named = Dynamic {
+            live: Some(LiveInfo {
+                room_id: 21852,
+                anchor: "官方账号".to_string(),
+                status: 1,
+                ..Default::default()
+            }),
+            ..with_room.clone()
+        };
+        assert_eq!(live_of(&named).expect("有房间信息").anchor, "官方账号");
+        // 没有 live 载荷的「直播」类型动态拿不到直播版式
+        assert!(
+            live_of(&Dynamic {
+                kind: "直播".to_string(),
+                ..Default::default()
+            })
+            .is_none()
+        );
     }
 
     /// 卡片上要画的表情：正文与转发原文里的都收，同名只留一份，没地址的不收

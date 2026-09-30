@@ -7,9 +7,15 @@
 
 use serde_json::Value;
 
-/// 沿路径取节点
+/// 沿路径取节点。**JSON 的 `null` 当没这个键看待**：
+///
+/// 2026-09-30 抓的 feed/space 响应里，`major` 的每一族兄弟键都占着位置、值是 `null`
+/// （`{"archive":null,"article":null,"live":null,"live_rcmd":{…},"draw":null,…}`），
+/// 而 `detail` 那一份只带真正有内容的那一族。按「键在不在」分支的代码在动态流上会全线走错支：
+/// 直播推荐动态因此被 `major.live = null` 顶掉、房间信息整块丢掉，卡片就成了空名空题空房间号。
 pub(crate) fn at<'a>(root: &'a Value, keys: &[&str]) -> Option<&'a Value> {
-    keys.iter().try_fold(root, |node, key| node.get(*key))
+    let found = keys.iter().try_fold(root, |node, key| node.get(*key))?;
+    (!found.is_null()).then_some(found)
 }
 
 /// 取字符串；数字也接受
@@ -135,7 +141,7 @@ pub struct LiveInfo {
     pub uid: i64,
     pub room_id: i64,
     pub anchor: String,
-    /// 主播头像（直播接口里的 `user_cover`；某些列表接口不给，就退回画个灰圆）
+    /// 主播头像；列表接口给 `face`，单房间接口只能从名片补，仍为空时直播卡退回画个灰圆
     pub face: String,
     pub area: String,
     pub title: String,
@@ -237,6 +243,20 @@ pub fn format_time(seconds: i64) -> String {
     }
 }
 
+/// 北京时间文本 → 秒级时间戳，[`format_time`] 的反向。
+///
+/// 直播间的 `live_time` 不是时间戳而是 `yyyy-MM-dd HH:mm:ss` 字符串，未开播时 B 站给的是
+/// 全零日期 `0000-00-00 00:00:00`——那种月份越界，解析自然失败，统一按「接口没给时间」返回 None。
+pub(crate) fn parse_time(value: &str) -> Option<i64> {
+    use chrono::{FixedOffset, LocalResult, NaiveDateTime, TimeZone};
+    let naive = NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S").ok()?;
+    let zone = FixedOffset::east_opt(8 * 3600)?;
+    match zone.from_local_datetime(&naive) {
+        LocalResult::Single(moment) => (moment.timestamp() > 0).then_some(moment.timestamp()),
+        _ => None,
+    }
+}
+
 /// 时长秒 → "1:02:03" / "12:34"
 pub fn format_duration(seconds: i64) -> String {
     let seconds = seconds.max(0);
@@ -301,6 +321,11 @@ fn major_body(major: &Value) -> String {
 }
 
 /// 解析 major 里的直播卡片。LIVE_RCMD 的 content 是一段被字符串化的 JSON，要二次解析。
+///
+/// 2026-09-30 抓的真实包：`live_play_info` 的键是 `room_id/uid/title/area_name/parent_area_name/
+/// cover/online/live_status/live_start_time/live_id/link/watched_show`，
+/// **开播时间叫 `live_start_time`，不是 `live_start`；这一路压根不给主播名和头像**，
+/// 那两格由动态作者顶上（见 `tasks::live_of`）。`user_cover` 是横屏封面，不是头像，别拿它填 `face`。
 fn parse_live(major: &Value, own_uid: i64) -> Option<LiveInfo> {
     let raw = if let Some(info) = at(major, &["live"]) {
         info.clone()
@@ -316,12 +341,21 @@ fn parse_live(major: &Value, own_uid: i64) -> Option<LiveInfo> {
         uid: number(&raw, &["uid"]).unwrap_or(own_uid),
         room_id,
         anchor: text(&raw, &["uname"]).unwrap_or_default(),
-        face: text(&raw, &["user_cover"]).unwrap_or_default(),
-        area: text(&raw, &["area_name"]).unwrap_or_default(),
+        // 实测这一路没有主播名与头像那两格；认 `face` 只是给旧结构留着，
+        // 千万别学 batch 接口用 `user_cover`——那是横屏封面，画进头像格就是一张横图
+        face: text(&raw, &["face"]).unwrap_or_default(),
+        area: text(&raw, &["area_name"])
+            .or_else(|| text(&raw, &["parent_area_name"]))
+            .unwrap_or_default(),
         title: text(&raw, &["title"]).unwrap_or_default(),
-        cover: text(&raw, &["cover"]).unwrap_or_default(),
+        cover: text(&raw, &["cover"])
+            .or_else(|| text(&raw, &["user_cover"]))
+            .or_else(|| text(&raw, &["keyframe"]))
+            .unwrap_or_default(),
         online: number(&raw, &["online"]).unwrap_or_default(),
-        live_start: number(&raw, &["live_start"]).unwrap_or_default(),
+        live_start: number(&raw, &["live_start_time"])
+            .or_else(|| number(&raw, &["live_start"]))
+            .unwrap_or_default(),
         status: number(&raw, &["live_status"]).unwrap_or(1),
     })
 }
@@ -635,7 +669,9 @@ pub fn parse_feed(data: &Value) -> Vec<Dynamic> {
     out
 }
 
-/// 关注的主播直播列表（`GetWebList` 的 rooms）
+/// 关注的主播直播列表（`GetWebList` 的 rooms）。这一条要登录，匿名实测取不到包，
+/// 所以字段映射没有像 `parse_live_status` 那样对过真实响应——登录后第一次用到如果发现不对，
+/// 拿真实响应照 `user_and_wbi_shapes` 那个路子补一条 fixture 就能钉死。
 pub fn parse_live_list(data: &Value) -> Vec<LiveInfo> {
     at(data, &["rooms"])
         .and_then(Value::as_array)
@@ -680,23 +716,60 @@ pub fn parse_live_status(data: &Value) -> Vec<LiveInfo> {
         .iter()
         .filter_map(|room| {
             let room_id = number(room, &["roomid"]).or_else(|| number(room, &["room_id"]))?;
+            // 批量状态接口不给 `cover`：主播没设自定义封面时只有 `keyframe`（直播截图）
+            let cover = ["cover", "cover_from_user", "keyframe"]
+                .into_iter()
+                .find_map(|key| text(room, &[key]))
+                .unwrap_or_default();
             Some(LiveInfo {
                 uid: number(room, &["uid"]).unwrap_or_default(),
                 room_id,
                 anchor: text(room, &["uname"]).unwrap_or_default(),
-                face: text(room, &["user_cover", "face"]).unwrap_or_default(),
+                // 这一路给 `face`；不给就留空由主播资料接口补，不拿 `user_cover` 顶——那是横屏封面
+                face: text(room, &["face"]).unwrap_or_default(),
                 area: text(room, &["area_name"]).unwrap_or_default(),
                 title: text(room, &["title"]).unwrap_or_default(),
-                cover: text(room, &["cover"]).unwrap_or_default(),
+                cover,
                 online: number(room, &["online"]).unwrap_or_default(),
-                live_start: number(room, &["live_begin_timestamp"]).unwrap_or_default(),
+                live_start: number(room, &["live_time"])
+                    .or_else(|| number(room, &["live_begin_timestamp"]))
+                    .unwrap_or_default(),
                 status: number(room, &["live_status"]).unwrap_or_default(),
             })
         })
         .collect()
 }
 
-/// 用户名片（`/x/space/wbi/acc/info` 与 nav 都能给）
+/// 单房间详情（`room/v1/Room/get_info`）。
+///
+/// 真实响应把字段平铺在 `data` 下，而且**没有** `anchor_info`（2026-09-30 curl 核过：
+/// 键是 `uid`/`room_id`/`title`/`user_cover`/`keyframe`/`area_name`/`live_status`/`online`/`live_time`）。
+/// 所以主播名和头像这里取不到，由 [`crate::bili::api::Bili::room`] 拿 `uid` 补一次名片；
+/// 留空就是留空，模板与卡片按"没有"处理，不编一个假名字上去。
+/// `live_time` 是日期字符串不是时间戳，未开播时给全零日期，那条走 [`parse_time`] 的 None 分支。
+/// 封面 `user_cover` 是主播上传的横版封面，没设过时为空串，退回 `keyframe`（实时截图）。
+pub fn parse_room(data: &Value, requested: i64) -> LiveInfo {
+    LiveInfo {
+        uid: number(data, &["uid"]).unwrap_or_default(),
+        room_id: number(data, &["room_id"])
+            .or_else(|| number(data, &["roomid"]))
+            .unwrap_or(requested),
+        anchor: String::new(),
+        face: String::new(),
+        area: text(data, &["area_name"]).unwrap_or_default(),
+        title: text(data, &["title"]).unwrap_or_default(),
+        cover: text(data, &["user_cover"])
+            .or_else(|| text(data, &["keyframe"]))
+            .unwrap_or_default(),
+        online: number(data, &["online"]).unwrap_or_default(),
+        live_start: text(data, &["live_time"])
+            .and_then(|value| parse_time(&value))
+            .unwrap_or_default(),
+        status: number(data, &["live_status"]).unwrap_or_default(),
+    }
+}
+
+/// 用户名片：昵称、头像、签名、等级、直播间号
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserBrief {
     pub uid: i64,
@@ -708,22 +781,40 @@ pub struct UserBrief {
     pub room_id: i64,
 }
 
-pub fn parse_user(data: &Value) -> Option<UserBrief> {
-    let uid = number(data, &["mid"]).or_else(|| number(data, &["info", "mid"]))?;
+/// 直播用户资料（`live_user/v1/Master/info`）→ 名片形状，填 uid/name/face/room_id。
+///
+/// 字段名照 2026-09-30 curl 下来的真实包：名字在 `data.info.uname`、头像在 `data.info.face`、
+/// 房间号在 `data.room_id`（与 `info` 平级），外层还有 `exp`/`follower_num`/`medal_name` 这些用不着的键。
+/// 签名与等级这一路不给，那两格留默认值——要完整名片请走 [`parse_user`]。
+pub fn parse_master(data: &Value) -> Option<UserBrief> {
+    let info = data.get("info")?;
+    let uid = number(info, &["uid"]).or_else(|| number(data, &["uid"]))?;
     Some(UserBrief {
         uid,
-        name: text(data, &["name"])
-            .or_else(|| text(data, &["info", "name"]))
-            .unwrap_or_default(),
-        face: text(data, &["face"])
-            .or_else(|| text(data, &["face_url"]))
-            .or_else(|| text(data, &["info", "face"]))
-            .unwrap_or_default(),
-        sign: text(data, &["sign"])
-            .or_else(|| text(data, &["info", "sign"]))
-            .unwrap_or_default(),
-        level: number(data, &["level_info", "current_level"]).unwrap_or_default(),
+        name: text(info, &["uname"]).unwrap_or_default(),
+        face: text(info, &["face"]).unwrap_or_default(),
         room_id: number(data, &["room_id"]).unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
+/// 用户名片（`x/web-interface/card`）：资料都裹在 `data.card` 下面。
+///
+/// 换掉 `x/space/wbi/acc/info` 是因为那条要 WBI 签名，同一秒连打就被判风控
+/// （2026-09-30 两次实测 `-352 风控校验失败`），而这条带上匿名设备指纹就能取，
+/// 等级也是真值：同一天端到端里签名那条成功时回的是 Lv0，这条给 546195 的是 Lv6。
+/// 房间号这一版的 `card` 里没给（实测键列表见单测），由 `Bili::user` 从主播资料补；
+/// `room.room_id` 这条路径留着，B 站哪天给了就直接命中。
+pub fn parse_user(data: &Value) -> Option<UserBrief> {
+    let card = data.get("card")?;
+    let uid = number(card, &["mid"])?;
+    Some(UserBrief {
+        uid,
+        name: text(card, &["name"]).unwrap_or_default(),
+        face: text(card, &["face"]).unwrap_or_default(),
+        sign: text(card, &["sign"]).unwrap_or_default(),
+        level: number(card, &["level_info", "current_level"]).unwrap_or_default(),
+        room_id: number(card, &["room", "room_id"]).unwrap_or_default(),
     })
 }
 
@@ -1006,16 +1097,122 @@ mod tests {
         assert_eq!(by_object[0].room_id, 55);
     }
 
+    /// 一条「直播推荐」动态的真实包（2026-09-30 从 web-dynamic/v1/detail 抓的）：
+    /// 房间信息裹在被字符串化的 `live_rcmd.content` 里。这一路解析不出来的话，
+    /// 直播版式就拿一堆默认值画出一张主播名、标题、房间号全空的卡。
+    #[test]
+    fn a_live_recommend_dynamic_carries_its_room() {
+        let content = json!({
+            "type": "live_play",
+            "live_record_info": null,
+            "live_play_info": {
+                "live_start_time": 1790761298, "room_id": 21852, "uid": 546195,
+                "title": "最手忙脚乱的一集", "area_name": "其他单机", "parent_area_name": "单机游戏",
+                "cover": "https://i0.hdslb.com/bfs/live/new_room_cover/0dcada.jpg",
+                "online": 1092851, "live_status": 1, "live_id": "734393653329417564",
+                "link": "//live.bilibili.com/21852?live_from=85002"
+            }
+        });
+        let item = json!({
+            "id_str": "1253801885478944772", "type": "DYNAMIC_TYPE_LIVE_RCMD",
+            "modules": {
+                "module_author": {
+                    "mid": 546195, "name": "老番茄", "face": "https://i0.hdslb.com/bfs/face/bc5ca1.jpg"
+                },
+                "module_dynamic": {
+                    "major": {"live_rcmd": {"content": content.to_string(), "reserve_type": 0}, "type": "live_rcmd"},
+                    "desc": {"text": ""}
+                }
+            }
+        });
+        let dy = parse_item(&item).expect("这条直播推荐动态该解析出来");
+        assert_eq!(dy.kind, "直播");
+        assert_eq!(dy.name, "老番茄");
+        let live = dy.live.clone().expect("直播间信息不能丢");
+        assert_eq!(live.room_id, 21852);
+        assert_eq!(live.uid, 546195);
+        assert_eq!(live.title, "最手忙脚乱的一集");
+        assert_eq!(live.area, "其他单机");
+        assert_eq!(live.online, 1092851);
+        assert_eq!(live.status, 1);
+        assert!(live.living());
+        // 开播时间在 content 里叫 `live_start_time`，写成 `live_start` 取到的一直是 0
+        assert_eq!(live.live_start, 1790761298);
+        assert_eq!(live.started_text(), "2026年09月30日 17:41:38");
+        // 这个包不给主播名和头像，那两格由动态作者顶上（tasks::live_of）
+        assert!(live.anchor.is_empty());
+        assert!(live.face.is_empty());
+        // 房间封面并进图片列表，直播卡才有底图可画
+        assert!(dy.images.contains(&live.cover));
+    }
+
+    /// 动态流（feed/space）那一份包（2026-09-30 抓的）：`major` 里每一族兄弟键都占位、值是 `null`。
+    /// 按「键在不在」分支的解析在这份包上会全线走错支——这一条就是钉住「null 当没这个键」。
+    #[test]
+    fn the_feed_shape_pads_every_major_family_with_null() {
+        let content = json!({
+            "type": 1,
+            "live_record_info": Value::Null,
+            "live_play_info": {
+                "room_id": 21852, "uid": 546195, "live_status": 1,
+                "title": "最手忙脚乱的一集", "cover": "https://i0.hdslb.com/bfs/live/new_room_cover/0dcada.jpg",
+                "online": 1089108, "area_name": "其他单机", "parent_area_name": "单机游戏",
+                "live_start_time": 1790761298, "live_id": 734393653329417564i64
+            }
+        });
+        let item = json!({
+            "id_str": "1253801885478944772", "type": "DYNAMIC_TYPE_LIVE_RCMD",
+            "modules": {
+                "module_author": {"mid": 546195, "name": "老番茄", "face": "https://i0.hdslb.com/bfs/face/bc5ca1.jpg"},
+                "module_dynamic": {
+                    "additional": null, "desc": null, "topic": null,
+                    "major": {
+                        "archive": null, "article": null, "blocked": null, "common": null,
+                        "courses": null, "draw": null, "live": null, "medialist": null,
+                        "music": null, "none": null, "opus": null, "pgc": null,
+                        "subscription": null, "subscription_new": null, "ugc_season": null,
+                        "upower_common": null, "type": "MAJOR_TYPE_LIVE_RCMD",
+                        "live_rcmd": {"content": content.to_string(), "reserve_type": 0}
+                    }
+                }
+            }
+        });
+        let dy = parse_item(&item).expect("动态流这份包也该解析出来");
+        let live = dy
+            .live
+            .clone()
+            .expect("`major.live` 是 null 不能把房间信息顶掉");
+        assert_eq!(live.room_id, 21852);
+        assert_eq!(live.title, "最手忙脚乱的一集");
+        assert_eq!(live.live_start, 1790761298);
+        // 附带内容也一样：满屏 null 的 `archive` 不该被当成视频附件
+        assert!(dy.attached.is_none(), "拿 null 的 archive 当视频附件了");
+        // 与 detail 那份包解析出同一条动态，两份形状就该给出同样的结果
+        assert_eq!(dy.kind, "直播");
+        assert_eq!(dy.id, 1253801885478944772);
+    }
+
+    /// 名片接口的真实包形状（2026-09-30 curl）：资料裹在 `data.card` 下面，等级在
+    /// `level_info.current_level`，`mid` 是字符串。房间号这一版不给（card 的键里没有 room），
+    /// 那一格由主播资料接口补——接口名一旦从 card 换回签名那条，这两行断言就会红。
     #[test]
     fn user_and_wbi_shapes() {
-        let user = parse_user(&json!({"mid": "3546838751775383", "name": "优妮", "face": "https://f", "sign": "s", "level_info": {"current_level": 6}, "room_id": 23058})).unwrap();
-        assert_eq!(user.uid, 3546838751775383);
+        let user = parse_user(&json!({
+            "card": {
+                "mid": "546195", "name": "老番茄", "sign": "新浪微博：_老番茄_",
+                "face": "http://i0.hdslb.com/bfs/face/bc5ca101.jpg",
+                "level_info": {"current_level": 6, "current_min": 0},
+                "official_verify": {"type": 1, "desc": "2024百UP年度UP主"}, "vip": {"type": 2}
+            },
+            "following": false, "archive_count": 120, "article_count": 30, "follower": 12809000
+        }))
+        .unwrap();
+        assert_eq!(user.uid, 546195);
+        assert_eq!(user.name, "老番茄");
+        assert_eq!(user.sign, "新浪微博：_老番茄_");
         assert_eq!(user.level, 6);
-        assert_eq!(user.room_id, 23058);
-        let old_shape =
-            parse_user(&json!({"info": {"mid": 1, "name": "n", "face": "f", "sign": "s"}}))
-                .unwrap();
-        assert_eq!(old_shape.name, "n");
+        assert_eq!(user.room_id, 0);
+        assert!(parse_user(&json!({"mid": 1})).is_none());
 
         let (img, sub) = parse_wbi_img(&json!({"wbi_img": {"img_url": "https://i0.hdslb.com/bfs/wbi/7cd787b007c248e0a7c3d0f0c0b0c0de.png", "sub_url": "https://i0.hdslb.com/bfs/wbi/493cfcaff4a64f6d8aa33c1a5f0cba15.png"}})).unwrap();
         assert_eq!(img, "7cd787b007c248e0a7c3d0f0c0b0c0de");
@@ -1034,5 +1231,117 @@ mod tests {
         assert_eq!(format_duration(-5), "0:00");
         assert_eq!(kind_name("DYNAMIC_TYPE_MUSIC"), "音乐");
         assert_eq!(kind_name("DYNAMIC_TYPE_UNKNOWN"), "动态");
+    }
+
+    /// 开播批量状态接口的响应形状，字段名照 2026-09-30 抓的真实包：
+    /// `data` 以 uid 字符串为键，封面叫 `cover_from_user`（没设自定义封面时只有 `keyframe`），
+    /// 开播时间叫 `live_time`。这几个名字一旦写错，开播检测就静默拿到空值。
+    #[test]
+    fn live_status_map_flattens_the_real_shape() {
+        let data = json!({
+            "546195": {
+                "title": "最手忙脚乱的一集", "room_id": 21852, "uid": 546195,
+                "online": 1068182, "live_time": 1790761298, "live_status": 1,
+                "area_name": "单机联机", "uname": "老番茄", "face": "https://i0.hdslb.com/f.jpg",
+                "cover_from_user": "https://i0.hdslb.com/c.jpg", "keyframe": "https://i0.hdslb.com/k.jpg"
+            },
+            "23058": {
+                "title": "无人直播的房", "room_id": 23058, "uid": 23058,
+                "live_status": 0, "keyframe": "https://i0.hdslb.com/k2.jpg"
+            }
+        });
+        let list = parse_live_status(&data);
+        assert_eq!(list.len(), 2);
+        let one = list.iter().find(|live| live.uid == 546195).unwrap();
+        assert_eq!(one.room_id, 21852);
+        assert_eq!(one.anchor, "老番茄");
+        // 头像字段就叫 `face`；从前写成 ["user_cover","face"] 那条路径，取的一直是空
+        assert_eq!(one.face, "https://i0.hdslb.com/f.jpg");
+        assert_eq!(one.area, "单机联机");
+        assert_eq!(one.cover, "https://i0.hdslb.com/c.jpg");
+        assert_eq!(one.live_start, 1790761298);
+        assert_eq!(one.status, 1);
+        // 没设自定义封面的那间退回直播截图
+        assert_eq!(
+            list.iter().find(|live| live.uid == 23058).unwrap().cover,
+            "https://i0.hdslb.com/k2.jpg"
+        );
+    }
+
+    /// `live_time` 在单房间接口里是日期字符串，全零日期表示没开播过
+    #[test]
+    fn bj_date_string_parses_to_the_right_instant() {
+        // 2026-09-30 20:00 北京时间 = 1790769600；一旦按 UTC 解析会差 8 小时
+        assert_eq!(parse_time("2026-09-30 20:00:00"), Some(1790769600));
+        assert_eq!(parse_time(" 2026-09-30 20:00:00 "), Some(1790769600));
+        assert_eq!(parse_time("0000-00-00 00:00:00"), None);
+        assert_eq!(parse_time("1793361600"), None);
+        // 反向对得上，说明两边用的是同一个偏移
+        assert_eq!(
+            format_time(parse_time("2026-09-30 20:00:00").unwrap()),
+            "2026年09月30日 20:00:00"
+        );
+    }
+
+    /// 单房间详情（`Room/get_info`）的真实包形状，字段名照 2026-09-30 curl 下来的响应抄：
+    /// 平铺在 `data` 下、**没有** `anchor_info`。上一版按 `anchor_info.base_info.uname` 取，
+    /// 于是链接解析里主播名恒空——那三行取值一直是死的。
+    #[test]
+    fn room_info_is_flat_and_has_no_anchor_envelope() {
+        let data = json!({
+            "uid": 11153765, "room_id": 23058, "short_id": 3, "online": 0,
+            "live_status": 0, "area_name": "唱见电台", "title": "哔哩哔哩音悦台",
+            "user_cover": "", "keyframe": "https://i0.hdslb.com/bfs/live-key-frame/k23058.jpg",
+            "live_time": "0000-00-00 00:00:00", "area_id": 190
+        });
+        let room = parse_room(&data, 23058);
+        assert_eq!(room.uid, 11153765);
+        assert_eq!(room.room_id, 23058);
+        assert_eq!(room.title, "哔哩哔哩音悦台");
+        assert_eq!(room.area, "唱见电台");
+        // `user_cover` 是空串：text() 不认空串，于是退回 keyframe
+        assert_eq!(
+            room.cover,
+            "https://i0.hdslb.com/bfs/live-key-frame/k23058.jpg"
+        );
+        assert_eq!(room.live_start, 0);
+        assert_eq!(room.status, 0);
+        // 这接口确实不给主播名，由 Bili::room 拿 uid 补名片
+        assert!(room.anchor.is_empty());
+        assert!(room.face.is_empty());
+
+        // 开播中的那间：时间是日期字符串，要落成时间戳，卡片才画得出「几点开播」
+        let living = parse_room(
+            &json!({"uid": 1, "room_id": 2, "live_status": 1, "live_time": "2026-09-30 20:00:00"}),
+            2,
+        );
+        assert_eq!(living.live_start, 1790769600);
+        assert!(living.living());
+
+        // room_id 缺失时认调用方给的那个，不退回 0 再把链接拼成 live.bilibili.com/0
+        assert_eq!(parse_room(&json!({"uid": 7}), 23058).room_id, 23058);
+    }
+
+    /// 直播用户资料接口的真实包形状（2026-09-30 curl）：名字在 `info.uname`、头像在 `info.face`。
+    /// 房间详情不给主播名，直播卡那两格就靠它补——这一路匿名可取且不需要 WBI 签名。
+    #[test]
+    fn master_gives_anchor_name_and_face() {
+        let data = json!({
+            "info": {
+                "uid": 11153765, "uname": "3号直播间",
+                "face": "https://i2.hdslb.com/bfs/face/5d35da6e.jpg",
+                "official_verify": {"type": 1, "desc": "bilibili企业认证"}, "gender": -1
+            },
+            "follower_num": 1234, "room_id": 23058, "medal_name": ""
+        });
+        let anchor = parse_master(&data).unwrap();
+        assert_eq!(anchor.uid, 11153765);
+        assert_eq!(anchor.name, "3号直播间");
+        assert_eq!(anchor.face, "https://i2.hdslb.com/bfs/face/5d35da6e.jpg");
+        // 房间号在与 info 平级的位置上
+        assert_eq!(anchor.room_id, 23058);
+        // 只有名字头像房间号，签名等级那两格留默认值——要完整名片走 user()
+        assert!(anchor.sign.is_empty());
+        assert!(parse_master(&json!({"uid": 1})).is_none());
     }
 }

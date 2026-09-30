@@ -72,15 +72,18 @@ pub fn sign(
 }
 
 /// 拼查询串：key 与 value 都做百分号编码（签名用的是原值，这两件事互不干扰）
+///
+/// 编码集合用 `super::URI_COMPONENT`：`host_mid` 一旦编成 `host%5Fmid`，B 站收到的 key 就和
+/// 参与签名的 key 不再是同一串写法。
 pub fn encode_query(params: &BTreeMap<String, String>) -> String {
-    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+    use percent_encoding::utf8_percent_encode;
     params
         .iter()
         .map(|(key, value)| {
             format!(
                 "{}={}",
-                utf8_percent_encode(key, NON_ALPHANUMERIC),
-                utf8_percent_encode(value, NON_ALPHANUMERIC)
+                utf8_percent_encode(key, super::URI_COMPONENT),
+                utf8_percent_encode(value, super::URI_COMPONENT)
             )
         })
         .collect::<Vec<_>>()
