@@ -1167,13 +1167,21 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// 接口失败的汇报：`reportInterval` 为 0 就每次记，否则按间隔节流
+/// 接口失败的汇报：`reportInterval` 为 0 就每次记，否则按间隔节流。
+/// 节流点记的是**上一次真记了日志**的时间（原插件 `BiliCheckTasker.lastCheck` 同口径）；
+/// 早先这里每次调用都刷新时间戳，检测间隔比汇报间隔短时一条都记不出来。
 fn report(check: &CheckConfig, message: &str) {
     let stamp = now() as u64;
-    let last = LAST_REPORT.swap(stamp, Ordering::SeqCst);
-    if check.report_interval == 0 || stamp.saturating_sub(last) >= check.report_interval {
+    let last = LAST_REPORT.load(Ordering::SeqCst);
+    if !throttled(check.report_interval, last, stamp) {
+        LAST_REPORT.store(stamp, Ordering::SeqCst);
         arona::runtime::log::warning(format!("bilibili：{message}"));
     }
+}
+
+/// 这条汇报要不要压住。`interval` 单位分钟（与配置说明一致），0 表示不节流
+fn throttled(interval: u64, last: u64, stamp: u64) -> bool {
+    interval != 0 && stamp.saturating_sub(last) < interval.saturating_mul(60)
 }
 
 /// `ss12345` / `12345` → 番剧季号。`ep`/`md` 在命令层就换成 `ss` 了，这里只认这两种写法。
@@ -1214,6 +1222,17 @@ mod tests {
         let (dynamic, live) = current_intervals(&check("0-24x0"));
         assert_eq!(dynamic, 30);
         assert_eq!(live, 15);
+    }
+
+    #[test]
+    fn failure_reports_are_throttled_by_minutes_not_by_calls() {
+        // 节流点必须是「上一次真记了日志」的时间：检测 30 秒一轮、汇报间隔 10 分钟，
+        // 按调用刷时间戳的话每轮都差 30 秒，一条也记不出来
+        assert!(!throttled(0, 0, 1_700_000_000));
+        assert!(!throttled(10, 1_700_000_000 - 601, 1_700_000_000));
+        assert!(throttled(10, 1_700_000_000 - 599, 1_700_000_000));
+        // 间隔写得再离谱也不能溢出崩掉（debug 构建里乘法溢出会 panic）
+        assert!(throttled(u64::MAX, 0, 1_700_000_000));
     }
 
     #[test]
