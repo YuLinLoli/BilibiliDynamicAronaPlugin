@@ -563,6 +563,19 @@ impl Default for TemplateConfig {
             "NoDraw".into(),
             "{name} 更新了{type}\n{content}\n{images}\n{link}".into(),
         );
+        // 下面四条是原插件 `TemplateConfig.dynamicPush` 里那几档，名字与内容都照搬
+        // （`BiliConfig.kt:231-237`）：那边配置里写着 `defaultDynamicPush: OneMsg` 的，
+        // 换到这边不改名就该查不到模板，所以这几个名字必须一直在。
+        dynamic_push.insert("DrawOnly".into(), "{draw}".into());
+        dynamic_push.insert(
+            "TextOnly".into(),
+            "{name}@{type}\n{link}\n{content}\n{images}".into(),
+        );
+        dynamic_push.insert("OneMsg".into(), "{draw}\n{name}@{type}\n{link}".into());
+        dynamic_push.insert(
+            "TwoMsg".into(),
+            "{draw}\r{name}@{uid}@{type}\n{time}\n{link}".into(),
+        );
 
         let mut live_push = BTreeMap::new();
         live_push.insert("OnlyDraw".into(), "{draw}".into());
@@ -571,11 +584,23 @@ impl Default for TemplateConfig {
             "{draw}\r{name} 正在直播：{title}\n分区：{area}\n房间号：{rid}\n{link}".into(),
         );
         live_push.insert("TextOnly".into(), "{name} 开播了！\n{title}\n{link}".into());
+        // 同样照搬原插件 `livePush` 那三档（`BiliConfig.kt:238-242`）
+        live_push.insert("DrawOnly".into(), "{draw}".into());
+        live_push.insert("OneMsg".into(), "{draw}\n{name}@直播\n{link}".into());
+        live_push.insert(
+            "TwoMsg".into(),
+            "{draw}\r{name}@{uid}@直播\n{title}\n{time}\n{link}".into(),
+        );
 
         let mut live_close = BTreeMap::new();
         live_close.insert(
             "SimpleMsg".into(),
             "{name} 的直播已结束\n标题：{title}\n分区：{area}\n房间号：{rid}\n开播：{startTime}\n结束：{endTime}\n时长：{duration}".into(),
+        );
+        // 原插件这一档只有两句（`BiliConfig.kt:244-247`），照原名留着
+        live_close.insert(
+            "ComplexMsg".into(),
+            "{name} 直播结束啦!\n直播时长: {duration}".into(),
         );
 
         TemplateConfig {
@@ -716,6 +741,23 @@ mod tests {
         };
         assert!(custom.allows("example.org"));
         assert!(!custom.allows("bad.example.org"));
+    }
+
+    /// 原插件 `TemplateConfig` 里那几档模板名必须一直在（`BiliConfig.kt:227-247`）：
+    /// 那边配置里写 `defaultDynamicPush: OneMsg` 的人换到这边不该需要改名
+    #[test]
+    fn the_original_template_names_all_exist() {
+        let config = TemplateConfig::default();
+        for name in ["DrawOnly", "TextOnly", "OneMsg", "TwoMsg", "ForwardMsg"] {
+            assert!(
+                config.dynamic_push.contains_key(name),
+                "动态模板少了 {name}"
+            );
+        }
+        for name in ["DrawOnly", "TextOnly", "OneMsg", "TwoMsg"] {
+            assert!(config.live_push.contains_key(name), "直播模板少了 {name}");
+        }
+        assert!(config.live_close.contains_key("ComplexMsg"));
     }
 
     /// 模板表要能被配置区渲染出来：空表会被渲染成 `{}`，用户看不出该填什么
