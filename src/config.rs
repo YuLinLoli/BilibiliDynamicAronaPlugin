@@ -435,7 +435,10 @@ impl PluginConfig for ImageConfig {
             "defaultColor" => {
                 "默认主题色，支持多个值自定义渐变，中间用分号分隔，例: #fde8ed;#fde8ed；单个值会自动生成渐变色"
             }
-            "cardOrnament" => "卡片装饰：FanCard(粉丝卡片) / QrCode(动态链接二维码) / None",
+            "cardOrnament" => {
+                "卡片装饰：QrCode(右下角画动态链接二维码) / None(不装饰)。FanCard(粉丝勋章) 这一档当前\
+                 不出效果——插件没铺 B 站的勋章数据，填了等同 None"
+            }
             "badgeEnable" => "卡片顶部的标签",
             "colorGenerator" | "colorGenerator.hueStep" => {
                 "渐变色生成器（仅当主题色只给了一个值时生效）"

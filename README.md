@@ -133,7 +133,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `theme` | `v3` | 绘图主题：`v3` / `v3RainbowOutline` / `v2` |
 | `font` | `""` | 字体文件**绝对路径**，或放在 `config/bilibili/font/` 下的**文件名**（后缀 `.ttf/.otf/.ttc` 可省）；留空自动找系统中文字体。后可跟 `;` 指定粗体 |
 | `defaultColor` | `#d3edfa` | 默认主题色，多个用 `;` 分隔构成渐变；单个值按 colorGenerator 自动生成 |
-| `cardOrnament` | `None` | 卡片装饰：`FanCard` / `QrCode` / `None` |
+| `cardOrnament` | `None` | 卡片装饰：`QrCode` / `None`；`FanCard` 这一档当前不出效果（见「已知差别」第 29 条） |
 | `badgeEnable` | `true` | 卡片顶部标签 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
 | `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度 |
@@ -218,10 +218,24 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 28. **翻译走 https**：原插件的地址是 `http://api.fanyi.baidu.com/…`，而 APP ID 与签名就挂在查询串里，
     明文跑公网等于摊给沿途每一跳看。这里用百度同一套服务的 `https://fanyi-api.baidu.com/…`。
     判定「该不该译」与原插件同口径：先摘掉 `[笑]` 这类中括号，含假名就译，整篇没有汉字也译。
+29. **卡片装饰只认 `QrCode`**：`FanCard`（粉丝牌）在原插件是画在作者行上的勋章装饰
+    （`DynamicModuleDraw.kt:542` 那两档），本插件没铺 B 站的勋章数据，填了等同 `None`；键留着只为对齐配置面。
+30. **没有「加载中…」占位，也不给管理员补发操作通知**：原插件的 `enableConfig.showLoadingMessage` 会先发一条
+    「加载中…」再撤回，这里慢的时候就是慢，不多占一次发送；订阅、分组那些改动的提示也只回命令本身那一条，
+    不另发 `General.kt` 那类操作通知。
+31. **画质四档内置，字体不自动下载**：原插件允许 `customOverload` 逐档覆盖像素布局（`DynamicImageQuality.kt:14`），
+    这里四档写死；原插件找不到字体会自动下一份默认字体（`Init.kt:77`），这里找不到就记一条日志、这条只发文本。
+32. **单 bot、没有分档开关**：原插件的 Napcat 多 bot 探测（`NapcatCheckTasker.kt`）和 `cacheClearEnable` /
+    `liveCloseNotifyEnable` 两个开关都没有对应项——一个框架实例对应的就是它自己那条连接，缓存清理与直播结束
+    通知总是随主流程跑，不单独关。
+33. **`muted`（静音）是个只读字段**：`store.yml` 里有它，`/bili config` 会打「静音：是/否」，推送路径上三处都会
+    跳过静音目标，但**没有任何命令或配置项能把它打开**（原插件没有这一功能面，`mute` 那几处命中全是 `Mutex`）。
+    留着的代价是清单上有个改不动的开关，撤掉的代价是将来想做要重写读侧——这条留给你定。
 
 ## 预留问题
 
-功能面没有待接的项。翻译（第 27、28 条）在 2026-09-30 这一轮接上了：`translate.enable` 打开、
+功能面没有待接的项（第 33 条那个改不动的 `muted` 字段除外——它不是原插件的功能面，是我自己多加的，去留待你定）。
+翻译（第 27、28 条）在 2026-09-30 这一轮接上了：`translate.enable` 打开、
 `translate.appId` / `translate.securityKey` 填好之后，检测任务在画动态卡之前调一次百度接口，
 失败只记一条日志，不影响这条动态推不推。
 
@@ -241,11 +255,12 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 假 OneBot 端与运行目录都在本机 `C:\Users\cheng\Arona-e2e\`：运行目录 `run-bili\` 里
 `config/onebot.yml` 的 self_id 是 10000，`config/arona.yml` 的管理员写 100 与 12345，插件 dll 放
-`plugins\bilibili\`。两个工装各自起一个 ws-forward 服务（默认 9001），一次只跑一个：
+`plugins\bilibili\`。三个工装各自起一个 ws-forward 服务（默认 9001），一次只跑一个：
 
 ```
 node fake-onebot-bili.mjs      # 命令序列：21 条本地 + 5 条联网
 node fake-onebot-login.mjs     # /bili login 专测：出图 → 轮询 → 撤码
+node fake-onebot-link.mjs      # 链接解析钩子：五条带 at 段的消息，含一条负例
 ```
 
 回话按「第 i 条命令下发到第 i+1 条之间收到的」归属，打到 `可疑 0 条` 才算过。宿主一律
@@ -259,6 +274,17 @@ node fake-onebot-login.mjs     # /bili login 专测：出图 → 轮询 → 撤�
   过期 → 撤掉那两条消息（`delete_msg` ×2）→ 回「登录失败 二维码已过期，重新发一次 login」。四条判定全过。
 - `/bili new 501` 在未登录时回「获取动态失败 账号登录失效（code -101），请用 /bili login 重新扫码登录」，
   文案准确、不栈崩——这正是上面第 1、2 条压不到的直接原因。
+- 链接解析钩子（五条带 at 段的消息）：**番剧卡与直播卡都真出了图片段**，视频那条按「没铺详情接口」回三行文本，
+  没有链接的负例**安静**（没骚扰）；只有空间那条回「解析失败 账号登录失效（code -101）」——`api.rs:265` 的
+  `user()` 走 wbi 名片接口，B 站要登录态才给。这一条链不需要 B 站登录，一次验到
+  「入站消息段对钩子可见 → at 判定 → 识别式命中 → 带 Referer 抓图 → 图片段发出」五跳。
+- 删掉 `config/bilibili/arona.yml` 让框架重生成，`linkResolve.enable` 出来是 `true`，跟
+  `LinkResolveConfig::default()`（`config.rs:321`）一致——先前运行目录里那份 `false` 是手工关的，不是默认值。
+
+同一天还修了一处真缺陷：**番剧检测原先只在启动/热重载时跑一次**（`schedule()` 里一次性 `spawn_as`，注释却
+写着「跟着动态那一轮跑」），追番的新集永远不会推。现在挂在 `dynamic_job` 里跟动态同轮，`run_seasons` 自带的
+`SEASON_BUSY` 互斥让重叠那一次直接跳过。这一条要实压同样得先有登录态加追番订阅——看宿主日志每轮都出现
+「番剧检测」才算跟跑成功。
 
 ## 开发
 

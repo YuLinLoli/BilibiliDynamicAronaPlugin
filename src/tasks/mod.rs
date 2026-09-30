@@ -97,12 +97,6 @@ pub(crate) fn schedule(ctx: &PluginContext) {
         conf.check.low_speed
     ));
 
-    // 番剧跟着动态那一轮跑，不单独占一个任务名
-    let context = ctx.clone();
-    ctx.spawn_as("番剧检测", async move {
-        run_seasons(context).await;
-    });
-
     if ctx.test_notify && !SELFTEST_DONE.swap(true, Ordering::SeqCst) {
         let context = ctx.clone();
         ctx.spawn_as("测试推送", async move {
@@ -142,6 +136,12 @@ fn dynamic_job(ctx: &PluginContext) -> JobFn {
         let spawned = ctx.clone();
         ctx.spawn_as("动态检测", async move {
             run_dynamic(spawned).await;
+        });
+        // 番剧跟着动态这一轮跑，不单独占一个任务名。它自带 SEASON_BUSY 互斥，
+        // 上一轮没跑完就直接跳过，所以搭车排程不会叠出一堆并发请求。
+        let seasons = ctx.clone();
+        ctx.spawn_as("番剧检测", async move {
+            run_seasons(seasons).await;
         });
     })
 }
