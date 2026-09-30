@@ -276,10 +276,11 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    那 10 项单测覆盖判定口径、签名拼法与响应解析。
 2. **`login` 的成功分支**。拿到 Cookie 后 `entry.update` 会把它写回 `config/bilibili/arona.yml`，
    再看框架能不能原样读回（Cookie 串里有分号、空格、等号）。这条只能你扫码，本轮压到的是失败分支。
-3. **作为附件直发的图片段是 WebP 还是 PNG**。`cache.downloadOriginal=false`（默认）时插件向 B 站缩放图服务要
-   `…webp` 那一份，番剧封面、直播封面因此以 WebP 发出去（2026-09-30 实测 52 KB，`base64://UklGR…` 开的头）。
-   画进卡片的那些不受影响——插件自己出的是 PNG。要不要把附件也统一转一次归你定：
-   转一次体积会涨一个量级，不转则取决于收端认不认 WebP。
+3. **作为附件直发的图片段是什么编码，取决于图床那一次给的是哪一份**。`cache.downloadOriginal=false`（默认）时
+   插件先要 `…@720w.webp`、失败才回退原图，而附件发的是拿到的原始字节，所以实测两种都出现过：
+   番剧/直播封面那次是 WebP（52 KB，`base64://UklGR…` 开头），`/bili new` 那轮是 JPEG（`base64:///9j/…` 开头）。
+   画进卡片的那些不受影响——插件自己出的是 PNG。要不要在发送前统一转一次归你定：
+   转一次体积会涨一个量级，不转则收端认不认得看运气。
 
 原来列在这里的第 1 条「**直播卡被真实开播数据驱动**」已经在 2026-09-30 晚间这一轮压到了：
 `feed/space` 里那条直播推荐动态真推出了一张 PNG 直播卡 + 「老番茄 正在直播：最手忙脚乱的一集 /
@@ -295,8 +296,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 ```
 node fake-onebot-bili.mjs      # 命令序列：21 条本地 + 5 条联网
 node fake-onebot-login.mjs     # /bili login 专测：出图 → 轮询 → 撤码
-node fake-onebot-link.mjs      # 链接解析钩子：六条带 at 段的消息，含一条负例
+node fake-onebot-link.mjs      # 链接解析钩子：七条带 at 段的消息，含一条负例
 node fake-onebot-season.mjs    # 番剧跟跑：订一部番后静默四轮，看检测有没有每轮都查
+node fake-onebot-new.mjs       # 软限流探针：同一个 uid 连发 N 次 /bili new，数几次出真动态
 node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推送与其中的图片段
 ```
 
@@ -328,8 +330,23 @@ node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推�
   修通之前它推的是一张「 正在直播：」空卡，根因见上面第 35 条。
 - `t.bilibili.com/<动态ID>` 这一族在连打时会被 B 站判风控（`-352`），插件回「解析失败 被 B 站风控拦了
   （code -352: 风控校验失败），把检测间隔调大一些再试」——这句话本轮实测出现过，属实数据不是编的。
+- 直播状态**批量**接口这一路本轮也匿名抓到了真包（`room/v1/Room/get_status_info_by_uids`，
+  POST `{"uids":[546195]}`）：回执是 `data.item_by_uid` 直接以 uid 为键、**没有** `room` 那一层嵌套，
+  字段给的是 `room_id`/`uname`/`face`/`area_name`/`cover_from_user`/`keyframe`/`live_status`/`online`/`live_time`。
+  `parse_live_status` 逐条对得上，两处先前只在猜的地方就此定死：头像认 `face`（真给，不需要拿
+  `Master/info` 补，更不能拿 `user_cover` 顶），封面先取 `cover_from_user`、主播没设自定义封面才退 `keyframe`。
 - `feed/space` 有**软限流**：本轮多次出现「code 0、`items` 是空数组」，宿主日志里 HTTP 全 200，
   定时检测因此一整轮 0 推送。这不是插件坏了，压测时别拿「0 推送」当失败判据——要看 `store.yml` 里水位有没有动。
+  同一现象在命令面上也出现过：改完第 34 条之后复跑全命令序列，26 条回话仍然**可疑 0 条**、宿主 0 panic，
+  但 `/bili new 546195` 那轮回的是「未找到动态」，而更早两轮同一条命令回的是真动态＋图片段。
+  为这条专门起了探针（`fake-onebot-new.mjs`：同一个 uid 连发四次，上一条回话一停就发下一条，
+  实际打出去是 12:20:15 / 17 / 19 / 21 四拍，`NEW_RC=0`）——
+  **四次里两次出真动态（PNG 卡片＋JPEG 配图两段图片段）、两次「未找到动态」**，宿主日志四条
+  `feed/space?…host_mid=546195…w_rid=…` 全部发出、全部正常返回。同一个人六秒之内不可能「没了动态又有了」，
+  所以这是接口在同一个窗口里忽空忽有，不是解析回归——探针只证明了「同一条命令能连出两次真动态」，
+  至于是按连接、按节点还是按配额抽样给空数组，B 站没说，我也不猜。`new()`（`commands/browse.rs:410`）没有水位去重，
+  空数组只能来自接口。结论落在插件行为上：**它分不清「真没动态」与「被软限流挡了」**，照 B 站给的
+  `items` 空数组回「未找到动态」。要不要拿 `psource`/水位把这两种分开是你的取舍，不是缺陷清单。
 - 删掉 `config/bilibili/arona.yml` 让框架重生成，`linkResolve.enable` 出来是 `true`，跟
   `LinkResolveConfig::default()`（`config.rs:321`）一致——先前运行目录里那份 `false` 是手工关的，不是默认值。
 
@@ -340,6 +357,9 @@ node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推�
 这一条**不需要 B 站登录就能实压**（`pgc/view/web/season` 匿名可查），验法见 `fake-onebot-season.mjs` 与
 `fake-onebot-listen.mjs`：订一部番之后什么都不发，宿主日志里每轮都真出现 `[BilibiliDynamic:番剧检测]`
 （本轮 140 秒里 20 次请求 = 5 轮 × 3 部），静默期推 0 条——首轮只记基线，正确。
+第 34 条修完之后拿 `fake-onebot-season.mjs` 复跑过一遍（`SEASON2B_RC=0`）：`/bili add ss38942 20001`
+回「追番成功( •̀ ω •́ )✧ [爆笑罗米熊与丹米兔]」，`/bili list` 里番剧那一栏有它，静默 4 轮检测共推 0 条，
+`store.yml` 落成的基线是**新格式**（剧集号写成字符串）：`seasons: { ss38942: '418481' }`。
 
 但晚间复跑时先暴露了一件事：**早些时候那句「把基线改成假的→认出新集→真推一条」压的其实是第 34 条那个缺陷**——
 那轮用的 `ss38942` 根本没有 `newest` 键，推出去的文案是「更新了：」，集名那一格是空的（本轮用同一手法
@@ -366,10 +386,14 @@ node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推�
 播放：https://www.bilibili.com/bangumi/play/ss298872」＋一张 PNG 卡，`ss38942` 那条也多出了「最新：第13话」
 这一行——这一行在先前那版里因为取不到值，被 `if !season.newest_title.trim().is_empty()` 整条跳掉了。
 
-还有一条记在这儿当观测：**定时推送里作为附件直发的那一份封面是 WebP**。`cache.downloadOriginal` 默认 `false`，
-插件向 B 站的缩放图服务要的是 `…jpg@…w.webp` 那一份，52 KB 很小，但发出去的图片段确实是 WebP 编码
-（`base64://UklGR…`，`src/cache.rs` 的键名测试里就写着这个形状）。链接解析那几条不受影响——
-那是插件画完再发的 PNG。要不要把附件也统一转成 PNG/JPEG 归你定，插件不猜。
+还有一条记在这儿当观测：**作为附件直发的那一份图，编码是跟着图床那一次给的是哪一份走的，插件不重编码**。
+`fetch`（`tasks/mod.rs:873`）在 `cache.downloadOriginal=false`（默认）时先要 `…@720w.webp`，那一次失败才回退原图；
+拿到的原始字节直接塞进图片段，解码只为画图。所以同一个附件位子上实测出现过两种编码：
+定时推送那次是 WebP（`base64://UklGR…`，52 KB），`/bili new` 这轮是 JPEG（`base64:///9j/4AAQSkZJRg…`）。
+链接解析与卡片那几段不受影响——那是插件画完再发的 PNG。
+要不要在发送前统一转成 PNG/JPEG 归你定：插件已经引了 `image`，`fetch` 里那句 `decoded.to_rgba8()` 手边就有像素，
+真要转只是把 `raw` 换成重编码那几行；但这会改变附件字节与缓存那份的对应关系（缓存存原始字节），
+属于取舍不是缺陷，所以我停在这儿等你拍。
 
 
 ## 开发
@@ -377,7 +401,7 @@ node fake-onebot-listen.mjs    # 纯监听：不下发命令，只数定时推�
 ```
 cargo fmt
 cargo clippy --all-targets     # 目标：0 警告
-cargo test --lib               # 136 项，2 项联网用例标了 #[ignore]
+cargo test --lib               # 147 项（145 通过 + 2 项联网用例标了 #[ignore]）
 cargo build --release
 ```
 
