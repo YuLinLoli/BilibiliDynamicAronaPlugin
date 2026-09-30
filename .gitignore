@@ -1,0 +1,7 @@
+/target
+/config
+/data
+/logs
+/plugins
+*.log
+*.pdb

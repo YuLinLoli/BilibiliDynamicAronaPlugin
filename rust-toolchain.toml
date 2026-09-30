@@ -1,0 +1,8 @@
+# 宿主装载插件时核对 ABI 指纹，指纹里带着 rustc 的 release 号
+# （见框架 crates/arona/build.rs），编译器版本不一致的 dll 会被直接拒载。
+# 必须与框架仓库同名文件逐字一致。
+[toolchain]
+channel = "1.98.0"
+# 只钉 channel，不写 components：components 会让每一次 cargo 都去补装组件，
+# 补装失败整条命令回滚报错。rustfmt/clippy 请显式装一次：
+#   rustup component add rustfmt clippy

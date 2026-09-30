@@ -1,0 +1,501 @@
+//! 模板渲染：把 `{name}` 这类占位符展开成一条条待发消息。
+//!
+//! 语义逐条抄自原插件 `tasker/SendTasker.kt`，三条路径各有口径：
+//! * 动态（`buildMsg`）与直播（`buildLiveMsg`）：按 `\{([a-z]+)}` 扫描替换，
+//!   所以键名只认小写字母——`{startTime}` 写在这里不会被识别，会原样留在文本里。
+//! * 直播结束（`buildCloseMsg`）：不走正则，按固定的九个键做字面替换，键名可以带大写，
+//!   产物只有**一条纯文本消息**（原插件那里既不拆多条也不支持合并转发）。
+//! * 模板里字面 `\n` 与真换行等价（当换行），字面 `\r` 与真回车等价（当"拆成两条消息"的分隔）；
+//!   `{>>}…{<<}` 之间的内容收成一张合并转发卡片。
+//! * 认不出的小写键保留原插件那句 `[不支持的类型: xxx]`。
+
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+use arona::runtime::message::{ForwardMessage, MessageSegment, OutgoingMessage};
+
+use crate::bili::model::{Dynamic, LiveInfo, format_duration, format_time};
+use crate::config::ForwardCard;
+
+/// 占位符：左花括号 + 若干小写字母 + 右花括号
+static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{([a-z]+)}").unwrap());
+/// 合并转发区间：`{>>}` 到 `{<<}`，跨行也算一段
+static FORWARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)\{>>}(.*?)\{<<}").unwrap());
+
+/// 文本类占位符的取值表。图片类占位符（`{draw}` `{images}` `{cover}`）不在这里，
+/// 因为它们的产物是消息段而不是文本，见 [`Supply`]。
+#[derive(Clone, Debug, Default)]
+pub struct Vals(BTreeMap<String, String>);
+
+impl Vals {
+    pub(crate) fn fill(items: [(&str, String); 8]) -> Vals {
+        let mut map = BTreeMap::new();
+        for (key, value) in items {
+            map.insert(key.to_string(), value);
+        }
+        Vals(map)
+    }
+
+    /// 测试推送用的那一份字段（`--test-notify` 走真实模板，只是内容是自己编的）
+    pub(crate) fn test() -> Vals {
+        let now = chrono::Utc::now().timestamp();
+        Vals::fill([
+            ("name", "bilibili-dynamic-plugin".to_string()),
+            ("uid", "0".to_string()),
+            ("did", "0".to_string()),
+            ("time", format_time(now)),
+            ("type", "动态".to_string()),
+            (
+                "content",
+                "这是一条测试推送：能看到就说明模板解析与发送两条路都通了。".to_string(),
+            ),
+            ("link", "https://t.bilibili.com".to_string()),
+            ("links", "https://t.bilibili.com".to_string()),
+        ])
+    }
+
+    /// 一条动态能填的键。`link` 由调用方决定是原链还是短链（`push.toShortLink`）。
+    pub fn dynamic(dynamic: &Dynamic, link: String) -> Vals {
+        let links = if dynamic.links.is_empty() {
+            dynamic.link()
+        } else {
+            dynamic
+                .links
+                .iter()
+                .map(|item| item.url.clone())
+                .collect::<Vec<String>>()
+                .join("\n")
+        };
+        Vals::fill([
+            ("name", dynamic.name.clone()),
+            ("uid", dynamic.uid.to_string()),
+            ("did", dynamic.id.to_string()),
+            ("time", dynamic.time_text()),
+            ("type", dynamic.kind.clone()),
+            ("content", dynamic.display_text()),
+            ("link", link),
+            ("links", links),
+        ])
+    }
+
+    /// 一次开播能填的键。`time` 是检测时刻，与原插件 `LiveMessage.time` 同口径。
+    pub fn live(live: &LiveInfo, link: String, time: &str) -> Vals {
+        Vals::fill([
+            ("name", live.anchor.clone()),
+            ("uid", live.uid.to_string()),
+            ("rid", live.room_id.to_string()),
+            ("time", time.to_string()),
+            ("type", "直播".to_string()),
+            ("title", live.title.clone()),
+            ("area", live.area.clone()),
+            ("link", link),
+        ])
+    }
+
+    /// 直播结束的九个键（字面替换那一路，键名带大写）
+    pub fn live_close(live: &LiveInfo, link: String, started_at: i64, ended_at: i64) -> Vals {
+        let seconds = if started_at > 0 && ended_at > started_at {
+            ended_at - started_at
+        } else {
+            0
+        };
+        Vals(BTreeMap::from([
+            ("name".to_string(), live.anchor.clone()),
+            ("uid".to_string(), live.uid.to_string()),
+            ("rid".to_string(), live.room_id.to_string()),
+            (
+                "startTime".to_string(),
+                if started_at > 0 {
+                    format_time(started_at)
+                } else {
+                    String::new()
+                },
+            ),
+            ("endTime".to_string(), format_time(ended_at)),
+            ("duration".to_string(), format_duration(seconds)),
+            ("title".to_string(), live.title.clone()),
+            ("area".to_string(), live.area.clone()),
+            ("link".to_string(), link),
+        ]))
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// 这条推送属于哪个订阅者（`{uid}` 那一格，@全体 的档位按它查）
+    pub fn uid(&self) -> i64 {
+        self.get("uid")
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// 转发节点上的显示名与 QQ 号（原插件用动态作者那一组）
+    fn author(&self) -> (String, i64) {
+        let name = self.0.get("name").cloned().unwrap_or_default();
+        let uin = self
+            .0
+            .get("uid")
+            .and_then(|raw| raw.parse::<i64>().ok())
+            .unwrap_or(0);
+        (name, uin)
+    }
+}
+
+/// 图片类占位符的供给。绘图与下载都在调用方做完，这里只把成品交出来。
+#[derive(Default)]
+pub struct Supply {
+    /// `{draw}`：卡片 PNG。None 表示没出图，发 [`Supply::draw_missing`] 那句
+    pub draw: Option<Vec<u8>>,
+    /// 没出图时给用户的说明，照抄原插件的两条文案
+    pub draw_missing: String,
+    /// `{images}`：正文图，一张一个图片段
+    pub images: Vec<Vec<u8>>,
+    /// `{cover}`：直播封面。缺了按原插件那样替换成空串
+    pub cover: Option<Vec<u8>>,
+}
+
+impl Supply {
+    /// 动态卡片的供给（没有封面这一说）
+    pub fn for_dynamic(draw: Option<Vec<u8>>, images: Vec<Vec<u8>>) -> Supply {
+        Supply {
+            draw_missing: if draw.is_none() {
+                "[绘制动态失败]".to_string()
+            } else {
+                "[未找到绘制的动态]".to_string()
+            },
+            draw,
+            images,
+            cover: None,
+        }
+    }
+
+    /// 直播卡片的供给
+    pub fn for_live(draw: Option<Vec<u8>>, cover: Option<Vec<u8>>) -> Supply {
+        Supply {
+            draw_missing: if draw.is_none() {
+                "[绘制直播图片失败]".to_string()
+            } else {
+                "[未找到绘制的直播图片]".to_string()
+            },
+            draw,
+            images: Vec::new(),
+            cover,
+        }
+    }
+}
+
+/// 动态/直播模板的渲染入口：返回按 `\r` 拆开的若干条消息（空的那几条已被丢掉）。
+pub fn render(
+    template: &str,
+    vals: &Vals,
+    supply: &Supply,
+    card: &ForwardCard,
+) -> Vec<OutgoingMessage> {
+    let text = normalize(template);
+    let mut out: Vec<OutgoingMessage> = Vec::new();
+    let mut cursor = 0usize;
+    for found in FORWARD.captures_iter(&text) {
+        let whole = found.get(0).expect("整段匹配一定存在").range();
+        if whole.start > cursor {
+            push_runs(&mut out, &text[cursor..whole.start], vals, supply);
+        }
+        let mut nodes: Vec<ForwardMessage> = Vec::new();
+        let mut inner: Vec<OutgoingMessage> = Vec::new();
+        push_runs(&mut inner, &found[1], vals, supply);
+        let (name, uin) = vals.author();
+        for message in inner {
+            nodes.push(ForwardMessage {
+                name: name.clone(),
+                uin,
+                content: message.segments,
+            });
+        }
+        if !nodes.is_empty() {
+            out.push(OutgoingMessage::forward(plain(&card.title, vals), nodes));
+        }
+        cursor = whole.end;
+    }
+    if cursor < text.len() {
+        push_runs(&mut out, &text[cursor..], vals, supply);
+    }
+    out
+}
+
+/// 直播结束模板：只做九个键的字面替换，产物一条纯文本消息。
+pub fn render_close(template: &str, vals: &Vals) -> OutgoingMessage {
+    let mut text = template.to_string();
+    for (key, value) in vals.0.iter() {
+        text = text.replace(&format!("{{{key}}}"), value);
+    }
+    OutgoingMessage::text(text)
+}
+
+/// 模板里只出文本时用这条（转发卡片的标题、预览）：图片占位按空处理。
+pub fn plain(template: &str, vals: &Vals) -> String {
+    let text = normalize(template);
+    let mut out = String::new();
+    // 逐段扫描：TAG 之间的原文照抄，认得的键换成值
+    let mut cursor = 0usize;
+    for found in TAG.captures_iter(&text) {
+        let whole = found.get(0).expect("整段匹配一定存在").range();
+        if whole.start > cursor {
+            out.push_str(&text[cursor..whole.start]);
+        }
+        let key = &found[1];
+        match vals.get(key) {
+            Some(value) => out.push_str(value),
+            None if matches!(key, "draw" | "images" | "cover") => {}
+            None => out.push_str(&format!("[不支持的类型: {key}]")),
+        }
+        cursor = whole.end;
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    out.replace("\\n", "\n")
+}
+
+/// 真换行/真回车统一成字面转义，之后所有判断都只认字面量（原插件先做这两次 replace）
+fn normalize(template: &str) -> String {
+    template.replace('\n', "\\n").replace('\r', "\\r")
+}
+
+/// 一段模板按字面 `\r` 拆成若干条消息
+fn push_runs(out: &mut Vec<OutgoingMessage>, chunk: &str, vals: &Vals, supply: &Supply) {
+    for run in chunk.split("\\r") {
+        let segments = expand(run, vals, supply);
+        if !segments.is_empty() {
+            out.push(OutgoingMessage::new(segments));
+        }
+    }
+}
+
+/// 一条消息的段序列：文本与图片按模板里出现的先后排
+fn expand(run: &str, vals: &Vals, supply: &Supply) -> Vec<MessageSegment> {
+    let mut segments: Vec<MessageSegment> = Vec::new();
+    let mut pending = String::new();
+    let mut cursor = 0usize;
+    for found in TAG.captures_iter(run) {
+        let whole = found.get(0).expect("整段匹配一定存在").range();
+        if whole.start > cursor {
+            pending.push_str(&run[cursor..whole.start]);
+        }
+        let key = &found[1];
+        match key {
+            "draw" => match &supply.draw {
+                Some(bytes) => {
+                    flush(&mut segments, &mut pending);
+                    segments.push(image(bytes.clone()));
+                }
+                None => pending.push_str(&supply.draw_missing),
+            },
+            "images" => {
+                flush(&mut segments, &mut pending);
+                for bytes in &supply.images {
+                    segments.push(image(bytes.clone()));
+                }
+            }
+            "cover" => {
+                if let Some(bytes) = &supply.cover {
+                    flush(&mut segments, &mut pending);
+                    segments.push(image(bytes.clone()));
+                }
+            }
+            _ => match vals.get(key) {
+                Some(value) => pending.push_str(value),
+                None => pending.push_str(&format!("[不支持的类型: {key}]")),
+            },
+        }
+        cursor = whole.end;
+    }
+    if cursor < run.len() {
+        pending.push_str(&run[cursor..]);
+    }
+    flush(&mut segments, &mut pending);
+    segments
+}
+
+/// 攒下的文本变成一段（字面 `\n` 还原成换行；空白串丢掉）
+fn flush(segments: &mut Vec<MessageSegment>, pending: &mut String) {
+    if pending.trim().is_empty() {
+        pending.clear();
+        return;
+    }
+    segments.push(MessageSegment::Text(pending.replace("\\n", "\n")));
+    pending.clear();
+}
+
+fn image(bytes: Vec<u8>) -> MessageSegment {
+    MessageSegment::Image {
+        url: None,
+        file: None,
+        data: Some(bytes),
+        file_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vals() -> Vals {
+        Vals(BTreeMap::from([
+            ("name".to_string(), "测试Up".to_string()),
+            ("uid".to_string(), "123".to_string()),
+            ("content".to_string(), "正文第一行\n第二行".to_string()),
+            ("link".to_string(), "https://t.bilibili.com/1".to_string()),
+        ]))
+    }
+
+    fn card() -> ForwardCard {
+        ForwardCard::default()
+    }
+
+    fn bytes() -> Vec<u8> {
+        vec![0u8; 12]
+    }
+
+    fn text_of(message: &OutgoingMessage) -> String {
+        message
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                MessageSegment::Text(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Vec<String>>()
+            .join("|")
+    }
+
+    fn images_of(message: &OutgoingMessage) -> usize {
+        message
+            .segments
+            .iter()
+            .filter(|segment| matches!(segment, MessageSegment::Image { .. }))
+            .count()
+    }
+
+    #[test]
+    fn tags_become_text_and_image_segments() {
+        let supply = Supply::for_dynamic(Some(bytes()), vec![bytes(), bytes()]);
+        let got = render(
+            "{name} 更新了{type}\n{content}\n{images}\n{link}",
+            &vals(),
+            &supply,
+            &card(),
+        );
+        assert_eq!(got.len(), 1, "整串没有 \\r，只该出一条");
+        assert_eq!(images_of(&got[0]), 2, "正文图两张该各成一个段");
+        let text = text_of(&got[0]);
+        assert!(text.starts_with("测试Up 更新了"), "{text}");
+        assert!(text.contains("正文第一行\n第二行"), "{text}");
+        assert!(text.ends_with("https://t.bilibili.com/1"), "{text}");
+    }
+
+    #[test]
+    fn literal_backslash_r_splits_into_several_messages() {
+        let supply = Supply {
+            draw: Some(bytes()),
+            draw_missing: String::new(),
+            images: Vec::new(),
+            cover: None,
+        };
+        let got = render("{draw}\\r{content}", &vals(), &supply, &card());
+        assert_eq!(got.len(), 2);
+        assert_eq!(images_of(&got[0]), 1);
+        assert_eq!(text_of(&got[1]), "正文第一行\n第二行");
+    }
+
+    #[test]
+    fn real_newline_and_carriage_return_mean_the_same_as_the_escapes() {
+        let supply = Supply::for_dynamic(Some(bytes()), Vec::new());
+        let got = render("{draw}\n{content}\r{name}", &vals(), &supply, &card());
+        assert_eq!(got.len(), 2, "真回车与字面 \\r 一样拆条");
+        assert_eq!(images_of(&got[0]), 1);
+        assert!(text_of(&got[0]).contains("正文第一行\n第二行"));
+        assert_eq!(text_of(&got[1]), "测试Up");
+    }
+
+    #[test]
+    fn forward_block_becomes_one_card_with_title_rendered() {
+        let supply = Supply::for_dynamic(Some(bytes()), Vec::new());
+        let template = "{draw}{>>}作者：{name}\nUID：{uid}{<<}\\r{content}";
+        let got = render(template, &vals(), &supply, &card());
+        assert_eq!(got.len(), 3, "卡片、转发、正文各一条");
+        let MessageSegment::Forward {
+            title, messages, ..
+        } = &got[1].segments[0]
+        else {
+            panic!("第二条该是合并转发，实际 {:?}", got[1].segments);
+        };
+        assert_eq!(title, "测试Up 的动态");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].name, "测试Up");
+        assert_eq!(messages[0].uin, 123);
+        assert!(text_of(&OutgoingMessage::new(messages[0].content.clone())).contains("UID：123"));
+    }
+
+    #[test]
+    fn unknown_tag_keeps_the_original_failure_text() {
+        let got = render("前面{wat}后面", &vals(), &Supply::default(), &card());
+        assert_eq!(text_of(&got[0]), "前面[不支持的类型: wat]后面");
+    }
+
+    #[test]
+    fn uppercase_tag_is_left_alone_because_the_original_regex_is_a_z_only() {
+        let got = render("开播：{startTime}", &vals(), &Supply::default(), &card());
+        assert_eq!(text_of(&got[0]), "开播：{startTime}");
+    }
+
+    #[test]
+    fn a_missing_draw_sends_the_failure_wording() {
+        let got = render(
+            "{draw}",
+            &vals(),
+            &Supply::for_dynamic(None, Vec::new()),
+            &card(),
+        );
+        assert_eq!(text_of(&got[0]), "[绘制动态失败]");
+        let live = Supply {
+            draw: Some(bytes()),
+            draw_missing: "[未找到绘制的直播图片]".to_string(),
+            images: Vec::new(),
+            cover: None,
+        };
+        let got = render("{cover}", &vals(), &live, &card());
+        assert!(
+            got.is_empty(),
+            "封面缺位时原插件替换成空串，空消息不该发出去"
+        );
+    }
+
+    #[test]
+    fn close_template_substitutes_the_nine_keys_only() {
+        let live = LiveInfo {
+            uid: 123,
+            room_id: 456,
+            anchor: "测试Up".to_string(),
+            title: "标题".to_string(),
+            area: "分区".to_string(),
+            ..Default::default()
+        };
+        let vals = Vals::live_close(&live, "https://live.bilibili.com/456".to_string(), 0, 0);
+        let got = render_close(
+            "{name} 的直播已结束\n房间号：{rid}\n时长：{duration}\n{unsupported}",
+            &vals,
+        );
+        // 字面替换那一路不认得 {unsupported}，也不做拆条——与原插件 buildCloseMsg 一致
+        // （MessageSegment 来自框架 crate、没有 PartialEq，所以逐段比文本）
+        assert_eq!(got.segments.len(), 1);
+        let MessageSegment::Text(text) = &got.segments[0] else {
+            panic!("结束通知该就一条文本段");
+        };
+        assert_eq!(
+            text,
+            "测试Up 的直播已结束\n房间号：456\n时长：0:00\n{unsupported}"
+        );
+    }
+}

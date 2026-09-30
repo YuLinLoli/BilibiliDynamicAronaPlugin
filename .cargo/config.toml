@@ -1,0 +1,7 @@
+# 与框架仓库保持一致：静态链接 MSVC 运行库，产物自带 VCRUNTIME/UCRT。
+# 宿主（arona-rs.exe）也是这么编的，两边口径不同会在链接期混进两套 CRT。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
