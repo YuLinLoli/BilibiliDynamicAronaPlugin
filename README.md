@@ -149,7 +149,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `badgeEnable.left` | `true` | 卡片顶部左标签（头像那枚） |
 | `badgeEnable.right` | `false` | 卡片顶部右标签（配色条那枚）；两档都关掉时整条标签带的高度一起收掉 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
-| `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度 |
+| `colorGenerator.lockSb` | `true` | 锁定饱和度与亮度（键名是 `lockSb`，`lock_sb` 经 camelCase 渲染而来；写成 `lockSB` 会被 serde 静默忽略） |
 | `colorGenerator.saturation` | `0.25` | 锁定的饱和度 0.0-1.0 |
 | `colorGenerator.brightness` | `1.0` | 锁定的亮度 0.0-1.0 |
 | `footer.dynamicFooter` | `""` | 动态页脚模板，支持 `{name} {uid} {id} {type} {time}`；留空不画页脚 |
@@ -319,7 +319,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 `translate.appId` / `translate.securityKey` 填好之后，检测任务在画动态卡之前调一次百度接口，
 失败只记一条日志，不影响这条动态推不推。
 
-下面第 1、2 条是**压测覆盖**没到，不是实现没做——而且没有一条还需要 B 站登录态（这一句此前写错过，见下面「端到端自测」里 2026-09-30 的那一轮）；第 3 条是一个等你拍的取舍，插件不替你决定：
+下面第 1、2 条是**压测覆盖**没到，不是实现没做——而且没有一条还需要 B 站登录态（这一句此前写错过，见下面「端到端自测」里 2026-09-30 的那一轮）；第 3、4 条是等你拍的取舍，插件不替你决定：
 
 1. **百度翻译的真实调用**。它挂在动态拉取之后，现在拉取通了，缺的只是一对真密钥：
    `translate.enable` 打开、`appId` / `securityKey` 填好才会出门。目前只有 `src/translate.rs`
@@ -331,6 +331,10 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    番剧/直播封面那次是 WebP（52 KB，`base64://UklGR…` 开头），`/bili new` 那轮是 JPEG（`base64:///9j/…` 开头）。
    画进卡片的那些不受影响——插件自己出的是 PNG。要不要在发送前统一转一次归你定：
    转一次体积会涨一个量级，不转则收端认不认得看运气。
+4. **注释表里的键名没有兜底**。`config.rs` 那 66 条说明是硬编码的 `match`，键名写错不报错、也不让编译
+   失败，只是生成的配置里少一行注释（上面 `lockSB` 就是这么漏进去的）。这轮那种脚本能查出来，可它待在
+   我本机 scratch 里，进不了 `cargo test`。要变成单测就得先让注释表可枚举——从 `match` 挪成一个常量数组，
+   66 行机械改写、行为不变，但那动的是 `config.rs` 的结构，按你立的规矩我没有自己下手。
 
 原来列在这里的第 1 条「**直播卡被真实开播数据驱动**」已经在 2026-09-30 晚间这一轮压到了：
 `feed/space` 里那条直播推荐动态真推出了一张 PNG 直播卡 + 「老番茄 正在直播：最手忙脚乱的一集 /
@@ -515,6 +519,16 @@ PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有�
   「加载中...」占位——`showLoadingMessage` 默认开着，占位也算一条出站消息，计数口径得跟着改。
   这一轮假端只收到 `send_group_msg` 一种帧、0 条通报：发命令的人用的是 100（框架 `managers` 里的号），
   管理员自己动手不发通报，正是那三重 gate 的反例。
+
+同一时刻给配置面补了第三证：删掉 `config/bilibili/arona.yml` 让框架按当前 HEAD 重生成，再拿两份脚本
+（本机 `C:\Users\cheng\Arona-e2e\check-config-keys.mjs` 与 `check-comment-keys.mjs`）对三方——
+README 那张键表的 49 个键在生成文件里全找得到，`config.rs` 注释表那 66 个键也全挂得上。
+第二支脚本一跑就抓到一处真错：`ColorGenerator::lock_sb` 经 `rename_all = "camelCase"` 渲染出来是
+`lockSb`，而注释表和 README 都写成 `lockSB`。后果有两层——生成的配置里这一项**一行说明都没有**，
+照 README 手写 `lockSB` 的人更会被 serde 当成未知键静默忽略，改不动这一档。两处键名都改成 `lockSb`，
+复跑脚本是「66 键零漏」，生成的 yml 里那行注释回来了。
+顺手改掉同一区的另一处文案漂移：`showLoadingMessage` 的注释原先写「模板列表、搜索、最新动态、最新视频」
+四条，可第 40 条讲的正是模板列表**不挂**占位——注释跟着实现缩成三条，并补了一句为什么不挂。
 
 ## 功能面差集收口
 
