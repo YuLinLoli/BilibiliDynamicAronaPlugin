@@ -149,7 +149,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `badgeEnable.left` | `true` | 卡片顶部左标签（头像那枚） |
 | `badgeEnable.right` | `false` | 卡片顶部右标签（配色条那枚）；两档都关掉时整条标签带的高度一起收掉 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
-| `colorGenerator.lockSb` | `true` | 锁定饱和度与亮度（键名是 `lockSb`，`lock_sb` 经 camelCase 渲染而来；写成 `lockSB` 会被 serde 静默忽略） |
+| `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度。全篇只有这一个键带连续大写——原插件自己就写成 `lockSB`（`BiliConfig.kt:181`），字段上单独 `rename` 点名，不让 `rename_all` 把它改成 `lockSb` |
 | `colorGenerator.saturation` | `0.25` | 锁定的饱和度 0.0-1.0 |
 | `colorGenerator.brightness` | `1.0` | 锁定的亮度 0.0-1.0 |
 | `footer.dynamicFooter` | `""` | 动态页脚模板，支持 `{name} {uid} {id} {type} {time}`；留空不画页脚 |
@@ -209,8 +209,10 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    `preview` / `summary` / `brief` 三项配置留着但当前 OneBot 实现取不到处安放。
 7. **`{images}` 实现为图片段**。原插件把它展开成图片消息段；这里一致，但一张图都没有时该位置直接留空，
    不会退化成一段占位文字。
-8. **没有 `enableConfig.showLoadingMessage`**。原插件「处理中先回一句」依赖 mirai 的事件拦截时序；
-   框架的命令分发是「回话恰好一次」，加这句会变成两条消息，所以不做。
+8. **「加载中」的实现路径不同（这一档先前记的是"不做"，2026-09-30 深夜做了，见第 30、40 条）**：
+   原插件靠 mirai 的事件拦截时序在命令执行前插一句；框架的命令分发是「回话恰好一次」，
+   照搬会变成两条消息留在群里。这边的办法是发出去再收回来——占位拿自己那条发送回执的
+   `message_id`，结果发完后调框架的 `Bot::recall` 把它撤掉，群里最终仍只看到结果那几条。
 9. **`proxy` 当前不生效**。出站 HTTP 走框架的代发出口（`arona::runtime::http`），那个出口没有代理参数；
    配置项留着是为了和原插件对齐，想让流量走代理请在框架/系统层配 `HTTP(S)_PROXY`。
 10. **短链只还原一层**。框架的 HTTP 出口只回响应正文，没有状态码也没有 302 的 `Location`，
@@ -295,7 +297,19 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     （默认不落地原图，附件仍照发）、`cardOrnament` 原 `FanCard` → `None`（见第 29 条）、
     `push.messageInterval`/`pushInterval` 从 100/500 毫秒放宽到 500/1000（连打会被 B 站判 -352）、
     `check.interval` 从 15 秒放宽到 30、`check.timeout` 从 10 秒放宽到 20、`footerAlign` 从 LEFT 改 CENTER、
-    `defaultDynamicPush` 从 `OneMsg` 改成 `SimpleMsg`。
+    `defaultDynamicPush` 与 `defaultLivePush` 从 `OneMsg` 改成 `SimpleMsg`。
+    2026-10-01 拿 `BiliConfig.kt` 的默认值又逐键比了一遍，下面这五处是当时漏记在这儿同款改动的：
+    * `check.lowSpeed` 原 `"0-0x2"` → `"3-8x2"`。原默认那串首尾都是 0，`low_speed_window`（`config.rs:241`）
+      判 `from == to` 就回 `None`——也就是说原插件默认压根不降速，它的 `lowSpeedEnable=true` 其实是空转；
+      这边给的是一个真会生效的凌晨窗口。
+    * `push.atAllPlus` 原 `PLUS_END` → `SINGLE_MESSAGE`。拼在最后一条尾部那种，碰上末条是合并转发会被
+      静默跳过（`push/mod.rs:191` 那个 `appendable` 特判，@全体 就这么丢了），单独先发一条不会。
+    * `admin` 原是一个 `Long`（`0` 表示没有）→ 这边是列表：能同时写多个 QQ 号与群号，也能一个都不写。
+    * 百度那两把密钥从 `baidu.APP_ID` / `baidu.SECURITY_KEY` 挪成 `translate.appId` / `translate.securityKey`
+      ——少一层子块，键名也不再是全大写蛇形。
+    * `forwardCard` 四串默认文案重写：原 `{name} {type} 详情` / `时间: {time}\n{content}` / `ID: {did}` /
+      `[{name} {type}]` → 这边 `{name} 的动态` / `{content}` / `点击查看完整动态` / `{name}: {content}`。
+      按第 6 条当前只有 `title` 那格真发得出去，其余三串留着只为对齐配置面。
 39. **操作通报（`bili.notifyEnable`）落在管理员的会话上**：非管理员动了订阅/分组/模板/过滤/@全体，
     插件给 `bili.admin` 里每个号发一条「操作人/位置/操作/结果」的私聊。两个口径与原插件不同：
     * 原插件把通报发给 `findContactAll(BiliConfig.admin)`——那只会命中机器人**已经认识的会话**；
@@ -524,9 +538,11 @@ PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有�
 （本机 `C:\Users\cheng\Arona-e2e\check-config-keys.mjs` 与 `check-comment-keys.mjs`）对三方——
 README 那张键表的 49 个键在生成文件里全找得到，`config.rs` 注释表那 66 个键也全挂得上。
 第二支脚本一跑就抓到一处真错：`ColorGenerator::lock_sb` 经 `rename_all = "camelCase"` 渲染出来是
-`lockSb`，而注释表和 README 都写成 `lockSB`。后果有两层——生成的配置里这一项**一行说明都没有**，
-照 README 手写 `lockSB` 的人更会被 serde 当成未知键静默忽略，改不动这一档。两处键名都改成 `lockSb`，
-复跑脚本是「66 键零漏」，生成的 yml 里那行注释回来了。
+`lockSb`，而注释表按原插件的写法（`BiliConfig.kt:181` 自己就写 `lockSB`）写的是 `lockSB`，两边对不上——
+生成的配置里这一项**一行说明都没有**。第一反应是把注释表和 README 一起改成 `lockSb`（`aa5a539` 就是这么做的），
+但那违背本仓既定口径：模块文档第 7 行写明键名逐字保留原插件的写法，好让老用户拿原 README 对得上，
+全篇也只有这一个键带连续大写。于是退回去给那一个字段单独点 `#[serde(rename = "lockSB")]`，
+`rename_all` 就不碰它了。复跑脚本是「66 键零漏」，注释回来了，键名也还是原插件那一个。
 顺手改掉同一区的另一处文案漂移：`showLoadingMessage` 的注释原先写「模板列表、搜索、最新动态、最新视频」
 四条，可第 40 条讲的正是模板列表**不挂**占位——注释跟着实现缩成三条，并补了一句为什么不挂。
 改完重编 dll（`ed1f0813…`，已放进运行目录的 `plugins\bilibili\`），拿新那份复跑整套命令序列：
@@ -551,7 +567,8 @@ README 那张键表的 49 个键在生成文件里全找得到，`config.rs` 注
   `lowSpeedEnable` / `cacheClearEnable` / `proxyEnable` 在这边改成"留空即不开"（`check.lowSpeed` 空串、
   `cache.expires` 全 0、`proxy` 空表），语义等价而少一个键。`CheckConfig` / `PushConfig` /
   `TemplateConfig` / `CacheConfig` / `LinkResolveConfig` 的键逐条过，`TemplateConfig` 那几档模板名
-  一档不改名（第 37 条）。
+  一档不改名（第 37 条）。**默认值也逐键比过**（2026-10-01）：拿 `BiliConfig.kt` 每个 data class 的
+  默认值对着这边 `Default` 实现看，凡不同的都能指回第 38 条那份清单——没有"移植时悄悄改错一个数"的那种。
 - **任务与类型面**：Kotlin 那 11 个 tasker 的归属——`DynamicCheck`/`LiveCheck`/`LiveCloseCheck` 进
   `tasks`，`SendTasker` 的节流与 @全体 拼法进 `push`，`CacheClearTasker` 进 24 小时一轮的清理，
   `ListenerTasker` 的链接解析进 `link.rs` 钩子、它那条 `BotLeaveEvent → removeAllSubscribe`
