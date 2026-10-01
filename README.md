@@ -340,7 +340,8 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 ## 端到端自测
 
 假 OneBot 端与运行目录都在本机 `C:\Users\cheng\Arona-e2e\`：运行目录 `run-bili\` 里
-`config/onebot.yml` 的 self_id 是 10000，`config/arona.yml` 的管理员写 100 与 12345，插件 dll 放
+`config/onebot.yml` 的 self_id 是 10000，`config/arona.yml` 的管理员写 100 与 12345（那是框架的
+`managers`，不是插件那区），插件 `bili.admin` 为了压通报单独写了 `[12345]`，插件 dll 放
 `plugins\bilibili\`。除了 `peek-images.mjs` 每个工装都起一个 ws-forward 服务（默认 9001），一次只跑一个：
 
 ```
@@ -520,7 +521,8 @@ PNG 卡片，`/9j/4AAQSkZ` 开头是动态附带的 JPEG 原图——只看有�
 判"改完了"用的是三面差集，每一面都比到具体条目，不是比总数：
 
 - **命令面**：`DynamicCommand.kt` 有 33 个 `@SubCommand`，本插件 [`SUBS`](src/commands/mod.rs) 33 行，
-  规范名逐条对齐（把驼峰统一成小写再比，diff 为空）；别名表除了照抄的那批还补了中文写法，
+  规范名逐条对齐（把驼峰统一成小写再比，diff 为空）；上面那张命令表也照样和 `SUBS` 比过一次，
+  33 行对 33 行、两个方向都是空——文档漏一条子命令这种事已经排除了；别名表除了照抄的那批还补了中文写法，
   比对走 `to_lowercase`，所以原插件的 `delAll` / `listAll` / `filterType` 这些驼峰写法在这边同样命中。
   不依赖 chat-command：命令名、别名、参数位次都在这份表里自己判。
 - **配置面**：`BiliConfig.kt` 的 `EnableConfig` 8 个开关逐个有下落——`drawEnable`（`bili-image` 那区）、
