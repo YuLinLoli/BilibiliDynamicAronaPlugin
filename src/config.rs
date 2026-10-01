@@ -473,7 +473,7 @@ impl PluginConfig for ImageConfig {
             "colorGenerator" | "colorGenerator.hueStep" => {
                 "渐变色生成器（仅当主题色只给了一个值时生效）"
             }
-            "colorGenerator.lockSb" => "锁定饱和度与亮度",
+            "colorGenerator.lockSB" => "锁定饱和度与亮度",
             "colorGenerator.saturation" => "锁定的饱和度 0.0-1.0",
             "colorGenerator.brightness" => "锁定的亮度 0.0-1.0",
             "footer" => "图片页脚",
@@ -510,6 +510,9 @@ impl Default for BadgeEnable {
 #[serde(default, rename_all = "camelCase")]
 pub struct ColorGenerator {
     pub hue_step: i64,
+    /// 原插件那一档的键名就是 `lockSB`（`BiliConfig.kt:181`），大写 B 是它自己写的，
+    /// 不是 camelCase 渲染出来的——所以这里点名单个字段，别让 `rename_all` 把它改成 `lockSb`。
+    #[serde(rename = "lockSB")]
     pub lock_sb: bool,
     pub saturation: f64,
     pub brightness: f64,
