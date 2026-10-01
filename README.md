@@ -529,6 +529,10 @@ README 那张键表的 49 个键在生成文件里全找得到，`config.rs` 注
 复跑脚本是「66 键零漏」，生成的 yml 里那行注释回来了。
 顺手改掉同一区的另一处文案漂移：`showLoadingMessage` 的注释原先写「模板列表、搜索、最新动态、最新视频」
 四条，可第 40 条讲的正是模板列表**不挂**占位——注释跟着实现缩成三条，并补了一句为什么不挂。
+改完重编 dll（`ed1f0813…`，已放进运行目录的 `plugins\bilibili\`），拿新那份复跑整套命令序列：
+**29 条回话，可疑 0 条**、宿主 0 panic。比上一轮多出的两条是 `/bili new` 这次真出了动态，
+多的是卡片与配图两段图片帧——「未找到动态」这一轮一次没出现，与上面 `fake-onebot-new.mjs`
+那一段记的软限流对得上：同一条命令在 B 站肯给数据的时候一直是通的。
 
 ## 功能面差集收口
 
@@ -536,8 +540,11 @@ README 那张键表的 49 个键在生成文件里全找得到，`config.rs` 注
 
 - **命令面**：`DynamicCommand.kt` 有 33 个 `@SubCommand`，本插件 [`SUBS`](src/commands/mod.rs) 33 行，
   规范名逐条对齐（把驼峰统一成小写再比，diff 为空）；上面那张命令表也照样和 `SUBS` 比过一次，
-  33 行对 33 行、两个方向都是空——文档漏一条子命令这种事已经排除了；别名表除了照抄的那批还补了中文写法，
-  比对走 `to_lowercase`，所以原插件的 `delAll` / `listAll` / `filterType` 这些驼峰写法在这边同样命中。
+  33 行对 33 行、两个方向都是空——文档漏一条子命令这种事已经排除了。**别名那一列同样逐条比过**
+  （本机 `check-alias-keys.mjs`，判 SUBS 每行的别名集合与表里那几个反引号是否同一个集合），
+  33 条零漂移——别名写错不会编译失败，用户照文档敲却命不中，只能这么钉。别名表除了照抄的那批
+  还补了中文写法，比对走 `to_lowercase`，所以原插件的 `delAll` / `listAll` / `filterType`
+  这些驼峰写法在这边同样命中。
   不依赖 chat-command：命令名、别名、参数位次都在这份表里自己判。
 - **配置面**：`BiliConfig.kt` 的 `EnableConfig` 8 个开关逐个有下落——`drawEnable`（`bili-image` 那区）、
   `liveCloseNotifyEnable`、`translateEnable`、`notifyEnable`、`showLoadingMessage` 是真开关，
