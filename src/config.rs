@@ -813,4 +813,75 @@ mod tests {
         let back: BiliConfig = serde_yaml::from_str(&text).unwrap();
         assert_eq!(back, BiliConfig::default());
     }
+
+    /// 这几处的键是用户自己起的名字（模板名、图片类别），注释只能给到表本身那一句，所以不下钻
+    const FREE_FORM_MAPS: &[&str] = &["cache.expires", "dynamicPush", "livePush", "liveClose"];
+
+    /// 照框架那一遍走法收集点分路径：非空映射先问自己再逐个子键下沉，
+    /// 数组和标量只问到这一层（`config/arona.rs` 的 `render_node`）。
+    fn template_paths(node: &serde_yaml::Value, prefix: &str, out: &mut Vec<String>) {
+        match node {
+            serde_yaml::Value::Mapping(map) if !map.is_empty() => {
+                if prefix.is_empty() {
+                    // 区块自身的键名不问注释，标题走 PluginConfig::TITLE
+                } else {
+                    out.push(prefix.to_string());
+                    if FREE_FORM_MAPS.contains(&prefix) {
+                        return;
+                    }
+                }
+                for (key, value) in map {
+                    let name = key.as_str().unwrap_or("?");
+                    let path = if prefix.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{prefix}.{name}")
+                    };
+                    template_paths(value, &path, out);
+                }
+            }
+            _ => {
+                if !prefix.is_empty() {
+                    out.push(prefix.to_string());
+                }
+            }
+        }
+    }
+
+    /// 注释表是硬编码的 `match`：键名写错既不会编译失败也不会有警告，只是生成的配置文件里
+    /// 悄悄少一行注释（`lockSB` 那件事就是这么漏进去的，见 README 第 34 条）。
+    /// 这条把「默认配置渲染出来的每个键都得有说明」变成会失败的测试，不用先把表改成可枚举的。
+    #[test]
+    fn every_key_the_template_renders_has_a_comment() {
+        let mut missing = Vec::new();
+        let counted = check_section(SECTION, &BiliConfig::default(), &mut missing)
+            + check_section(IMAGE_SECTION, &ImageConfig::default(), &mut missing)
+            + check_section(TEMPLATE_SECTION, &TemplateConfig::default(), &mut missing);
+        assert!(
+            missing.is_empty(),
+            "这些键会在生成的配置文件里以「没有说明」的样子出现：{missing:?}"
+        );
+        assert!(
+            counted >= 60,
+            "只数到 {counted} 个键，走法八成没跟上结构的改动"
+        );
+    }
+
+    /// 数出这一块默认配置会让框架去问注释的路径个数，没说明的那些挂到 `missing` 上（带区块名前缀好定位）
+    fn check_section<T: PluginConfig>(
+        section: &str,
+        config: &T,
+        missing: &mut Vec<String>,
+    ) -> usize {
+        let value = serde_yaml::to_value(config).expect("默认配置序列化不出去");
+        let mut paths = Vec::new();
+        template_paths(&value, "", &mut paths);
+        missing.extend(
+            paths
+                .iter()
+                .filter(|path| T::comment(path).is_none())
+                .map(|path| format!("{section}.{path}")),
+        );
+        paths.len()
+    }
 }
