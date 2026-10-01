@@ -1303,4 +1303,79 @@ mod tests {
         let style = style("1000w");
         assert!(measure(&item, &Art::default(), &style, None) > 0.0);
     }
+
+    /// 给人眼看版式的出图，不做断言：`cargo test --lib -- --ignored --nocapture card_preview`
+    /// 三张分别对着原插件 README 的样式预览——九宫格、视频附件、转发嵌套。
+    #[test]
+    #[ignore = "只出图给人看版式，没有断言"]
+    fn card_preview_writes_three_boards_to_temp() {
+        let style = style("1000w");
+        let mut art = Art::default();
+        art.faces.insert(
+            "https://face/1.jpg".to_string(),
+            RgbaImage::from_pixel(200, 200, image::Rgba([240, 200, 190, 255])),
+        );
+        let palette = [
+            image::Rgba([214, 96, 96, 255]),
+            image::Rgba([96, 168, 214, 255]),
+            image::Rgba([112, 200, 132, 255]),
+            image::Rgba([224, 176, 88, 255]),
+            image::Rgba([168, 120, 214, 255]),
+            image::Rgba([88, 88, 96, 255]),
+        ];
+        let urls: Vec<String> = palette
+            .iter()
+            .enumerate()
+            .map(|index| format!("https://i/{}.png", index.0))
+            .collect();
+        for (index, color) in palette.iter().enumerate() {
+            art.pictures
+                .insert(urls[index].clone(), RgbaImage::from_pixel(400, 400, *color));
+        }
+        art.pictures.insert(
+            "https://i/cover.png".to_string(),
+            RgbaImage::from_pixel(640, 400, image::Rgba([40, 44, 52, 255])),
+        );
+        // 想看 unicode 表情的回退效果：设 ARONA_TWEMOJI_DIR 指向放好 `<码位>.png` 的目录，
+        // 那些 png 就是 gather 从 twemoji 拉回来的那一份（地址见 text::twemoji_url）。
+        if let Ok(dir) = std::env::var("ARONA_TWEMOJI_DIR") {
+            let mut set = HashMap::new();
+            for code in ["2764", "1f9dc-200d-2640-fe0f"] {
+                let path = std::path::Path::new(&dir).join(format!("{code}.png"));
+                if let Ok(raw) = std::fs::read(&path)
+                    && let Ok(any) = image::load_from_memory(&raw)
+                {
+                    set.insert(code.to_string(), any.to_rgba8());
+                }
+            }
+            if !set.is_empty() {
+                art.emojis = EmojiSet::new(set);
+            }
+        }
+
+        let mut grid = sample("这是🧜‍♀️只美人鱼，你敢和她直视10秒吗？❤️");
+        grid.images = urls.clone();
+
+        let mut video = sample("翻唱投稿");
+        video.attached = Some(Attached {
+            kind: "视频".to_string(),
+            title: "【全部猫芒】7ki7ki棒棒—派对浪客诸葛孔明【翻唱】".to_string(),
+            cover: "https://i/cover.png".to_string(),
+            url: "https://b23.tv/x".to_string(),
+            duration: "01:29".to_string(),
+            play: "1.2万播放".to_string(),
+            desc: "ばんばん".to_string(),
+        });
+
+        let mut nested = sample("２ｗ！？？？？？？？？！");
+        nested.origin = Some(Box::new(video.clone()));
+
+        let out = std::env::temp_dir().join("arona-bili-cards");
+        std::fs::create_dir_all(&out).unwrap();
+        for (name, item) in [("grid", &grid), ("video", &video), ("nested", &nested)] {
+            let file = out.join(format!("{name}.png"));
+            std::fs::write(&file, dynamic_card(item, &art, &style, None)).unwrap();
+            println!("{name} -> {}", file.display());
+        }
+    }
 }

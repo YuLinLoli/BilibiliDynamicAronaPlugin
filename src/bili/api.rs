@@ -82,13 +82,13 @@ impl Bili {
         self.account.uid
     }
 
-    async fn headers(&self, referer: &str) -> Vec<(String, String)> {
+    async fn headers(&self, url: &str, referer: &str) -> Vec<(String, String)> {
         let mut headers = vec![
             ("user-agent".to_string(), USER_AGENT.to_string()),
             ("referer".to_string(), referer.to_string()),
         ];
         let cookie = self.cookie().await;
-        if !cookie.is_empty() {
+        if !cookie.is_empty() && is_bili_host(url) {
             headers.push(("cookie".to_string(), cookie));
         }
         headers
@@ -179,7 +179,7 @@ impl Bili {
         self.send(Request {
             method: Method::Get,
             url: full_url(url, params),
-            headers: self.headers(referer).await,
+            headers: self.headers(url, referer).await,
             timeout: Some(self.timeout),
             ..Default::default()
         })
@@ -204,7 +204,7 @@ impl Bili {
         let request = Request {
             method: Method::Get,
             url: format!("{url}?{query}"),
-            headers: self.headers(referer).await,
+            headers: self.headers(url, referer).await,
             timeout: Some(self.timeout),
             ..Default::default()
         };
@@ -225,7 +225,7 @@ impl Bili {
         let request = Request {
             method: Method::Post,
             url: url.to_string(),
-            headers: self.headers(referer).await,
+            headers: self.headers(url, referer).await,
             body: arona::runtime::http::Body::Form(form),
             timeout: Some(self.timeout),
         };
@@ -236,7 +236,7 @@ impl Bili {
         let request = Request {
             method: Method::Post,
             url: url.to_string(),
-            headers: self.headers(referer).await,
+            headers: self.headers(url, referer).await,
             body: arona::runtime::http::Body::Raw {
                 content_type: "application/json".to_string(),
                 text: json.to_string(),
@@ -256,7 +256,7 @@ impl Bili {
         http::send(Request {
             method: Method::Get,
             url: url.to_string(),
-            headers: self.headers(referer).await,
+            headers: self.headers(url, referer).await,
             timeout: Some(self.timeout),
             ..Default::default()
         })
@@ -632,7 +632,7 @@ impl Bili {
         let request = Request {
             method: Method::Post,
             url: SHORT_LINK.to_string(),
-            headers: self.headers("https://www.bilibili.com/").await,
+            headers: self.headers(SHORT_LINK, "https://www.bilibili.com/").await,
             body: arona::runtime::http::Body::Form(pairs),
             timeout: Some(self.timeout),
         };
@@ -684,6 +684,29 @@ impl Bili {
         };
         Ok((code, message, cookie))
     }
+}
+
+/// 这份 Cookie 该不该跟着请求出门。
+///
+/// 出站口只有一个 `headers`，而 `bytes` 那条不只拉 B 站自己的图——表情回退要拉 cdnjs 上的
+/// twemoji png。照原来那份头会把 `SESSDATA` 一并送给第三方域名，所以按主机名收一次口。
+/// `hdslb.com` 是 B 站自己的图床域，跟着算自家，封面与头像的下载行为不变。
+fn is_bili_host(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["bilibili.com", "biligame.com", "hdslb.com"]
+        .iter()
+        .any(|root| host == *root || host.ends_with(&format!(".{root}")))
 }
 
 /// 从登录跳转 URL 的 query 里捞 SESSDATA / bili_jct / DedeUserID 拼成 cookie 串
@@ -841,6 +864,24 @@ fn cookie_from_editthis(items: &[Value]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_stops_at_bilibili_own_domains() {
+        assert!(is_bili_host("https://api.bilibili.com/x/web-interface/nav"));
+        assert!(is_bili_host(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+        ));
+        // 图床不是 bilibili.com，但它是 B 站自己的域，封面下载照旧带 referer 与 Cookie
+        assert!(is_bili_host("https://i0.hdslb.com/bfs/face/x.jpg"));
+        assert!(!is_bili_host(
+            "https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72.png"
+        ));
+        // 后缀像但不该算自家的两种写法
+        assert!(!is_bili_host("https://evil-bilibili.com/x"));
+        assert!(!is_bili_host("https://bilibili.com.evil.cn/x"));
+        // 端口与查询串不能把主机名带歪
+        assert!(is_bili_host("http://api.bilibili.com:443/x?y=1"));
+    }
 
     #[test]
     fn envelope_passes_data_through() {

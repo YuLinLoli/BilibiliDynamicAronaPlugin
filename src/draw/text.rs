@@ -325,6 +325,17 @@ fn units(text: &str) -> Vec<Unit> {
             index = end + 1;
             continue;
         }
+        if is_emoji_base(ch)
+            && let Some(end) = find_emoji_code(&chars, index)
+        {
+            if !chunk.is_empty() {
+                out.push(word(std::mem::take(&mut chunk)));
+            }
+            let run: Vec<char> = chars[index..=end].to_vec();
+            out.push(emoji_image(run.iter().collect(), twemoji_code(&run)));
+            index = end + 1;
+            continue;
+        }
         if ch.is_ascii_alphanumeric() {
             chunk.push(ch);
             index += 1;
@@ -351,6 +362,102 @@ fn emoji(text: String) -> Unit {
         emoji: Some(text.clone()),
         text,
     }
+}
+
+/// 一段该按表情图画的单元：`text` 留着原字符，图没下下来时照文字画
+fn emoji_image(text: String, code: String) -> Unit {
+    Unit {
+        text,
+        emoji: Some(code),
+    }
+}
+
+/// 表情的起始码位：象形文字区、杂项符号与装饰符、星形符号，加上拼旗帜的区域指示符。
+/// 汉字、假名与常见标点都不落在这些段里。
+fn is_emoji_base(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF
+    ) || is_regional(ch)
+}
+
+/// 只能跟在别的表情后面的修饰码位：变体选择符、零宽连接符、keycap 组合符、皮肤色调。
+/// 少了这一层区分，连着两个 `❤️` 会被吃成一格。
+fn is_emoji_extend(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0xFE00..=0xFE0F | 0x200D | 0x20E3 | 0x1F3FB..=0x1F3FF
+    )
+}
+
+fn is_regional(ch: char) -> bool {
+    matches!(ch as u32, 0x1F1E6..=0x1F1FF)
+}
+
+/// 从 `start` 起能整段吃下的表情码位，返回结束下标（含）。
+/// 只往修饰码位上续：零宽连接符后面还得是个表情才算数，两个各自成形的表情分开算两格。
+fn find_emoji_code(chars: &[char], start: usize) -> Option<usize> {
+    let head = chars.get(start).copied()?;
+    if !is_emoji_base(head) {
+        return None;
+    }
+    let mut end = start;
+    let mut index = start + 1;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch == '\u{200d}' {
+            if chars.get(index + 1).copied().is_some_and(is_emoji_base) {
+                end = index + 1;
+                index += 2;
+                continue;
+            }
+            break;
+        }
+        if !(is_emoji_extend(ch) || (is_regional(ch) && is_regional(chars[end]))) {
+            break;
+        }
+        end = index;
+        index += 1;
+    }
+    Some(end)
+}
+
+/// 一段表情码位对应的 twemoji 文件名（不含 `.png`）：十六进制小写、`-` 连接。
+/// 末尾那个 `fe0f` 只在序列里没有零宽连接符时才去掉——照原插件那条规则来
+/// （`DynamicModuleDraw.kt:443-452`）。
+fn twemoji_code(chars: &[char]) -> String {
+    let mut parts: Vec<String> = chars.iter().map(|ch| format!("{:x}", *ch as u32)).collect();
+    if parts.last().map(String::as_str) == Some("fe0f") && !parts.iter().any(|part| part == "200d")
+    {
+        parts.pop();
+    }
+    parts.join("-")
+}
+
+/// 表情图去哪儿取：twemoji 的 72x72 png，与原插件同一个地址（`Api.kt:53`）。
+/// 主字体里没有彩色 emoji 字形（fontdue 不认 CBDT），所以只能像原插件那样拉图。
+pub(crate) fn twemoji_url(code: &str) -> String {
+    format!("https://cdnjs.cloudflare.com/ajax/libs/twemoji/14.0.2/72x72/{code}.png")
+}
+
+/// 一段文本里出现了哪些 unicode 表情：`(twemoji 文件名, 下载地址)`，按出现顺序去重。
+/// 下载侧拿它补进表情表，绘图侧靠同一个文件名命中。
+pub(crate) fn twemoji_needs(text: &str) -> Vec<(String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let Some(end) = find_emoji_code(&chars, index) else {
+            index += 1;
+            continue;
+        };
+        let code = twemoji_code(&chars[index..=end]);
+        if !out.iter().any(|(have, _)| *have == code) {
+            out.push((code.clone(), twemoji_url(&code)));
+        }
+        index = end + 1;
+    }
+    out
 }
 
 /// `[` 往后找到配对的 `]`，返回 `]` 的下标
@@ -545,6 +652,48 @@ mod tests {
         assert_eq!(find_emoji(&nested, 0), None);
         let ok: Vec<char> = "[笑]尾巴".chars().collect();
         assert_eq!(find_emoji(&ok, 0), Some(2));
+    }
+
+    #[test]
+    fn unicode_emoji_codes_follow_the_twemoji_naming() {
+        let heart: Vec<char> = "❤️".chars().collect();
+        // 没有零宽连接符时末尾那个 fe0f 去掉：2764-fe0f → 2764
+        assert_eq!(twemoji_code(&heart), "2764");
+        // 美人鱼+女性：序列里有 200d，所以 fe0f 留着
+        let mermaid: Vec<char> = "🧜‍♀️".chars().collect();
+        assert_eq!(twemoji_code(&mermaid), "1f9dc-200d-2640-fe0f");
+        assert!(twemoji_url("2764").ends_with("/72x72/2764.png"));
+    }
+
+    #[test]
+    fn unicode_emoji_scan_skips_plain_text_and_dedupes() {
+        let needs = twemoji_needs("这是🧜‍♀️只美人鱼，你敢和她直视10秒吗？❤️❤️");
+        assert_eq!(needs.len(), 2, "重复的那个不该再要一遍：{needs:?}");
+        assert_eq!(needs[0].0, "1f9dc-200d-2640-fe0f");
+        assert_eq!(needs[1].0, "2764");
+        // 汉字、假名、全角标点与方括号表情都不该被当成 unicode 表情
+        assert!(twemoji_needs("本日の新活動【翻唱】[笑]").is_empty());
+        assert!(twemoji_needs("100% & 3.14 ~ (´∀`)").is_empty());
+    }
+
+    #[test]
+    fn two_adjacent_emoji_stay_two_units() {
+        let pair = units("❤️❤️");
+        assert_eq!(pair.len(), 2, "连着两个各自成形的表情该分开算");
+        assert_eq!(pair[0].emoji.as_deref(), Some("2764"));
+        // 旗帜是两个区域指示符拼出来的一格
+        let flag = units("🇨🇳");
+        assert_eq!(flag.len(), 1);
+        assert_eq!(flag[0].emoji.as_deref(), Some("1f1e8-1f1f3"));
+    }
+
+    #[test]
+    fn an_emoji_unit_keeps_its_text_for_the_fallback() {
+        // 图没下下来时按原文字画：单元里得留着那个字符，宽度也照文字算
+        let units = units("❤️");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].text, "❤️");
+        assert_eq!(units[0].emoji.as_deref(), Some("2764"));
     }
 
     #[test]

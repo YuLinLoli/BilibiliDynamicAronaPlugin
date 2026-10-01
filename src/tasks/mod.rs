@@ -831,10 +831,13 @@ fn picture_urls(dynamic: &Dynamic) -> Vec<String> {
 
 /// 一条动态涉及哪些表情：正文里 `[笑]` 这种原文 → B 站给的图地址。
 /// 转发动态被转的那条正文里也带表情，所以连 origin 一起收。
+/// 末尾那段是 unicode 表情（❤️ 那种）：主字体没有彩色字形，按 twemoji 的 png 补。
 fn emoji_pairs(dynamic: &Dynamic) -> Vec<(String, String)> {
     let mut lists: Vec<&Vec<Node>> = vec![&dynamic.nodes];
+    let mut texts: Vec<&String> = vec![&dynamic.text];
     if let Some(old) = &dynamic.origin {
         lists.push(&old.nodes);
+        texts.push(&old.text);
     }
     let mut out: Vec<(String, String)> = Vec::new();
     for nodes in lists {
@@ -844,6 +847,13 @@ fn emoji_pairs(dynamic: &Dynamic) -> Vec<(String, String)> {
                 && !out.iter().any(|(have, _)| have == text)
             {
                 out.push((text.clone(), url.clone()));
+            }
+        }
+    }
+    for text in texts {
+        for (code, url) in crate::draw::text::twemoji_needs(text) {
+            if !out.iter().any(|(have, _)| *have == code) {
+                out.push((code, url));
             }
         }
     }
