@@ -514,6 +514,24 @@ impl Data {
         count
     }
 
+    /// 整条删掉这批目标：订阅、个性化配置和分组里的挂名一起消失。返回原本挂着的订阅条数。
+    ///
+    /// `/bili clear` 确认之后走这里而不是 [`clear_subs`](Self::clear_subs)：那条命令是拿
+    /// `targets` 的键当候选的，只清内容不删条目的话，同一个失效群每次都会被重新列出来。
+    /// 反正这个群/好友 bot 已经不在里面了，那份配色和模板覆盖也没有下一个主人。
+    pub fn remove_targets(&mut self, keys: &[String]) -> usize {
+        let mut count = 0usize;
+        for key in keys {
+            if let Some(state) = self.targets.remove(key) {
+                count += state.subs.len() + state.seasons.len();
+            }
+            for cluster in self.clusters.values_mut() {
+                cluster.members.remove(key);
+            }
+        }
+        count
+    }
+
     /// 设主题色。空串表示取消单独配色、回到全局默认。
     pub fn set_color(&mut self, keys: &[String], color: &str) {
         for key in keys {
@@ -1084,6 +1102,34 @@ mod tests {
             data.targets_of(487550002),
             vec!["g1".to_string(), "g2".to_string(), "g3".to_string()]
         );
+    }
+
+    /// `/bili clear` 确认之后走 remove_targets：条目整条没了，下一轮才不会再把它列出来
+    #[test]
+    fn removed_targets_stop_coming_back() {
+        let mut data = Data::default();
+        data.target_mut("g1").subs.insert(7);
+        data.target_mut("g1").seasons.insert("ss1".into());
+        data.target_mut("g1").color = Some("#ff8800".into());
+        data.clusters.insert(
+            "主播群".into(),
+            Cluster {
+                creator: 1,
+                members: ["g1".to_string()].into_iter().collect(),
+                admins: BTreeSet::new(),
+            },
+        );
+        // 没记录过的键不计数，但也不报错——清单里那份可能已经被别的会话清掉了
+        assert_eq!(data.remove_targets(&["g1".into(), "g9".into()]), 2);
+        assert!(data.targets.is_empty(), "配色那些也该跟着走");
+        assert!(
+            data.clusters["主播群"].members.is_empty(),
+            "分组里的挂名要一并摘掉，不然推分组时又把这个死群算进去"
+        );
+        // 对照：clear_subs 只清内容，条目留着，所以下一轮 clear 还会列它
+        data.target_mut("g2").subs.insert(7);
+        assert_eq!(data.clear_subs(&["g2".into()]), 1);
+        assert!(data.targets.contains_key("g2"));
     }
 
     /// `0` 是原插件 `dynamic[0]` 的通配位：订了它的目标什么动态都收，

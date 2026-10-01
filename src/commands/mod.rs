@@ -20,6 +20,7 @@ mod browse;
 mod filter;
 mod group;
 mod subscribe;
+mod wizard;
 
 use std::sync::Arc;
 
@@ -235,7 +236,7 @@ const SUBS: &[Row] = &[
         &["config", "配置"],
         Cmd::Config,
         "[UID] [目标]",
-        "看这个目标当前生效的配置",
+        "交互式配置：回编号往下选（主题色 模板 过滤器 At全体）",
     ),
     (
         &["search", "s", "搜索"],
@@ -306,8 +307,8 @@ const SUBS: &[Row] = &[
     (
         &["clear", "清理失效目标"],
         Cmd::Clear,
-        "[确定]",
-        "清掉已经不在的群/好友的订阅（仅管理员）",
+        "",
+        "删掉已经不在的群/好友（连订阅带配色整条删），随后回一句「确定」才真删（仅管理员）",
     ),
 ];
 
@@ -357,6 +358,10 @@ pub(crate) fn register(ctx: &PluginContext) {
         .with_feature(crate::FEATURE)
         .with_usage("/bili <子命令> [参数…]　/bili help 看全部子命令"),
     );
+    // `/bili config` 的向导、`/bili clear` 的那一句「确定」都要吃随后的消息，
+    // 那一跳挂在消息钩子上（分别见 `wizard` 与 `browse::confirm_step`）
+    wizard::register(ctx);
+    browse::register_confirm(ctx);
 }
 
 /// 一条命令的完整执行：读配置 → 认子命令 → 交出去。
@@ -406,7 +411,7 @@ async fn dispatch(cmd: Cmd, call: &Call) -> Reply {
         Cmd::AtAll => filter::at_all(call, true).await,
         Cmd::DelAtAll => filter::at_all(call, false).await,
         Cmd::ListAtAll => filter::at_all_list(call),
-        Cmd::Config => browse::config(call).await,
+        Cmd::Config => wizard::start(call).await,
         Cmd::Search => browse::search(call).await,
         Cmd::Live => browse::live(call).await,
         Cmd::New => browse::new(call).await,

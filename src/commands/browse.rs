@@ -10,17 +10,23 @@
 //!   要联网的命令上。原插件还挂在 `templateList` 上（`DynamicCommand.kt:224`），那边画图要时间，
 //!   这边模板预览用的是假数据、不联网也不绘图，占位一条只会闪一下，所以没挂。
 //! * `login` 成功之后多回一句"登录成功!"，原插件只默默写 Cookie。
-//! * `clear` 要等用户回一句"确定"，框架没有 `nextMessage` 这种"等下一条消息"的出口，
-//!   所以改成两步命令（见 [`clear`]）。
+//! * `clear` 那句「请回复 确定 或 取消」现在是真等一句答复（见 [`confirm_step`]），与原插件
+//!   `nextMessage(300000)` 同形。先前这里写成两步命令，理由是「框架没有等下一条消息的出口」，
+//!   那个判断是错的——消息钩子加插件自己那份会话表就能做同一件事（`/bili config` 的向导是同一套料）。
 //! * `templateList` 原来是"每条模板一个嵌套转发"。框架的转发只有一层，所以摊平成一个转发，
 //!   条目之间靠"模板名"那一行分隔。
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use arona::bot::Bot;
+use arona::onebot::HookFlow;
+use arona::onebot::hooks::{BodyFilter, EventContext, event_handler};
+use arona::plugin::PluginContext;
 use arona::runtime::message::{ForwardMessage, MessageSegment, OutgoingMessage};
+use arona::runtime::priority::ListenerPriority;
+use once_cell::sync::Lazy;
 
 use super::{Call, Cmd};
 use super::{Match, Reply, filter::template_kind, lines, match_uid, reply, usage_str};
@@ -43,6 +49,8 @@ pub(crate) fn reload(call: &Call) -> Reply {
         return reply("仅 bot 管理员可以重载配置");
     }
     call.ctx().framework().configs().reload(crate::PLUGIN_ID);
+    // 菜单上那些中括号里的值是旧配置下的，重载之后不能再让人照着点
+    super::wizard::clear();
     reply("配置重载成功")
 }
 
@@ -197,21 +205,21 @@ async fn wait_for_scan(bili: &Arc<Bili>, key: &str) -> Result<(String, i64), Str
     Err("三分钟没人扫码".to_string())
 }
 
-/// `/bili config [UID] [目标]`：把这个目标当前生效的配置打出来。
-/// 原插件是一个"回复编号往下选"的交互向导，框架没有"等下一条消息"的出口，
-/// 所以这里改成一次性的静态清单（要改哪一项，照着清单上的名字去发对应子命令）。
-pub(crate) async fn config(call: &Call) -> Reply {
+/// 一次性配置清单。`/bili config` 现在顶给交互向导了（见 `wizard`），这张表挂在
+/// 向导里的 `全局` 那一档下面——原插件把两件事分在同一个子命令上做不了，
+/// 因为它的向导会吃掉随后每一条消息。
+pub(crate) fn overview(call: &Call) -> Vec<String> {
     let uid = match call.sub_uid(0) {
         Ok(value) => value,
-        Err(reason) => return reply(reason),
+        Err(reason) => return vec![reason],
     };
     let targets = match call.targets(1) {
         Ok(value) => value,
-        Err(reason) => return reply(reason),
+        Err(reason) => return vec![reason],
     };
     let keys = match targets.writable() {
         Ok(list) => list.to_vec(),
-        Err(reason) => return reply(reason),
+        Err(reason) => return vec![reason],
     };
     let bili = call.conf();
     let appearance = call.ctx().config::<ImageConfig>(IMAGE_SECTION).get();
@@ -286,7 +294,7 @@ pub(crate) async fn config(call: &Call) -> Reply {
             .unwrap_or_default();
         out.extend(target_lines(key, uid, &state));
     }
-    lines(&out)
+    out
 }
 
 /// 一个目标的配置明细。`uid` 为 0 时把所有订阅者的分档都列出来，否则只列那一档。
@@ -526,35 +534,89 @@ fn local_target(call: &Call) -> (String, String) {
     (key, color)
 }
 
-/// 待确认的清理结果：谁发的、什么时候过期、要清哪几个目标
+/// `/bili clear` 那份待确认清单。键是「会话号#发起人」——原插件那句
+/// `fromEvent.nextMessage(300000)` 等的就是「发命令这个人在这个会话里的下一句话」，
+/// 用表而不是单个槽位，是为了让两个人各清各的清单时不互相顶掉。
+#[derive(Clone)]
 struct Pending {
-    who: i64,
-    until: i64,
     keys: Vec<String>,
+    expires: Instant,
 }
 
-static PENDING: OnceLock<Mutex<Option<Pending>>> = OnceLock::new();
+static CONFIRMS: Lazy<RwLock<HashMap<String, Pending>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn pending() -> &'static Mutex<Option<Pending>> {
-    PENDING.get_or_init(|| Mutex::new(None))
+/// 原插件 `nextMessage(300000)` 那五分钟
+const CONFIRM_WINDOW: Duration = Duration::from_secs(300);
+
+/// 挂上「等那一句答复」那一跳。与向导同一档优先级（排在链接解析之前）：
+/// 正在等确认的人打的那句「确定」不该被别的钩子拿去解析。
+/// 同一个人如果同时开着 `/bili config` 的向导，那句话会先被向导吃掉当编号用——
+/// 向导注册在前，而这份清单又不该被一个编号悄悄删掉，所以留着直到五分钟过。
+pub(crate) fn register_confirm(ctx: &PluginContext) {
+    let holder = ctx.clone();
+    ctx.listen_feature(
+        crate::FEATURE,
+        &[BodyFilter::GroupMessage, BodyFilter::PrivateMessage],
+        ListenerPriority::High,
+        event_handler(move |event: Arc<EventContext>| {
+            let ctx = holder.clone();
+            Box::pin(async move { confirm_step(&ctx, &event).await })
+        }),
+    );
 }
 
-/// `/bili clear`：列出订阅记录里 bot 已经不在的群、已经不是好友的人。
-/// 原插件在这里 `nextMessage(300000)` 等一句"确定"，框架没有这个出口，
-/// 所以分两步：先 `{前缀} clear` 看清单，再 `{前缀} clear 确定` 真删。
+/// 一份清单只许答复一次，答复完（或认了过期）就从表里摘掉
+fn forget(id: &str) {
+    if let Ok(mut table) = CONFIRMS.write() {
+        table.remove(id);
+    }
+}
+
+/// 那一句答复到了。`确定` 就真删，其它任何一句都算放弃——原插件那句
+/// `else sendMessage("已取消")` 就是这个意思；超时则整条静默作废，不追一句「过期了」。
+/// 唯一例外是又打了一条 `/bili` 命令：命令照常走分发，清单留到过期为止。
+async fn confirm_step(ctx: &PluginContext, event: &EventContext) -> HookFlow {
+    let id = super::wizard::key(
+        &super::wizard::contact_of(event.group_id(), event.user_id()),
+        event.user_id(),
+    );
+    let Some(found) = CONFIRMS
+        .read()
+        .ok()
+        .and_then(|table| table.get(&id).cloned())
+    else {
+        return HookFlow::Pass;
+    };
+    if found.expires <= Instant::now() {
+        forget(&id);
+        return HookFlow::Pass;
+    }
+    let input = super::wizard::typed(event);
+    if input.is_empty() || super::wizard::is_command(ctx, &input) {
+        return HookFlow::Pass;
+    }
+    forget(&id);
+    if input != "确定" {
+        let _ = event.reply("已取消").await;
+        return HookFlow::Handled;
+    }
+    let removed = crate::store().write(|data| data.remove_targets(&found.keys));
+    let _ = event
+        .reply(format!(
+            "删除成功（清掉 {} 个失效目标，共 {removed} 条）",
+            found.keys.len()
+        ))
+        .await;
+    HookFlow::Handled
+}
+
+/// `/bili clear`：列出订阅记录里 bot 已经不在的群、已经不是好友的人，然后等那一句「确定」。
+/// 与原插件同形（`DynamicCommand.kt:452-464`）：清单发出来就完事，答复走 [`confirm_step`]
+/// 那条钩子，不必再打一次命令。确认之后是 `remove_targets`——条目整条删掉，
+/// 因为这份清单本来就是从 `targets` 的键扫出来的，只清内容的话同一个失效群会永远重复上榜。
 pub(crate) async fn clear(call: &Call) -> Reply {
     if !call.is_bot_admin() {
         return reply("权限不足，仅bot管理员可操作");
-    }
-    match call.arg(0).unwrap_or("").trim() {
-        "确定" => return confirm_clear(call).await,
-        "取消" => {
-            if let Ok(mut slot) = pending().lock() {
-                *slot = None;
-            }
-            return reply("已取消");
-        }
-        _ => {}
     }
     let bot = Bot::of(call.ctx().framework());
     // 两边各查一次；哪一边查不到就不判那一边的目标，免得把还好好的订阅清了
@@ -597,50 +659,29 @@ pub(crate) async fn clear(call: &Call) -> Reply {
     if dead.is_empty() {
         return reply("未找到失效的群/好友");
     }
-    if let Ok(mut slot) = pending().lock() {
-        *slot = Some(Pending {
-            who: call.from().user_id,
-            until: chrono::Utc::now().timestamp() + 300,
-            keys: dead.clone(),
-        });
+    if let Ok(mut table) = CONFIRMS.write() {
+        let now = Instant::now();
+        table.retain(|_, live| live.expires > now);
+        table.insert(
+            super::wizard::key(
+                &super::wizard::contact_of(call.from().group_id, call.from().user_id),
+                call.from().user_id,
+            ),
+            Pending {
+                keys: dead.clone(),
+                expires: now + CONFIRM_WINDOW,
+            },
+        );
     }
     let mut out: Vec<String> = vec![String::new(), "发现以下失效的群/好友：".to_string()];
     out.extend(dead.iter().cloned());
     out.extend(vec![
         String::new(),
-        "g 开头是群，f 开头是好友。确认删除这些目标的订阅吗".to_string(),
-        format!(
-            "确认请再发一次 {} clear 确定，放弃请发 {} clear 取消（五分钟内有效）",
-            call.prefix(),
-            call.prefix()
-        ),
+        "g 开头是群，f 开头是好友。确认删除这些目标的订阅吗（配色与模板覆盖会一起删掉）"
+            .to_string(),
+        "请回复 '确定' 或 '取消'（五分钟内有效）".to_string(),
     ]);
     lines(&out)
-}
-
-/// 第二步：按清单删订阅。清单过期或发命令的人换了，都算没这一步。
-async fn confirm_clear(call: &Call) -> Reply {
-    let Some(slot) = take_pending(call) else {
-        return reply("没有待确认的清理，或已经过了五分钟。先发一次 clear 看清单");
-    };
-    let removed = crate::store().write(|data| data.clear_subs(&slot));
-    reply(format!(
-        "删除成功（清掉 {} 个目标的订阅，共 {removed} 条）",
-        slot.len()
-    ))
-}
-
-/// 取出待确认的清单，同时把它作废：确认这一步只许做一次
-fn take_pending(call: &Call) -> Option<Vec<String>> {
-    let mut slot = pending().lock().ok()?;
-    let taken = slot.take()?;
-    if taken.who != call.from().user_id {
-        return None;
-    }
-    if chrono::Utc::now().timestamp() > taken.until {
-        return None;
-    }
-    Some(taken.keys)
 }
 
 #[cfg(test)]
