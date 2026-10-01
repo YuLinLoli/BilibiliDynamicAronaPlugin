@@ -56,6 +56,31 @@ pub(crate) async fn color(call: &Call) -> Reply {
     })
 }
 
+/// `/bili mute [目标]` 与 `/bili unmute [目标]`：整体停推 / 复推某个目标。
+/// 订阅关系、配色、模板、过滤器一概不动，只翻 `store.yml` 里那一格 `muted`——
+/// 检测任务与推送路径本来就有三处按它跳过（`tasks/mod.rs`、`push/mod.rs`）。
+pub(crate) fn mute(call: &Call, muted: bool) -> Reply {
+    let targets = match call.targets(0) {
+        Ok(targets) => targets,
+        Err(reason) => return reply(reason),
+    };
+    let keys = match targets.writable() {
+        Ok(keys) => keys.to_vec(),
+        Err(reason) => return reply(reason),
+    };
+    crate::store().write(|data| data.set_muted(&keys, muted));
+    let word = if muted {
+        "静音设置完成，这个目标不再收任何推送"
+    } else {
+        "已恢复推送"
+    };
+    reply(if targets.is_self() {
+        word.to_string()
+    } else {
+        format!("{}{word}", targets.grant())
+    })
+}
+
 /// `/bili add <UP主UID|番剧号> [目标]`
 pub(crate) async fn add(call: &Call) -> Reply {
     let raw = match call.need(0, &usage_str(call, Cmd::Add)) {

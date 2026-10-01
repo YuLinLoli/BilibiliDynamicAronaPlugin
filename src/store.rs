@@ -555,6 +555,13 @@ impl Data {
         }
     }
 
+    /// 静音某个目标：订阅、配色、模板、过滤器全留着，只是不再给它推任何东西。
+    pub fn set_muted(&mut self, keys: &[String], muted: bool) {
+        for key in keys {
+            self.target_mut(key).muted = muted;
+        }
+    }
+
     /// 追番：记下番剧号与标题。返回新增的目标数。
     pub fn follow_season(&mut self, keys: &[String], id: &str, title: &str) -> usize {
         let mut added = 0usize;
@@ -1130,6 +1137,40 @@ mod tests {
         data.target_mut("g2").subs.insert(7);
         assert_eq!(data.clear_subs(&["g2".into()]), 1);
         assert!(data.targets.contains_key("g2"));
+    }
+
+    /// `/bili mute` 只翻那一格：订阅、配色、模板全留着，`unmute` 得能原样恢复
+    #[test]
+    fn muting_a_target_keeps_every_subscription() {
+        let mut data = Data::default();
+        data.target_mut("g1").subs.insert(7);
+        data.target_mut("g1").seasons.insert("ss1".into());
+        data.target_mut("g1").color = Some("#ff8800".into());
+        data.target_mut("g1")
+            .templates
+            .insert("dynamic".into(), "OneMsg".into());
+        data.target_mut("g2").subs.insert(9);
+
+        data.set_muted(&["g1".into(), "g2".into()], true);
+        assert!(data.targets["g1"].muted);
+        assert!(data.targets["g2"].muted);
+        // 静音不该动到订阅关系：这三样是 /bili mute 唯一不该碰的
+        assert_eq!(
+            data.targets["g1"].subs,
+            [7].into_iter().collect::<BTreeSet<i64>>()
+        );
+        assert!(data.targets["g1"].seasons.contains("ss1"));
+        assert_eq!(
+            data.targets["g1"].templates["dynamic"], "OneMsg",
+            "模板覆盖不能被静音抹掉，否则恢复推送之后换了一套版式"
+        );
+
+        data.set_muted(&["g1".into()], false);
+        assert!(!data.targets["g1"].muted);
+        assert!(
+            data.targets["g2"].muted,
+            "只点名 g1 的时候不该顺手把 g2 也解开"
+        );
     }
 
     /// `0` 是原插件 `dynamic[0]` 的通配位：订了它的目标什么动态都收，

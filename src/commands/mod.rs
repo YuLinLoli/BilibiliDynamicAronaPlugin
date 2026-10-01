@@ -84,6 +84,8 @@ pub(crate) enum Cmd {
     Help,
     Reload,
     Color,
+    Mute,
+    Unmute,
     Add,
     Del,
     DelAll,
@@ -129,6 +131,18 @@ const SUBS: &[Row] = &[
         Cmd::Color,
         "<#rrggbb[;#rrggbb…]> [目标]",
         "给某个目标单独指定卡片配色",
+    ),
+    (
+        &["mute", "silence", "静音", "暂停推送"],
+        Cmd::Mute,
+        "[目标]",
+        "让这个目标暂停收推送，订阅关系一条都不动",
+    ),
+    (
+        &["unmute", "resume", "取消静音", "恢复推送"],
+        Cmd::Unmute,
+        "[目标]",
+        "恢复这个目标的推送",
     ),
     (
         &["add", "follow", "添加", "订阅"],
@@ -394,6 +408,8 @@ async fn dispatch(cmd: Cmd, call: &Call) -> Reply {
         Cmd::Help => help(call),
         Cmd::Reload => browse::reload(call),
         Cmd::Color => subscribe::color(call).await,
+        Cmd::Mute => subscribe::mute(call, true),
+        Cmd::Unmute => subscribe::mute(call, false),
         Cmd::Add => subscribe::add(call).await,
         Cmd::Del => subscribe::del(call).await,
         Cmd::DelAll => subscribe::del_all(call).await,
@@ -433,6 +449,8 @@ fn mutates(cmd: Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Color
+            | Cmd::Mute
+            | Cmd::Unmute
             | Cmd::Add
             | Cmd::Del
             | Cmd::DelAll
