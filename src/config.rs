@@ -92,7 +92,8 @@ impl PluginConfig for BiliConfig {
                  是否给每个管理员发一条私聊通报\n关掉就只在日志里记"
             }
             "showLoadingMessage" => {
-                "慢命令（模板列表、搜索、最新动态、最新视频）是否先发一条「加载中…」，\n出结果后撤回"
+                "慢命令（搜索、最新动态、最新视频）是否先发一条「加载中…」，\n出结果后撤回\n\
+                 模板列表不挂这一档：它用假数据渲染，占位一条只会闪一下"
             }
             "command" | "command.names" => {
                 "主命令名与别名，必须带前缀\n多个名字都指向同一棵子命令树\n改名要重启才生效"
@@ -472,7 +473,7 @@ impl PluginConfig for ImageConfig {
             "colorGenerator" | "colorGenerator.hueStep" => {
                 "渐变色生成器（仅当主题色只给了一个值时生效）"
             }
-            "colorGenerator.lockSB" => "锁定饱和度与亮度",
+            "colorGenerator.lockSb" => "锁定饱和度与亮度",
             "colorGenerator.saturation" => "锁定的饱和度 0.0-1.0",
             "colorGenerator.brightness" => "锁定的亮度 0.0-1.0",
             "footer" => "图片页脚",
