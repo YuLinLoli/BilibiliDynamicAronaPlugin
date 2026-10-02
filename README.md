@@ -770,11 +770,11 @@ admin 轮 **57 条、可疑 0**，`/bili clear` 轮 **可疑 0**，三轮宿主�
 点分路径，逐个去问注释表，谁没说明就带区块名列出来。四张自由键名的表（`cache.expires` 与模板那三张）
 只问到表本身那一句，不下钻——那些键是用户自己起的名字。
 它的牙齿是现场验的：把 `"colorGenerator.lockSB"` 临时改成 `"colorGenerator.lockSBx"` 重跑，报的正是
-`["bili-image.colorGenerator.lockSB"]`，改回来即绿；三门跟着走完（fmt 0、clippy 0、172 项里 169 通过 + 3 项
-`#[ignore]`）。**这条改动只在测试里**，产品码一行没动，所以上面那些端到端结论说的还是运行目录里那份 dll，
+`["bili-image.colorGenerator.lockSB"]`，改回来即绿；三门跟着走完（fmt 0、clippy 0、全绿，测试总数见「开发」那节）。
+**这条改动只在测试里**，产品码一行没动，所以上面那些端到端结论说的还是运行目录里那份 dll，
 不必重编也不必重跑。反向那半仍然空着：表里多出一条配置里已经没有的死键，得先把表做成可枚举的才查得了。
-同一天紧接着把那两支脚本里的另一支（README 命令表与 `SUBS` 的别名对照）也搬成了单测，
-见「功能面差集收口」命令面那一条；两次三门都过，最后一轮的数是 **173 项里 170 通过 + 3 项 `#[ignore]`**。
+同一天紧接着把本机那两支脚本都搬进了 `cargo test`——命令表与 `SUBS` 的对照见「功能面差集收口」命令面那一条，
+配置键表与渲染回读见配置面那一条。
 
 ## 功能面差集收口
 
@@ -805,6 +805,14 @@ admin 轮 **57 条、可疑 0**，`/bili clear` 轮 **可疑 0**，三轮宿主�
   `TemplateConfig` / `CacheConfig` / `LinkResolveConfig` 的键逐条过，`TemplateConfig` 那几档模板名
   一档不改名（第 37 条）。**默认值也逐键比过**（2026-10-01）：拿 `BiliConfig.kt` 每个 data class 的
   默认值对着这边 `Default` 实现看，凡不同的都能指回第 38 条那份清单——没有"移植时悄悄改错一个数"的那种。
+  2026-10-02 这一面也进了 `cargo test`，两条：
+  [`readme_config_tables_only_document_real_keys`](src/config.rs) 把 README 那几张键表读进来，
+  每个键都必须在框架真会渲染出来的那些路径里（临时把 `translate.cutLine` 写成 `translate.cutline` 就报
+  `["translate.cutline"]`，大小写漂移也抓）；
+  [`rendered_template_parses_back_to_the_defaults`](src/config.rs) 是直接拿框架那台渲染器
+  （`typed_section::<T>(key).render(...)`）把三块区各生成一份，再要求生成的文本**读回来等于整套默认值**——
+  这条钉的是「框架自己生成的配置文件自己读不回来」那一类（带换行的值早先被渲染成块标量，框架侧已修）。
+  两边都只查一个方向：文档写了却不存在会红，代码里有而文档漏了仍然查不了，那归注释表那条单测管。
 - **任务与类型面**：Kotlin 那 11 个 tasker 的归属——`DynamicCheck`/`LiveCheck`/`LiveCloseCheck` 进
   `tasks`，`SendTasker` 的节流与 @全体 拼法进 `push`，`CacheClearTasker` 进 24 小时一轮的清理，
   `ListenerTasker` 的链接解析进 `link.rs` 钩子、它那条 `BotLeaveEvent → removeAllSubscribe`
@@ -819,7 +827,7 @@ admin 轮 **57 条、可疑 0**，`/bili clear` 轮 **可疑 0**，三轮宿主�
 ```
 cargo fmt
 cargo clippy --all-targets     # 目标：0 警告
-cargo test --lib               # 173 项（170 通过 + 3 项标了 #[ignore]：两条联网、一条离线绘图）
+cargo test --lib               # 175 项（172 通过 + 3 项标了 #[ignore]：两条联网、一条离线绘图）
 cargo build --release
 ```
 

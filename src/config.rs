@@ -884,4 +884,90 @@ mod tests {
         );
         paths.len()
     }
+
+    /// 拿框架那台渲染器把三块区各生成一遍，确认生成的文件**读回来还是同一套默认值**。
+    /// 钉的是「框架自己生成的配置文件自己读不回来」那一类：带换行的配置值早先被渲染成块标量，
+    /// 拼到本层就成了非法 YAML（框架侧已修，Arona-rs 那笔 `059bb64`；这边留一条常驻哨兵）。
+    #[test]
+    fn rendered_template_parses_back_to_the_defaults() {
+        use arona::config::arona::typed_section;
+
+        let sections = [
+            typed_section::<BiliConfig>(SECTION),
+            typed_section::<ImageConfig>(IMAGE_SECTION),
+            typed_section::<TemplateConfig>(TEMPLATE_SECTION),
+        ];
+        for section in &sections {
+            let text = section.render(&section.default_value());
+            let first = text
+                .lines()
+                .find(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty());
+            assert!(
+                first.is_some_and(|line| line.starts_with(section.key())),
+                "{} 区渲染出来第一行不是 `{}:`：{text}",
+                section.key(),
+                section.key()
+            );
+        }
+        let [bili, image, template] = sections;
+        let bili_back: BTreeMap<String, BiliConfig> =
+            serde_yaml::from_str(&bili.render(&bili.default_value()))
+                .expect("`bili` 区读不回来，生成的文件是非法 YAML");
+        let image_back: BTreeMap<String, ImageConfig> =
+            serde_yaml::from_str(&image.render(&image.default_value()))
+                .expect("`bili-image` 区读不回来");
+        let template_back: BTreeMap<String, TemplateConfig> =
+            serde_yaml::from_str(&template.render(&template.default_value()))
+                .expect("`bili-template` 区读不回来");
+        assert_eq!(bili_back.get(SECTION), Some(&BiliConfig::default()));
+        assert_eq!(image_back.get(IMAGE_SECTION), Some(&ImageConfig::default()));
+        assert_eq!(
+            template_back.get(TEMPLATE_SECTION),
+            Some(&TemplateConfig::default())
+        );
+    }
+
+    /// README「## 配置」那几张表里的键，必须是框架真会渲染出来的键。
+    /// 反方向（代码里有、文档没写）这里查不了——那是上一条单测与全量注释表的责任。
+    #[test]
+    fn readme_config_tables_only_document_real_keys() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("读不到 README.md");
+        let region = text
+            .split("\n## 配置\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README 里没有「## 配置」那一节");
+        let mut real = Vec::new();
+        for section in [
+            serde_yaml::to_value(BiliConfig::default()).unwrap(),
+            serde_yaml::to_value(ImageConfig::default()).unwrap(),
+            serde_yaml::to_value(TemplateConfig::default()).unwrap(),
+        ] {
+            template_paths(&section, "", &mut real);
+        }
+        let mut phantom = Vec::new();
+        let mut documented = 0usize;
+        for line in region.lines().filter(|line| line.starts_with("| ")) {
+            let cells: Vec<&str> = line.split('|').skip(1).map(str::trim).collect();
+            let Some(first) = cells.first().map(|cell| cell.trim_matches('`')) else {
+                continue;
+            };
+            if cells.len() != 4 || first == "键" || first.starts_with('-') || first.is_empty() {
+                continue;
+            }
+            documented += 1;
+            if !real.iter().any(|path| path == first) {
+                phantom.push(first.to_string());
+            }
+        }
+        assert!(
+            phantom.is_empty(),
+            "README 配置表里这些键在生成的配置文件里根本不存在：{phantom:?}"
+        );
+        assert!(
+            documented >= 40,
+            "只数到 {documented} 个文档键，README 那张表八成被改坏了"
+        );
+    }
 }
