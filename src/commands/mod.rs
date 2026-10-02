@@ -990,4 +990,86 @@ mod tests {
         assert_eq!(season_id("ss11111111111"), None, "位数太多");
         assert_eq!(season_id("487550002"), None, "uid 不是番剧号");
     }
+
+    /// README 那张命令表是用户唯一会去抄的东西，`SUBS` 才是真跑的那份。别名写错既不报错也不警告，
+    /// 用户照文档敲却命不中，只能逐条双向比。说明那一列不钉——bot 里回的那条要短，文档里那条要讲清
+    /// （`Config` 那两行就是故意不一样的）。
+    #[test]
+    fn readme_command_table_matches_the_subcommand_rows() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("读不到 README.md");
+        let section = text
+            .split("\n## 命令\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README 里没有「## 命令」那一节");
+        let mut names = Vec::new();
+        let mut drift = Vec::new();
+        for line in section.lines().filter(|line| line.starts_with("| ")) {
+            // 用法串里的竖线在 markdown 表里必须写成 \|，先换成一个正文里不会出现的字符再切
+            let mut cells: Vec<String> = line
+                .replace("\\|", "\u{1}")
+                .split('|')
+                .skip(1)
+                .map(|cell| cell.replace('\u{1}', "|").trim().to_string())
+                .collect();
+            if cells.last().is_some_and(String::is_empty) {
+                cells.pop();
+            }
+            if cells.len() != 4 || cells[0] == "子命令" || cells[0].starts_with('-') {
+                continue;
+            }
+            let name = cells[0].clone();
+            names.push(name.clone());
+            let Some(row) = SUBS
+                .iter()
+                .find(|(_, cmd, _, _)| format!("{cmd:?}") == name)
+            else {
+                drift.push(format!("README 有 {name}，SUBS 里没有这一行"));
+                continue;
+            };
+            let documented: std::collections::BTreeSet<String> = cells[1]
+                .split('`')
+                .map(str::trim)
+                .filter(|chunk| !chunk.is_empty())
+                .map(str::to_string)
+                .collect();
+            let real: std::collections::BTreeSet<String> =
+                row.0.iter().map(|alias| alias.to_string()).collect();
+            if documented != real {
+                drift.push(format!(
+                    "{name} 的别名对不上：README {documented:?} / SUBS {real:?}"
+                ));
+            }
+            let usage = cells[2].trim_matches('`');
+            if usage != row.2 {
+                drift.push(format!(
+                    "{name} 的用法对不上：README {usage:?} / SUBS {:?}",
+                    row.2
+                ));
+            }
+        }
+        for (aliases, cmd, _, _) in SUBS {
+            let name = format!("{cmd:?}");
+            if !names.contains(&name) {
+                drift.push(format!(
+                    "SUBS 有 {name}（别名 {aliases:?}），README 表里没这一行"
+                ));
+            }
+        }
+        let uniq: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+        if uniq.len() != names.len() {
+            drift.push(format!(
+                "README 表里有重名的行：{} 行 / {} 个不同名",
+                names.len(),
+                uniq.len()
+            ));
+        }
+        assert!(
+            drift.is_empty(),
+            "命令表与 SUBS 对不上：\n{}",
+            drift.join("\n")
+        );
+        assert_eq!(names.len(), SUBS.len(), "上面逐条比过了，行数也该对上");
+    }
 }
