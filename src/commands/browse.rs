@@ -234,11 +234,12 @@ pub(crate) fn overview(call: &Call) -> Vec<String> {
             on_off(bili.show_loading_message)
         ),
         format!(
-            "命令名 {}｜检测间隔 动态 {} 秒 / 直播 {} 秒｜低频 {}",
+            "命令名 {}｜检测间隔 动态 {} 秒 / 直播 {} 秒｜低频 {}｜关注流翻页 {} 页",
             call.prefix(),
             bili.check.interval,
             bili.check.live_interval,
-            bili.check.low_speed
+            bili.check.low_speed,
+            bili.check.timeline_pages
         ),
         format!(
             "节流 消息间 {} 毫秒 / 目标间 {} 毫秒｜短链 {}｜@全体 挂法 {}｜结束通知 {}",

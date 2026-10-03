@@ -115,7 +115,8 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
     (
         "account",
         "B 站账号 Cookie\n手填写法: SESSDATA=xxx; bili_jct=yyy\n留空也能起：插件会自己去取匿名设备指纹，\
-         订阅检测/番剧/开播/链接解析都不必登录；只有关注时间线、自动关注与分组才要扫码",
+         番剧/开播/链接解析都不必登录，订阅检测就走逐个 UP 主的匿名路\n\
+         登录后检测换成关注时间线（一轮一次请求，与订阅人数无关），自动关注与分组也只有登录才做",
     ),
     (
         "account.cookie",
@@ -129,7 +130,11 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
         "account.csrf",
         "bili_jct，改关系（关注/加组）时要用；留空时从 cookie 里自动解析",
     ),
-    ("account.autoFollow", "添加订阅时顺手关注这个 UP"),
+    (
+        "account.autoFollow",
+        "添加订阅时顺手关注这个 UP\n检测走的是关注时间线，那条只覆盖已关注的人，\
+         所以这条关掉又没在 B 站手动关注过的订阅会一条都收不到",
+    ),
     (
         "account.followGroup",
         "自动关注时把对方归到哪个 B 站分组（最长 16 字符）",
@@ -137,6 +142,11 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
     ("check", "检测节奏"),
     ("check.interval", "动态检测间隔(秒)，推荐 15-60"),
     ("check.liveInterval", "直播检测间隔(秒)"),
+    (
+        "check.timelinePages",
+        "一轮最多翻几页关注时间线，一页约二十条（只在有登录态时用到）\n\
+         这一页最旧一条已经比所有水位都新就不再往下翻，所以平静时段实际只打一次",
+    ),
     (
         "check.lowSpeed",
         "低频时段，例 3-8x2 表示 3 点到 8 点间隔为正常间隔的 2 倍；留空表示全天同速",
@@ -237,13 +247,26 @@ impl Default for CommandConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
-#[derive(Default)]
 pub struct AccountConfig {
     pub cookie: String,
     pub uid: i64,
     pub csrf: String,
     pub auto_follow: bool,
     pub follow_group: String,
+}
+
+impl Default for AccountConfig {
+    /// `autoFollow` 取 `true` 不是随手定的：检测主路径走关注时间线，那条只覆盖这个账号**关注过**的人，
+    /// 订阅却不关注就成了「订了收不到」。原插件的默认值也正是 `true`。
+    fn default() -> Self {
+        AccountConfig {
+            cookie: String::new(),
+            uid: 0,
+            csrf: String::new(),
+            auto_follow: true,
+            follow_group: String::new(),
+        }
+    }
 }
 
 impl AccountConfig {
@@ -276,6 +299,8 @@ impl AccountConfig {
 pub struct CheckConfig {
     pub interval: u64,
     pub live_interval: u64,
+    /// 一轮最多翻几页关注时间线（一页约二十条，翻页不签名）。翻够了会提前停，见 `should_fetch_more`
+    pub timeline_pages: u32,
     pub low_speed: String,
     pub report_interval: u64,
     pub timeout: u64,
@@ -286,6 +311,8 @@ impl Default for CheckConfig {
         CheckConfig {
             interval: 30,
             live_interval: 15,
+            // 3 页 ≈ 60 条，一分钟内全关注加起来也发不了这么多
+            timeline_pages: 3,
             low_speed: "3-8x2".into(),
             report_interval: 0,
             timeout: 20,
