@@ -33,7 +33,7 @@ use crate::bili::api::{Bili, client};
 use crate::config::{
     BiliConfig, DEFAULT_LINK_PATTERNS, IMAGE_SECTION, ImageConfig, LinkResolveConfig, SECTION,
 };
-use crate::push;
+use crate::push::{self, attachment};
 use crate::store;
 use crate::tasks;
 
@@ -347,7 +347,7 @@ async fn text_card(
             Ok(raw) => MessageSegment::Image {
                 url: None,
                 file: None,
-                data: Some(raw),
+                data: Some(attachment(raw)),
                 file_id: None,
             },
             Err(_) => MessageSegment::Image {

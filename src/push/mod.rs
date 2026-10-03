@@ -12,11 +12,13 @@
 
 pub(crate) mod template;
 
+use std::io::Cursor;
 use std::time::Duration;
 
 use arona::bot::Bot;
 use arona::plugin::PluginContext;
 use arona::runtime::message::{MessageSegment, MessageTarget, OutgoingMessage};
+use image::ImageFormat;
 
 use crate::config::{BiliConfig, ForwardCard, SECTION, TEMPLATE_SECTION, TemplateConfig};
 use crate::store::{self, TargetState};
@@ -259,5 +261,83 @@ pub async fn selftest(ctx: &PluginContext) {
             supply,
         };
         push_state(ctx, &key, &state, &post).await;
+    }
+}
+
+/// PNG 的文件头，用来认出「已经是 PNG，不必再编一遍」
+const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// 交出去的图片段一律先转成 PNG。素材从 B 站图床来，拿到的是 WebP 还是 JPEG 全看配置——
+/// `cache.downloadOriginal=false` 时先要 `…@720w.webp`，拿不到才回退原图，
+/// 而实现端对 WebP 的支持并不齐。编码不能跟着运气走。
+/// 已经是 PNG 的原样交出去（自己画的卡片都在这一支，不必重编码）；
+/// 解不开也交原件——宁可编码不合口味，也好过整条推送少一张图。
+/// 动图只留第一帧：素材在解码那一步就已经是静态的了，附件这一路不再单开一支。
+pub(crate) fn attachment(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.starts_with(PNG_MAGIC) {
+        return bytes;
+    }
+    let Ok(decoded) = image::load_from_memory(&bytes) else {
+        return bytes;
+    };
+    let mut out = Cursor::new(Vec::new());
+    if decoded.write_to(&mut out, ImageFormat::Png).is_err() {
+        return bytes;
+    }
+    out.into_inner()
+}
+
+#[cfg(test)]
+mod tests {
+    use image::{ImageBuffer, ImageFormat, Rgb, Rgba, RgbaImage};
+
+    use super::{PNG_MAGIC, attachment};
+
+    fn swatch() -> RgbaImage {
+        ImageBuffer::from_pixel(3, 2, Rgba([10, 120, 240, 255]))
+    }
+
+    /// JPEG 编码器不认 RGBA，样例得按目标格式挑颜色
+    fn encoded(format: ImageFormat) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        let done = match format {
+            ImageFormat::Jpeg => {
+                ImageBuffer::from_pixel(3, 2, Rgb([10u8, 120, 240])).write_to(&mut out, format)
+            }
+            _ => swatch().write_to(&mut out, format),
+        };
+        done.expect("样例图编不出来");
+        out.into_inner()
+    }
+
+    #[test]
+    fn webp_and_jpeg_both_leave_as_png() {
+        for format in [ImageFormat::WebP, ImageFormat::Jpeg] {
+            let raw = encoded(format);
+            assert!(
+                !raw.starts_with(PNG_MAGIC),
+                "{format:?} 样例本身就该不是 PNG"
+            );
+            let done = attachment(raw);
+            assert!(done.starts_with(PNG_MAGIC), "{format:?} 转完不是 PNG");
+            let back = image::load_from_memory(&done).expect("转出来的 PNG 读不回来");
+            assert_eq!(
+                (back.width(), back.height()),
+                (3, 2),
+                "{format:?} 转完尺寸变了"
+            );
+        }
+    }
+
+    #[test]
+    fn png_and_undecodable_bytes_pass_through() {
+        let png = encoded(ImageFormat::Png);
+        assert_eq!(attachment(png.clone()), png, "已经是 PNG 的被重编码了");
+        let junk = vec![1, 2, 3, 4, 5];
+        assert_eq!(
+            attachment(junk.clone()),
+            junk,
+            "解不开的也该交原件，别把图片段清空"
+        );
     }
 }

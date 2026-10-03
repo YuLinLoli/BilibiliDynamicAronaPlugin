@@ -332,7 +332,7 @@ fn image(bytes: Vec<u8>) -> MessageSegment {
     MessageSegment::Image {
         url: None,
         file: None,
-        data: Some(bytes),
+        data: Some(super::attachment(bytes)),
         file_id: None,
     }
 }
@@ -376,6 +376,32 @@ mod tests {
             .iter()
             .filter(|segment| matches!(segment, MessageSegment::Image { .. }))
             .count()
+    }
+
+    /// 第一个图片段里的字节
+    fn first_image(message: &OutgoingMessage) -> Vec<u8> {
+        message
+            .segments
+            .iter()
+            .find_map(|segment| match segment {
+                MessageSegment::Image { data, .. } => data.clone(),
+                _ => None,
+            })
+            .expect("这条消息里没有图片段")
+    }
+
+    #[test]
+    fn a_jpeg_supply_leaves_as_a_png_segment() {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::ImageBuffer::from_pixel(3, 2, image::Rgb([10u8, 120, 240]))
+            .write_to(&mut out, image::ImageFormat::Jpeg)
+            .expect("样例 JPEG 编不出来");
+        let supply = Supply::for_dynamic(None, vec![out.into_inner()]);
+        let got = render("{images}", &vals(), &supply, &card());
+        assert!(
+            first_image(&got[0]).starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            "正文图没走统一转码，交出去的编码又在跟着图床的运气走"
+        );
     }
 
     #[test]
