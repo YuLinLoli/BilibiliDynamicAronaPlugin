@@ -116,7 +116,7 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
         "account",
         "B 站账号 Cookie\n手填写法: SESSDATA=xxx; bili_jct=yyy\n留空也能起：插件会自己去取匿名设备指纹，\
          番剧/开播/链接解析都不必登录，订阅检测就走逐个 UP 主的匿名路\n\
-         登录后检测换成关注时间线（一轮一次请求，与订阅人数无关），自动关注与分组也只有登录才做",
+         登录后检测换成关注时间线（一轮最多翻 check.timelinePages 页，请求数与订阅人数无关），自动关注与分组也只有登录才做",
     ),
     (
         "account.cookie",
@@ -144,8 +144,10 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
     ("check.liveInterval", "直播检测间隔(秒)"),
     (
         "check.timelinePages",
-        "一轮最多翻几页关注时间线，一页约二十条（只在有登录态时用到）\n\
-         这一页最旧一条已经比所有水位都新就不再往下翻，所以平静时段实际只打一次",
+        "一轮最多翻几页关注时间线（只在有登录态时用到）\n\
+         一页几条没实测过：feed/all 要登录态才出包，原插件那份接口注释写「每页 20 左右」\n\
+         页里最旧一条仍比最低的那条水位新才继续往下翻，所以平静时段实际只打一次\n\
+         翻满还没到底时，这一轮跳过去的动态下一轮也不算新了（会漏），日志里记一条告警",
     ),
     (
         "check.lowSpeed",
@@ -177,7 +179,8 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
     ("cache", "图片缓存"),
     (
         "cache.downloadOriginal",
-        "是否下载动态里的原图（关了就只画卡片，不缓存原图）",
+        "是否下载动态里的原图\n关掉时先向 B 站图床要 720w 那份缩略 WebP，拿不到才回退原图\n\
+         卡片和附件用的都是实际拿到的那一份，缓存照写",
     ),
     (
         "cache.expires",
@@ -299,7 +302,7 @@ impl AccountConfig {
 pub struct CheckConfig {
     pub interval: u64,
     pub live_interval: u64,
-    /// 一轮最多翻几页关注时间线（一页约二十条，翻页不签名）。翻够了会提前停，见 `should_fetch_more`
+    /// 一轮最多翻几页关注时间线（一页几条没实测过，翻页不签名）。翻够了会提前停，见 `should_fetch_more`
     pub timeline_pages: u32,
     pub low_speed: String,
     pub report_interval: u64,
@@ -1199,6 +1202,38 @@ mod tests {
         assert!(
             undocumented.is_empty(),
             "这些配置键在 README 对应小节里一次都没写过：{undocumented:?}"
+        );
+    }
+
+    /// README 里不许钉本仓源码的行号：动一次代码行号就漂，而漂掉的引用比没有引用更坏——它看着仍然可信。
+    /// 一律写成「哪个文件的哪个符号」。指向原 mirai 插件那 18 处 `.kt:` 引用不在此列（外部仓库，内容不动）。
+    #[test]
+    fn readme_never_pins_a_line_number_inside_this_repo() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("读不到 README.md");
+        let mut pinned = Vec::new();
+        for (index, line) in text.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find(".rs:") {
+                let digits: String = rest[at + 4..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if !digits.is_empty() {
+                    pinned.push(format!(
+                        "第 {} 行 `{}{}`",
+                        index + 1,
+                        &rest[..at + 4],
+                        digits
+                    ));
+                }
+                // `.rs:` 是 ASCII，这个切点不会落在多字节字符中间
+                rest = &rest[at + 4..];
+            }
+        }
+        assert!(
+            pinned.is_empty(),
+            "README 钉了本仓源码行号，改一次就漂，请换成符号名：{pinned:?}"
         );
     }
 }

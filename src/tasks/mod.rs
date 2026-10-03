@@ -258,10 +258,15 @@ async fn firehose_round(
     }
     let marks = watermarks();
     let mut feed: Vec<Dynamic> = Vec::new();
-    for page in 1..=conf.check.timeline_pages.max(1) {
+    let cap = conf.check.timeline_pages.max(1);
+    let mut used = 0u32;
+    for page in 1..=cap {
         match bili.timeline(page, "all").await {
             Ok(items) if items.is_empty() => break,
-            Ok(items) => feed.extend(items),
+            Ok(items) => {
+                used += 1;
+                feed.extend(items);
+            }
             Err(reason) => {
                 report(&conf.check, &format!("关注时间线读不出来：{reason}"));
                 // 第一页就没有，这一轮什么都判不了；后面的页翻不动就用已拿到的那些，别把整轮作废
@@ -281,6 +286,17 @@ async fn firehose_round(
     }
     if feed.is_empty() {
         return Firehose::Done;
+    }
+    if past_the_page_cap(used, cap, &feed, &uids, &marks, wants_all) {
+        // 这一档漏掉的不是"这一轮"，是永远：水位推到本轮见过的最大 id，中间没取到的那些下一轮也不算了。
+        // 走 report 那条节流——它和接口失败汇报同一种性质，一轮一条会把宿主日志刷过去，reportInterval 能压住。
+        report(
+            &conf.check,
+            &format!(
+                "关注流翻满 {cap} 页还没到底，页里最旧那条仍比最低的那条水位新——\
+                 中间没取到的动态这一轮就跳过去了，订阅多就抬 check.timelinePages"
+            ),
+        );
     }
     let plan = plan_round(&feed, &uids, &marks, wants_all);
     for (slot, newest) in &plan.align {
@@ -456,6 +472,20 @@ fn should_fetch_more(
         Some(floor) => oldest > floor,
         None => false,
     }
+}
+
+/// 这一轮是「翻到底了」还是「翻页预算用完了」——只有后者才漏。
+/// 水位推到本轮见过的最大 id，所以预算用完时那些没翻到的更旧动态下一轮也不算新了：这一档漏是永久的。
+/// `used` 是本轮真取回的页数（空页与读不出来都提前收尾，所以它可能小于 `cap`）。
+fn past_the_page_cap(
+    used: u32,
+    cap: u32,
+    items: &[Dynamic],
+    uids: &[i64],
+    marks: &BTreeMap<i64, i64>,
+    wants_all: bool,
+) -> bool {
+    used >= cap && should_fetch_more(items, uids, marks, wants_all)
 }
 
 /// 直播版式要的那份房间信息。`DYNAMIC_TYPE_LIVE_RCMD` 的 content 里只有房间号、标题和封面，
@@ -1495,6 +1525,22 @@ mod tests {
             !should_fetch_more(&[], &[1], &marks(&[(1, 1)]), false),
             "空页没什么可翻的"
         );
+    }
+
+    /// 「翻页预算用完了」和「翻到底了」是两件事，只有前者会漏，而漏掉的那些永远补不回来
+    /// （水位推到本轮见过的最大 id，下一轮那些也不算新了）。这条钉住那个区别，别让那句 warn 变成瞎报。
+    #[test]
+    fn only_an_exhausted_page_budget_leaks_dynamics() {
+        let feed = [dynamic(1, 300), dynamic(2, 200)];
+        let uids = [1, 2];
+        let above = marks(&[(1, 150), (2, 150)]);
+        // 三页翻满、页里最旧那条仍比最低的那条水位新：更旧的页没取到，这一轮跳过去的就是漏
+        assert!(past_the_page_cap(3, 3, &feed, &uids, &above, false));
+        // 同样翻满三页，但已经压到水位之下——那是翻到底，不是预算用完
+        let at_bottom = marks(&[(1, 200), (2, 250)]);
+        assert!(!past_the_page_cap(3, 3, &feed, &uids, &at_bottom, false));
+        // 预算没用完（空页或读不出来提前收尾），剩下的页下一轮还会打
+        assert!(!past_the_page_cap(2, 3, &feed, &uids, &above, false));
     }
 
     /// 顺序只能由 `pick_fresh` 自己定：`parse_feed` 交出来的是按 `time` 升序那份，接口页序又不保证什么。
