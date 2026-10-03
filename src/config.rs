@@ -155,7 +155,7 @@ const BILI_COMMENTS: &[(&str, &str)] = &[
     ),
     (
         "check.reportInterval",
-        "接口失败时每隔多少分钟记一条日志，0 表示每次失败都记",
+        "告警日志（接口失败、页没取到底）每隔多少分钟记一条，0 表示每次都记",
     ),
     ("check.timeout", "单次 B 站请求的超时(秒)"),
     ("push", "推送节流"),
@@ -1205,35 +1205,55 @@ mod tests {
         );
     }
 
-    /// README 里不许钉本仓源码的行号：动一次代码行号就漂，而漂掉的引用比没有引用更坏——它看着仍然可信。
+    /// README 与源码注释都不许钉本仓源码的行号：动一次代码行号就漂，而漂掉的引用比没有引用更坏——它看着仍然可信。
     /// 一律写成「哪个文件的哪个符号」。指向原 mirai 插件那 18 处 `.kt:` 引用不在此列（外部仓库，内容不动）。
     #[test]
-    fn readme_never_pins_a_line_number_inside_this_repo() {
-        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
-            .expect("读不到 README.md");
-        let mut pinned = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            let mut rest = line;
-            while let Some(at) = rest.find(".rs:") {
-                let digits: String = rest[at + 4..]
-                    .chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect();
-                if !digits.is_empty() {
-                    pinned.push(format!(
-                        "第 {} 行 `{}{}`",
-                        index + 1,
-                        &rest[..at + 4],
-                        digits
-                    ));
+    fn nothing_in_this_repo_pins_a_line_number_inside_our_own_source() {
+        fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("读不到 src 目录") {
+                let path = entry.expect("读不到目录项").path();
+                if path.is_dir() {
+                    collect_rs(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
                 }
-                // `.rs:` 是 ASCII，这个切点不会落在多字节字符中间
-                rest = &rest[at + 4..];
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("README.md")];
+        let mut sources = Vec::new();
+        collect_rs(&root.join("src"), &mut sources);
+        sources.sort();
+        files.extend(sources);
+
+        let mut pinned = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("读不到被检查的文件");
+            let where_ = file.strip_prefix(root).unwrap_or(file).display();
+            for (index, line) in text.lines().enumerate() {
+                let mut rest = line;
+                while let Some(at) = rest.find(".rs:") {
+                    let digits: String = rest[at + 4..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect();
+                    if !digits.is_empty() {
+                        pinned.push(format!(
+                            "`{}` 第 {} 行 `{}{}`",
+                            where_,
+                            index + 1,
+                            &rest[..at + 4],
+                            digits
+                        ));
+                    }
+                    // `.rs:` 是 ASCII，这个切点不会落在多字节字符中间
+                    rest = &rest[at + 4..];
+                }
             }
         }
         assert!(
             pinned.is_empty(),
-            "README 钉了本仓源码行号，改一次就漂，请换成符号名：{pinned:?}"
+            "README 或源码注释里钉了本仓源码行号，改一次就漂，请换成符号名：{pinned:?}"
         );
     }
 }

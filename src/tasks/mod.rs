@@ -353,6 +353,8 @@ async fn per_up_round(
                 .copied()
                 .unwrap_or_default()
         });
+        // `pick_fresh` 会把整页搬走，所以「这一页有没有可能没到底」得在它之前问
+        let page_may_run_over = page_might_hold_more(&items, watermark);
         let Some((fresh, newest)) = pick_fresh(items, watermark) else {
             continue;
         };
@@ -365,6 +367,17 @@ async fn per_up_round(
             ));
             continue;
         }
+        if page_may_run_over {
+            // 水位推到本轮见过的最大 id，所以这一页底下那些没取到的更旧动态下一轮也不算新了：这一档漏是永久的
+            report(
+                &conf.check,
+                &format!(
+                    "{uid} 这一页动态整页都比水位新：匿名逐 UP 那一路每轮只打第一页，所以这一页可能没到底，\
+                     没到底的那些这一轮就跳过去了、下一轮也不算新了（会漏）；\
+                     隔很久才检一轮、或这个 UP 一轮里发得特别密时会这样，扫码登录换成关注流就能翻页"
+                ),
+            );
+        }
         for dynamic in &fresh {
             push_one(ctx, conf, bili, appearance, uid, dynamic, &targets).await;
         }
@@ -373,7 +386,7 @@ async fn per_up_round(
 
 /// 从一页动态里挑出比水位新的那些，并给出这一页里最新一条的 id（对齐就用它）。逐 UP 与关注流两条路共用
 ///
-/// 手里的顺序一律不信：`per_up_round` 那份是 `parse_feed` 按 `time` **升序**排过的（`model.rs:668`），
+/// 手里的顺序一律不信：`per_up_round` 那份是 `parse_feed`（`bili/model.rs`）按 `time` **升序**排过的，
 /// 关注流那份是多页拼接加去重，谁都不是「接口给的页序」。旧代码以为前者还是新→旧，`reverse()` 之后取 `last()`
 /// 当最新，实际拿到的是**最旧**那条——水位钉在最旧动态上，下一轮整页历史就全被当成新的推出去（2026-10-03，
 /// 实测 12 条的页重推出 11 条）。所以这里显式按 id 排序取 `last()`，返回的 `fresh` 也是旧→新，
@@ -486,6 +499,19 @@ fn past_the_page_cap(
     wants_all: bool,
 ) -> bool {
     used >= cap && should_fetch_more(items, uids, marks, wants_all)
+}
+
+/// 逐 UP 那一页是不是**整页**都比水位新——是就可能页底下还有更旧的动态没被取到。
+/// 这一路每轮只打第一页、根本不翻页，所以「整页全新」就是「这一页没到底」的唯一可见迹象。
+/// 水位为 0（第一次订阅）时整页当然全是新的，那一轮只对齐、不告警。
+/// 判据用「页里最旧那条都比水位新」而不是「新条数等于页大小」：匿名页一页实测 10～12 条，页数不是常数。
+fn page_might_hold_more(items: &[Dynamic], watermark: i64) -> bool {
+    watermark > 0
+        && items
+            .iter()
+            .map(|item| item.id)
+            .min()
+            .is_some_and(|oldest| oldest > watermark)
 }
 
 /// 直播版式要的那份房间信息。`DYNAMIC_TYPE_LIVE_RCMD` 的 content 里只有房间号、标题和封面，
@@ -1541,6 +1567,22 @@ mod tests {
         assert!(!past_the_page_cap(3, 3, &feed, &uids, &at_bottom, false));
         // 预算没用完（空页或读不出来提前收尾），剩下的页下一轮还会打
         assert!(!past_the_page_cap(2, 3, &feed, &uids, &above, false));
+    }
+
+    /// 逐 UP 那一路不翻页，所以「整页都比水位新」是「这一页可能没到底」的唯一迹象——
+    /// 页里只要有一条已经见过（含水位那条本身），就说明这一页已经压进已知区，没漏。
+    #[test]
+    fn an_all_new_page_is_the_only_sign_the_per_up_page_ran_over() {
+        let page = [dynamic(1, 300), dynamic(1, 250)];
+        // 两条都比水位新：这一页底下说不定还有几条我们永远看不到的
+        assert!(page_might_hold_more(&page, 200));
+        // 最旧那条正好是水位那条：`id > 水位` 才算新，见过就是到底了
+        assert!(!page_might_hold_more(&page, 250));
+        assert!(!page_might_hold_more(&page, 300));
+        // 第一次订阅那一轮整页当然全是新的，但那一轮只对齐，不该报警
+        assert!(!page_might_hold_more(&page, 0));
+        // 空页（匿名接口常回 `code 0`）什么都不说明
+        assert!(!page_might_hold_more(&[], 200));
     }
 
     /// 顺序只能由 `pick_fresh` 自己定：`parse_feed` 交出来的是按 `time` 升序那份，接口页序又不保证什么。
