@@ -126,7 +126,27 @@ pub(crate) async fn add(call: &Call) -> Reply {
             data.follow_cluster(cluster, uid);
         }
     });
-    reply(format!("{}订阅 {name} 成功!", targets.grant()))
+    let hint = if uid == 0 {
+        wildcard_hint(bili.signed())
+    } else {
+        ""
+    };
+    reply(format!("{}订阅 {name} 成功!{hint}", targets.grant()))
+}
+
+/// 通配档在没有登录态时确实订上了，可它每一轮都拿不到内容（匿名 `feed/all` 不出包）——
+/// 不提醒就是「回了一句成功，却永远不推」，那是最坏的一种成功。
+///
+/// 只提这一条，是因为只有这一档在匿名态下**整档失效**：普通 uid 走匿名 `feed/space`，照常推。
+///
+/// `signed()` 判的是 `api::client` 里 `with_cookie_file` 之后的那份账号态，所以 `cookies.json` 导入的
+/// 登录态也算数——这里不能换成直接读配置串的那个 `signed()`，否则文件导入的人会被误告一句要扫码。
+fn wildcard_hint(signed: bool) -> &'static str {
+    if signed {
+        ""
+    } else {
+        "（这一档走关注时间线，匿名拿不到内容，要 /bili login 扫码之后才生效）"
+    }
 }
 
 /// 这个 uid 在这批目标上订过没有
@@ -498,4 +518,23 @@ pub(crate) async fn list_user(call: &Call) -> Reply {
     out.push(String::new());
     out.push(format!("共 {} 名用户", keys.len()));
     lines(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 通配档在匿名态下整档拿不到内容，`/bili add 0` 那句「成功」必须自己交代这一点——
+    /// 用户看到的是一句成功、之后一条都不会推，而清单那一头（`browse.rs` 的 `a_wildcard_slot_is_spelled_out`）
+    /// 只有他主动去列才看得到。
+    #[test]
+    fn adding_the_wildcard_while_anonymous_says_it_needs_login() {
+        let hint = wildcard_hint(false);
+        assert!(
+            hint.contains("关注时间线"),
+            "得说清这一档走的是哪条接口：{hint}"
+        );
+        assert!(hint.contains("/bili login"), "匿名那句要给出口：{hint}");
+        assert_eq!(wildcard_hint(true), "", "有登录态时不该多这一句");
+    }
 }

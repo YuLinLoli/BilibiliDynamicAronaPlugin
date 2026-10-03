@@ -58,7 +58,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | Color | `color` `颜色` | `<#rrggbb[;#rrggbb…]> [目标]` | 给某个目标单独指定卡片配色 |
 | Mute | `mute` `silence` `静音` `暂停推送` | `[目标]` | 让这个目标暂停收推送，订阅关系一条都不动 |
 | Unmute | `unmute` `resume` `取消静音` `恢复推送` | `[目标]` | 恢复这个目标的推送 |
-| Add | `add` `follow` `添加` `订阅` | `<UP主UID\|番剧号> [目标]` | 订阅一个 UP 主，或追一部番 |
+| Add | `add` `follow` `添加` `订阅` | `<UP主UID\|番剧号> [目标]` | 订阅一个 UP 主，或追一部番；UID 填 `0` 订「全部动态」，那一档要有登录态 |
 | Del | `del` `unfollow` `删除` `取消订阅` | `<UP主UID\|名字\|番剧号> [目标]` | 取消订阅 |
 | DelAll | `delall` `删除全部订阅` | `[目标]` | 清空这个目标的全部订阅 |
 | List | `list` `列表` | `[目标]` | 看这个目标订了些什么 |
@@ -506,6 +506,20 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
      于是「整页全新」结构上不可能成立，那一轮判成「接线断了」是我的期望写错，不是代码缺陷（见上面那条更正）。
      **它是迹象不是结论**：一个 UP 在一轮里恰好发了整页、而页底下并没有漏，也会报这一条——
      所以文案写的是「可能没到底」，只进宿主日志、不发群。
+   * 同一条匿名路上还有一个**整档失效**的档：通配位 `0`（原插件的 `listenAll`）只有关注流能给它出内容，
+     而 `store.subscribed_uids()` 是刻意 `uids.remove(&0)` 的（那条由单测
+     `the_zero_slot_takes_everything_but_is_not_a_uid` 钉着——没人能去轮询 uid 0 的主页），
+     所以在没登录态时它是「订上了、每一轮都 0 条」。这类回了一句成功却永远不推是最坏的一种成功，
+     于是 `/bili add 0` 现在自己把话头交出来：`订阅 全部动态 成功!（这一档走关注时间线，匿名拿不到内容，
+     要 /bili login 扫码之后才生效）`。判据是 `wildcard_hint(bili.signed())`，而这个 `bili` 来自
+     `api::client`——那份 `signed()` 已经吃过 `cookies.json` 的文件优先，所以靠导入 cookie 登录的人不会被误告一句要扫码。
+     单测 `adding_the_wildcard_while_anonymous_says_it_needs_login` 钉两面：匿名那句要同时给出接口名与出口，
+     有登录态时必须是空串。牙齿现场验过：把 `if signed` 写成 `if true`，红在第一条断言。
+     端到端是 `cmdseq` 那一轮（产物 `dll-wildcardhint.dll`，日志 `bili-cmdseq-round.log`）：
+     **30 条回话、可疑 0**、握手布局 5、宿主 0 panic，那条真带上了这一句；同一轮 `/bili add 546195 20001`
+     回的还是光一句「订阅 老番茄 成功!」，所以一轮里就有正反两例。清单那头其实早就说过这件事
+     （`/bili list` 里那句「已订阅「全部动态」（走关注时间线，要有登录态）」，由 `a_wildcard_slot_is_spelled_out` 钉着），
+     差别在于那要用户主动去列才看得见，而这一句在他刚订完的那一刻就送到眼前。
    * 还欠的那一半：关注流拿到真数据要有登录态，工装是匿名的，所以「一轮请求数与订阅数无关」在真账号上的实测
      还欠着，跟 `#85` 那批一起等扫码。这一条里能不等登录先验的是**分支选择**与**三态退法**，已进端到端。
 6. **两个「等下一句话」现在连超时那一支都端到端压到了**（2026-10-01 补的 `fake-onebot-timeout.mjs`）。
@@ -584,7 +598,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 `plugins\bilibili\`。除了 `peek-images.mjs` 每个工装都起一个 ws-forward 服务（默认 9001），一次只跑一个：
 
 ```
-node fake-onebot-bili.mjs      # 命令序列：21 条本地 + 5 条联网
+node fake-onebot-bili.mjs      # 命令序列：22 条本地 + 5 条联网
 node fake-onebot-login.mjs     # /bili login 专测：出图 → 轮询 → 撤码
 node fake-onebot-link.mjs      # 链接解析钩子：七条带 at 段的消息，含一条负例
 node fake-onebot-season.mjs    # 番剧跟跑：订一部番后静默四轮，看检测有没有每轮都查
