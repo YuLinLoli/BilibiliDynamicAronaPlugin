@@ -1085,8 +1085,8 @@ mod tests {
         );
     }
 
-    /// README「## 配置」那几张表里的键，必须是框架真会渲染出来的键。
-    /// 反方向（代码里有、文档没写）这里查不了——那是上一条单测与全量注释表的责任。
+    /// README「## 配置」那几张表里的键，必须是框架真会渲染出来的键（方向：文档 → 代码）。
+    /// 反方向那半条在 `every_real_config_key_is_documented_in_readme`。
     #[test]
     fn readme_config_tables_only_document_real_keys() {
         let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
@@ -1126,6 +1126,79 @@ mod tests {
         assert!(
             documented >= 40,
             "只数到 {documented} 个文档键，README 那张表八成被改坏了"
+        );
+    }
+
+    /// 取 README「## 配置」里某个区块那一小节正文：从 `### \`<键>\`` 那行标题往下，到下一个 `###` 或 `##` 为止
+    fn readme_section_body(region: &str, key: &str) -> String {
+        let head = format!("### `{key}`");
+        let start = region
+            .find(&head)
+            .unwrap_or_else(|| panic!("README 的「## 配置」里没有 {head} 那一小节"));
+        let rest = &region[start + head.len()..];
+        let stop = [rest.find("\n### "), rest.find("\n## ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        rest[..stop].to_string()
+    }
+
+    /// 反方向的那半：代码里有键、README 漏写。先前只能查「表里的键是不是真键」，
+    /// 加一个键而忘了写说明就不会红——这条补上那一半。
+    /// 口径是「这个点分路径（或它的最后一段）在这一小节的反引号里出现过」，
+    /// 因为 `bili-template` 那一节压根没有键表，键名写在正文里。
+    #[test]
+    fn every_real_config_key_is_documented_in_readme() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("读不到 README.md");
+        let region = text
+            .split("\n## 配置\n")
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .expect("README 里没有「## 配置」那一节");
+        let sections = [
+            (
+                SECTION,
+                serde_yaml::to_value(BiliConfig::default()).unwrap(),
+            ),
+            (
+                IMAGE_SECTION,
+                serde_yaml::to_value(ImageConfig::default()).unwrap(),
+            ),
+            (
+                TEMPLATE_SECTION,
+                serde_yaml::to_value(TemplateConfig::default()).unwrap(),
+            ),
+        ];
+        let mut undocumented = Vec::new();
+        let mut counted = 0usize;
+        for (section, value) in sections {
+            let body = readme_section_body(region, section);
+            let mut paths = Vec::new();
+            template_paths(&value, "", &mut paths);
+            // 只问叶子：中间那层映射在文档里就是子键那一串前缀（`command.names` 这种），
+            // 单独要求它自己成一行反而会把父键名当成缺陷。自由映射（模板名那张表）没有子键，
+            // 于是照规则要它自己署名——那是对的，用户得知道往哪个键下面加项。
+            let leaves: Vec<&String> = paths
+                .iter()
+                .filter(|p| !paths.iter().any(|c| c.starts_with(&format!("{p}."))))
+                .collect();
+            counted += leaves.len();
+            for path in leaves {
+                let leaf = path.rsplit('.').next().unwrap_or(path.as_str());
+                if !body.contains(&format!("`{path}`")) && !body.contains(&format!("`{leaf}`")) {
+                    undocumented.push(format!("{section}.{path}"));
+                }
+            }
+        }
+        assert!(
+            counted >= 50,
+            "只数到 {counted} 个配置叶子键，README 那三张表的走法八成被改坏了"
+        );
+        assert!(
+            undocumented.is_empty(),
+            "这些配置键在 README 对应小节里一次都没写过：{undocumented:?}"
         );
     }
 }

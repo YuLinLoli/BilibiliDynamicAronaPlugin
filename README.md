@@ -176,7 +176,8 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 另附 `DrawOnly` / `OneMsg` / `TwoMsg`；直播结束 `SimpleMsg` / `ComplexMsg`。
 两边同名的档位内容一致，改名那一档见「已知差别」第 37 条。
 `defaultDynamicPush` / `defaultLivePush` / `defaultLiveClose` 都指向 `SimpleMsg`。
-表是自己加项的：键名就是 `/bili template` 里写的模板名。
+自己加项那张表按类型分三个键：动态写进 `dynamicPush`、直播写进 `livePush`、直播结束写进 `liveClose`，
+里面的键名就是 `/bili template` 里写的那个模板名。
 
 占位符与原插件一致：
 
@@ -435,6 +436,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    死键（改过名、删过字段）会红；`comment_tables_have_no_duplicate_keys` 查同一路径写两遍——
    第二条永远读不到，那是藏起来的抄错。三头的牙齿都现场验过：临时加一条 `check.nonexistent` 与一条重复项，
    两条新单测各红一次；再把 `admin` 的说明摘掉，前半那条红出 `["bili.admin"]`；改回全绿。
+   2026-10-04 又补上 README 那一头的反方向（`every_real_config_key_is_documented_in_readme`：代码里的叶子键
+   必须在对应区块那一小节里署一次名），它一落地就抓到 `dynamicPush` / `livePush` / `liveClose`
+   那三张自己加项的表在 README 里从来没被点过名——见「端到端自测」里那条。
 5. **一轮检测从「逐 UP」换成原插件那一次关注流——2026-10-03 按 A 做完了**。这条是 2026-10-01 拿原插件 README 的
    「## 特性」逐条回查时挖出来的，也是那张表里唯一一条本插件行为不同的：
    「无论多少订阅均可在最低 10s 内检测所有动态」——原插件那一次不是并发拉每个 UP，是**一次请求拿全部**
@@ -1097,8 +1101,14 @@ JPEG 与 WebP 各 0**；`live404` 那条最小诊断 **5 步全通、可疑 0**�
   [`rendered_template_parses_back_to_the_defaults`](src/config.rs) 是直接拿框架那台渲染器
   （`typed_section::<T>(key).render(...)`）把三块区各生成一份，再要求生成的文本**读回来等于整套默认值**——
   这条钉的是「框架自己生成的配置文件自己读不回来」那一类（带换行的值早先被渲染成块标量，框架侧已修）。
-  这两条都只查一个方向：文档写了却不存在会红，代码里有而文档漏了仍然查不了——那一头归注释表那三条管，
-  而它从 2026-10-03 起是两头咬合的：配置里有键没说明会红（`every_key_the_template_renders_has_a_comment`），
+  这两条查的是「文档 → 代码」那一头，而 2026-10-04 把反方向也补成一条单测：
+  [`every_real_config_key_is_documented_in_readme`](src/config.rs) 按 `###` 标题把 `bili` / `bili-image` /
+  `bili-template` 那三小节各自切出来，要求每个叶子键（点分路径，或它的最后一段）
+  在那一小节的反引号里至少出现一次——中间那层映射跳过，因为文档里它就是子键的前缀；
+  自由映射（`dynamicPush` / `livePush` / `liveClose`）没有子键，所以按规则要它自己署名，
+  **这条一落地就抓到那三张表在 README 里从来没被点过名**（原文只写「表是自己加项的」，读者不知道往哪个键下加），
+  补上键名之后跑绿。牙齿同样现场验过：把 `notifyEnable` 那一行改成 `notifyEnabled` 就报 `["bili.notifyEnable"]`。
+  注释表那一头从 2026-10-03 起是两头咬合的：配置里有键没说明会红（`every_key_the_template_renders_has_a_comment`），
   表里多出一条已经不存在的键也会红（`every_comment_path_is_a_real_key`），
   同一路径写两遍（第二条永远读不到）由 `comment_tables_have_no_duplicate_keys` 管。
 - **任务与类型面**：Kotlin 那 11 个 tasker 的归属——`DynamicCheck`/`LiveCheck`/`LiveCloseCheck` 进
