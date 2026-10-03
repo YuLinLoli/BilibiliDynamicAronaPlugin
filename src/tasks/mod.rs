@@ -341,8 +341,10 @@ async fn per_up_round(
         if fresh.is_empty() {
             continue;
         }
-        // 接口按新→旧给，倒过来推才和读者看到的时间线一致
-        fresh.reverse();
+        // `feed/space` 正是「含置顶动态」那一个接口（原插件 `Dynamic.kt:28` 用 `hasTop` 挑的就是它）：
+        // 置顶那条排在页首、id 却比近期的小，所以最新得按 id 取最大、推送也得按 id 排——
+        // 照页序取的话第一次订阅会把水位压到那条旧动态上，下一轮整页历史就全被当成新的推出去了
+        fresh.sort_by_key(|item| item.id);
         let newest = fresh.last().map(|item| item.id).unwrap_or(watermark);
         if watermark == 0 {
             crate::store().write(|data| data.advance_watermark(uid, newest));
