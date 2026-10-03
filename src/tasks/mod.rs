@@ -8,10 +8,11 @@
 //! * 首次订阅某个 UP 主时只把水位推到最新一条、不推历史，否则一订阅就刷二十条。
 //! * 直播第一次观测就在播也只记状态，不补一条"开播"。
 //! * 番剧的 `ep`/`md` 在命令层就换成 `ss` 号了（`season_by_ep`/`season_by_md`），检测层只见 `ss`。
-//! * 订"全部动态"（`/bili add 0`，原插件的 listenAll）走关注时间线接口，那一个档位要有登录态。
+//! * 有登录态时检测主路径就是关注时间线（一轮一到几页，请求数与订阅人数无关）；没登录态换成逐个 UP 主
+//!   的匿名 `feed/space`。订"全部动态"（`/bili add 0`，原插件的 listenAll）落在通配档 `0`，只有前者能喂它。
 //! * `{draw}` 卡片按目标的配色缓存，同色只画一张。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -40,6 +41,8 @@ use crate::{CACHE_JOB, DYNAMIC_JOB, LIVE_JOB, RESCHEDULE_JOB};
 const RESCHEDULE_EVERY: u64 = 300;
 /// 图片缓存清理的周期。原插件 `CacheClearTasker` 也是 24 小时一轮
 const CACHE_EVERY: u64 = 60 * 60 * 24;
+/// 关注流连着几轮读不出来就临时退回逐 UP（一份坏 Cookie 不该把整个检测弄停）
+const FALLBACK_AFTER: u64 = 3;
 
 static DYNAMIC_BUSY: AtomicBool = AtomicBool::new(false);
 static LIVE_BUSY: AtomicBool = AtomicBool::new(false);
@@ -47,6 +50,8 @@ static SEASON_BUSY: AtomicBool = AtomicBool::new(false);
 /// 上一轮排出去的间隔，低频重排靠它判断"该不该重排"
 static LAST_DYNAMIC_INTERVAL: AtomicU64 = AtomicU64::new(0);
 static LAST_LIVE_INTERVAL: AtomicU64 = AtomicU64::new(0);
+/// 关注流连着几轮读不出来，计数到 [`FALLBACK_AFTER`] 就临时退回逐 UP
+static FIREHOSE_FAILS: AtomicU64 = AtomicU64::new(0);
 /// `--test-notify` 只测一次，配置热重载不能重复推
 static SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
 /// 接口失败的汇报节流点（unix 秒）
@@ -194,7 +199,9 @@ fn reschedule_job(ctx: &PluginContext) -> JobFn {
     })
 }
 
-/// 一轮动态检测：逐个订阅者拉最新几条，过滤、绘图、推送
+/// 一轮动态检测。有登录态就走关注时间线：一轮只打一到几次 `feed/all`，请求数与订阅人数无关
+/// （原插件 `DynamicCheckTasker.kt:38-39` 同一模型）。没登录态留在逐 UP——匿名 `feed/all` 恒 `-101`，
+/// 而匿名 `feed/space` 还出内容，这条路删不得，否则没扫码的人整个检测功能就没了。
 async fn run_dynamic(ctx: PluginContext) {
     let Some(_guard) = Busy::try_lock(&DYNAMIC_BUSY) else {
         arona::runtime::log::debug("bilibili：上一轮动态检测还没跑完，这一轮跳过");
@@ -205,9 +212,108 @@ async fn run_dynamic(ctx: PluginContext) {
         return;
     }
     let appearance = image_of(&ctx);
-    let uids = crate::store().read(|data| data.subscribed_uids());
     let bili = api::client(conf.account.clone(), conf.check.timeout.max(5));
-    for uid in uids {
+    if bili.signed() {
+        // 关注流读不出来的两种退法见 [`Firehose`]：登录失效是定论，立刻退回逐 UP；
+        // 单次故障先计数，连着三轮都读不出来才退——一份坏 Cookie 不该把整个检测弄停，
+        // 可也正因如此，被风控那一轮不该再补 N 次签名接口把情况弄得更糟。
+        let fails = match firehose_round(&ctx, &conf, &bili, &appearance).await {
+            Firehose::Done => {
+                FIREHOSE_FAILS.store(0, Ordering::SeqCst);
+                0
+            }
+            Firehose::Dead => u64::MAX,
+            Firehose::Failed => FIREHOSE_FAILS.fetch_add(1, Ordering::SeqCst) + 1,
+        };
+        if fails >= FALLBACK_AFTER {
+            per_up_round(&ctx, &conf, &bili, &appearance).await;
+        }
+    } else {
+        per_up_round(&ctx, &conf, &bili, &appearance).await;
+    }
+}
+
+/// 一轮关注流的结局，决定要不要退回逐 UP 那一路
+enum Firehose {
+    /// 首页拿到了（页里有没有新动态另说），水位计数清零
+    Done,
+    /// B 站判这份 Cookie 已死（-101 / -30）：关注流往后每轮都会空，立刻退
+    Dead,
+    /// 这一轮没读出来（风控、网络、Cookie 写法不对）：连着三轮才退
+    Failed,
+}
+
+/// 关注流一轮：拉一到几页（什么时候停翻见 `should_fetch_more`），按订阅表分桶，再逐档推。
+/// 订「全部动态」（原插件的 listenAll）也走这一份数据，只是它落在通配档 `0` 上、收所有作者。
+async fn firehose_round(
+    ctx: &PluginContext,
+    conf: &BiliConfig,
+    bili: &Arc<Bili>,
+    appearance: &ImageConfig,
+) -> Firehose {
+    let uids = crate::store().read(|data| data.subscribed_uids());
+    let wants_all = crate::store().read(|data| data.wants_all());
+    if uids.is_empty() && !wants_all {
+        return Firehose::Done;
+    }
+    let marks = watermarks();
+    let mut feed: Vec<Dynamic> = Vec::new();
+    for page in 1..=conf.check.timeline_pages.max(1) {
+        match bili.timeline(page, "all").await {
+            Ok(items) if items.is_empty() => break,
+            Ok(items) => feed.extend(items),
+            Err(reason) => {
+                report(&conf.check, &format!("关注时间线读不出来：{reason}"));
+                // 第一页就没有，这一轮什么都判不了；后面的页翻不动就用已拿到的那些，别把整轮作废
+                if page == 1 {
+                    return if reason.starts_with(api::AUTH_FAILURE) {
+                        Firehose::Dead
+                    } else {
+                        Firehose::Failed
+                    };
+                }
+                break;
+            }
+        }
+        if !should_fetch_more(&feed, &uids, &marks, wants_all) {
+            break;
+        }
+    }
+    if feed.is_empty() {
+        return Firehose::Done;
+    }
+    let plan = plan_round(&feed, &uids, &marks, wants_all);
+    for (slot, newest) in &plan.align {
+        crate::store().edit_only(|data| data.advance_watermark(*slot, *newest));
+        arona::runtime::log::info(if *slot == 0 {
+            "bilibili：关注时间线第一次跑，历史动态不推，水位已对齐最新一条".to_string()
+        } else {
+            format!("bilibili：{slot} 是第一次订阅，历史动态不推，水位已对齐最新一条")
+        });
+    }
+    if !plan.align.is_empty() {
+        save(&conf.check);
+    }
+    for (slot, dynamics) in &plan.fresh {
+        let targets = states_of(*slot);
+        if targets.is_empty() {
+            continue;
+        }
+        for dynamic in dynamics {
+            push_one(ctx, conf, bili, appearance, *slot, dynamic, &targets).await;
+        }
+    }
+    Firehose::Done
+}
+
+/// 逐 UP 那一轮（只在没有登录态时用）：每个订阅者各拉一次匿名 `feed/space`
+async fn per_up_round(
+    ctx: &PluginContext,
+    conf: &BiliConfig,
+    bili: &Arc<Bili>,
+    appearance: &ImageConfig,
+) {
+    for uid in crate::store().read(|data| data.subscribed_uids()) {
         let targets = states_of(uid);
         if targets.is_empty() {
             continue;
@@ -246,49 +352,95 @@ async fn run_dynamic(ctx: PluginContext) {
             continue;
         }
         for dynamic in &fresh {
-            push_one(&ctx, &conf, &bili, &appearance, uid, dynamic, &targets).await;
+            push_one(ctx, conf, bili, appearance, uid, dynamic, &targets).await;
         }
-    }
-    // 关注时间线那一路：有人订了"全部动态"（原插件的 listenAll）才拉，要有登录态
-    if bili.signed() && crate::store().read(|data| data.wants_all()) {
-        timeline_round(&ctx, &conf, &bili, &appearance).await;
     }
 }
 
-/// 时间线一轮：把 `0` 这个通配档位下的新动态推给订了它的目标
-async fn timeline_round(
-    ctx: &PluginContext,
-    conf: &BiliConfig,
-    bili: &Arc<Bili>,
-    appearance: &ImageConfig,
-) {
-    let items = match bili.timeline(1, "all").await {
-        Ok(items) => items,
-        Err(reason) => {
-            report(&conf.check, &format!("关注时间线读不出来：{reason}"));
-            return;
+/// 各档位当前水位。通配档 `0` 是「全部动态」那一条，键是 uid 的十进制串，解不开的就当没有
+fn watermarks() -> BTreeMap<i64, i64> {
+    crate::store().read(|data| {
+        data.watermark
+            .iter()
+            .filter_map(|(key, id)| key.parse::<i64>().ok().map(|slot| (slot, *id)))
+            .collect::<BTreeMap<i64, i64>>()
+    })
+}
+
+/// 一轮关注流的分桶结果
+#[derive(Clone, Debug, Default)]
+struct Plan {
+    /// 档位 -> 这一轮要推的新动态（旧→新，跟读者看到的时间线一致）
+    fresh: BTreeMap<i64, Vec<Dynamic>>,
+    /// 水位还是 0 的档位 -> 页里见到的最新一条：只把水位推上去，不推历史
+    align: BTreeMap<i64, i64>,
+}
+
+/// 把关注流按订阅表分成「每个档位这一轮的新动态」。纯函数，不碰 ctx，也不碰 store。
+///
+/// `items` 是各页拼接后的原样顺序（页内新→旧，页间可能重叠），先按 id 去重再分桶，
+/// 于是这里不依赖接口给的顺序：新鲜与否只看 `id > 水位`。
+fn plan_round(
+    items: &[Dynamic],
+    uids: &[i64],
+    marks: &BTreeMap<i64, i64>,
+    wants_all: bool,
+) -> Plan {
+    let mut seen = BTreeSet::new();
+    let feed: Vec<&Dynamic> = items.iter().filter(|item| seen.insert(item.id)).collect();
+    let mut slots: Vec<i64> = uids.to_vec();
+    if wants_all {
+        slots.push(0);
+    }
+    let mut plan = Plan::default();
+    for slot in slots {
+        // 通配档 `0` 收所有作者，按 UP 主订阅的那一档只看这个 uid
+        let own: Vec<Dynamic> = feed
+            .iter()
+            .filter(|item| slot == 0 || item.uid == slot)
+            .map(|item| (*item).clone())
+            .collect();
+        let watermark = marks.get(&slot).copied().unwrap_or_default();
+        if watermark == 0 {
+            // 第一次见到这一档：只对齐水位，不然一订阅就把页里那几条历史全推一遍
+            if let Some(newest) = own.iter().map(|item| item.id).max() {
+                plan.align.insert(slot, newest);
+            }
+            continue;
         }
+        let mut fresh: Vec<Dynamic> = own.into_iter().filter(|item| item.id > watermark).collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        fresh.sort_by_key(|item| item.id);
+        plan.fresh.insert(slot, fresh);
+    }
+    plan
+}
+
+/// 这一页之后还要不要往下翻：页里最旧一条已经压到所有已知水位之下，再老的动态对谁都不算新了。
+/// 全是第一次订阅（一个已知水位都没有）时也不翻——那一轮只对齐水位，多翻只是多打接口。
+fn should_fetch_more(
+    items: &[Dynamic],
+    uids: &[i64],
+    marks: &BTreeMap<i64, i64>,
+    wants_all: bool,
+) -> bool {
+    let Some(oldest) = items.iter().map(|item| item.id).min() else {
+        return false;
     };
-    let watermark =
-        crate::store().read(|data| data.watermark.get("0").copied().unwrap_or_default());
-    let mut fresh: Vec<Dynamic> = items
-        .into_iter()
-        .filter(|item| item.id > watermark)
+    let mut floors: Vec<i64> = uids
+        .iter()
+        .filter_map(|uid| marks.get(uid))
+        .filter(|&&mark| mark > 0)
+        .copied()
         .collect();
-    if fresh.is_empty() {
-        return;
+    if wants_all {
+        floors.extend(marks.get(&0).filter(|&&mark| mark > 0).copied());
     }
-    fresh.reverse();
-    let newest = fresh.last().map(|item| item.id).unwrap_or(watermark);
-    if watermark == 0 {
-        // 第一次开这条：只对齐水位，不然一上来就把时间线首页二十条全推一遍
-        crate::store().write(|data| data.advance_watermark(0, newest));
-        arona::runtime::log::info("bilibili：关注时间线第一次跑，历史动态不推，水位已对齐最新一条");
-        return;
-    }
-    let targets = states_of(0);
-    for dynamic in &fresh {
-        push_one(ctx, conf, bili, appearance, 0, dynamic, &targets).await;
+    match floors.into_iter().min() {
+        Some(floor) => oldest > floor,
+        None => false,
     }
 }
 
@@ -1210,12 +1362,132 @@ mod tests {
 
     fn check(low_speed: &str) -> CheckConfig {
         CheckConfig {
-            interval: 30,
-            live_interval: 15,
             low_speed: low_speed.to_string(),
-            report_interval: 0,
-            timeout: 20,
+            ..Default::default()
         }
+    }
+
+    fn dynamic(uid: i64, id: i64) -> Dynamic {
+        Dynamic {
+            uid,
+            id,
+            ..Default::default()
+        }
+    }
+
+    fn marks(rows: &[(i64, i64)]) -> BTreeMap<i64, i64> {
+        rows.iter().copied().collect()
+    }
+
+    #[test]
+    fn one_firehose_page_is_bucketed_per_subscriber() {
+        // 页里有三个 UP：1 和 2 有人订，3 没人订；没人订的那些只可能从通配档 `0` 出去
+        let feed = [
+            dynamic(3, 300),
+            dynamic(1, 210),
+            dynamic(2, 205),
+            dynamic(1, 200),
+            dynamic(1, 100),
+        ];
+        let plan = plan_round(
+            &feed,
+            &[1, 2],
+            &marks(&[(1, 200), (2, 100), (0, 150)]),
+            true,
+        );
+        // 水位 200 那条本身不算新（`>` 而非 `>=`），只剩 210
+        assert_eq!(ids(&plan, 1), vec![210]);
+        assert_eq!(ids(&plan, 2), vec![205]);
+        // 通配档收所有作者，按 id 旧→新排（推送顺序要跟读者看到的时间线一致）。
+        // 1 那条 200 在这里出现却不从档位 1 出去：两档各查各的水位（0 是 150，1 是 200）。
+        assert_eq!(ids(&plan, 0), vec![200, 205, 210, 300]);
+        assert!(plan.align.is_empty(), "三档都有水位，不该有对齐");
+    }
+
+    #[test]
+    fn a_slot_that_has_never_been_seen_only_aligns() {
+        // 第一次订阅：只把水位推到页里见到的最新一条，历史一条都不推
+        let feed = [dynamic(7, 500), dynamic(7, 400), dynamic(8, 300)];
+        let plan = plan_round(&feed, &[7, 8], &marks(&[(8, 250)]), false);
+        assert_eq!(
+            plan.align.get(&7),
+            Some(&500),
+            "7 没见过，水位该对齐到它最新的一条"
+        );
+        assert!(
+            ids(&plan, 7).is_empty(),
+            "第一次见到就把历史全推出去，等于一订阅就刷屏"
+        );
+        assert_eq!(ids(&plan, 8), vec![300]);
+        assert!(!plan.fresh.contains_key(&7));
+    }
+
+    #[test]
+    fn the_wildcard_slot_aligns_on_its_own() {
+        // 「全部动态」第一次跑：整页二十条都不该推，只对齐
+        let feed = [dynamic(1, 900), dynamic(2, 800)];
+        let plan = plan_round(&feed, &[1], &marks(&[(1, 100)]), true);
+        assert_eq!(plan.align.get(&0), Some(&900));
+        assert!(!plan.fresh.contains_key(&0));
+        assert!(!plan.align.contains_key(&1), "1 有水位，走的是推送那一支");
+    }
+
+    #[test]
+    fn overlapping_pages_are_merged_by_id() {
+        // 翻页时两页之间又发了动态，拼接处会重复同一 id：去重，只推一次
+        let feed = [
+            dynamic(1, 200),
+            dynamic(1, 190),
+            dynamic(1, 190),
+            dynamic(1, 180),
+        ];
+        let plan = plan_round(&feed, &[1], &marks(&[(1, 100)]), false);
+        assert_eq!(ids(&plan, 1), vec![180, 190, 200]);
+    }
+
+    #[test]
+    fn paging_stops_once_the_page_drops_below_every_watermark() {
+        let feed = [dynamic(1, 300), dynamic(2, 200)];
+        // 页里最旧 200 还高于最低水位 150，说明更老的页里可能还有没见过的
+        assert!(should_fetch_more(
+            &feed,
+            &[1, 2],
+            &marks(&[(1, 150), (2, 150)]),
+            false
+        ));
+        // 已经压到最低水位之下：再老的动态对谁都不算新，翻下去只是多打接口
+        assert!(!should_fetch_more(
+            &feed,
+            &[1, 2],
+            &marks(&[(1, 200), (2, 250)]),
+            false
+        ));
+        // 通配档的水位也算数：它订的是所有作者，压不到它底下就不能翻
+        assert!(should_fetch_more(
+            &feed,
+            &[1],
+            &marks(&[(1, 250), (0, 100)]),
+            true
+        ));
+        assert!(!should_fetch_more(
+            &feed,
+            &[1],
+            &marks(&[(1, 250), (0, 200)]),
+            true
+        ));
+        // 全是第一次订阅（一个已知水位都没有）：那一轮只对齐，翻页白翻
+        assert!(!should_fetch_more(&feed, &[1, 2], &marks(&[]), false));
+        assert!(
+            !should_fetch_more(&[], &[1], &marks(&[(1, 1)]), false),
+            "空页没什么可翻的"
+        );
+    }
+
+    fn ids(plan: &Plan, slot: i64) -> Vec<i64> {
+        plan.fresh
+            .get(&slot)
+            .map(|rows| rows.iter().map(|item| item.id).collect())
+            .unwrap_or_default()
     }
 
     #[test]

@@ -738,6 +738,10 @@ fn cookie_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// 「登录失效」那一句的行头。检测任务要靠它认出「这份 Cookie 已经死了」，
+/// 所以文案与判据共用这一个常量——改了字面串，那边跟着变，不会悄悄失配。
+pub const AUTH_FAILURE: &str = "账号登录失效";
+
 /// B 站的业务信封：code != 0 一律算失败，-101 单独给一句能照着做的话
 fn unwrap_envelope(value: Value) -> Result<Value, String> {
     let code = value.get("code").and_then(Value::as_i64).unwrap_or(0);
@@ -756,7 +760,7 @@ fn unwrap_envelope(value: Value) -> Result<Value, String> {
         .unwrap_or("无提示");
     if code == -101 || code == -30 {
         return Err(format!(
-            "账号登录失效（code {code}），请用 /bili login 重新扫码登录"
+            "{AUTH_FAILURE}（code {code}），请用 /bili login 重新扫码登录"
         ));
     }
     if code == -403 || code == -352 {
@@ -925,6 +929,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(reason.contains("/bili login"), "{reason}");
+        // 检测任务按这个行头认出「Cookie 死了」并退回逐 UP，文案改前面得先过这一关
+        assert!(reason.starts_with(AUTH_FAILURE), "{reason}");
     }
 
     #[test]
