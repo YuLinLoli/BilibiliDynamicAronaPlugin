@@ -102,13 +102,19 @@ pub(crate) async fn add(call: &Call) -> Reply {
         return reply("之前订阅过这个人哦");
     }
     let bili = call.bili();
+    let relation = if uid == 0 {
+        // 通配位没有"这个人"可查关系，下面那半句提示也不看它
+        Relation::Unconfirmed
+    } else {
+        match relation_guard(call, &bili, uid).await {
+            Ok(state) => state,
+            Err(reason) => return reply(reason),
+        }
+    };
     let name = if uid == 0 {
         // 通配位：原插件的 listenAll，推的是这个账号关注时间线里的全部动态
         "全部动态".to_string()
     } else {
-        if let Err(reason) = relation_guard(call, &bili, uid).await {
-            return reply(reason);
-        }
         match bili.user(uid).await {
             Ok(brief) => brief.name,
             Err(reason) => {
@@ -129,7 +135,7 @@ pub(crate) async fn add(call: &Call) -> Reply {
     let hint = if uid == 0 {
         wildcard_hint(bili.signed())
     } else {
-        ""
+        follow_hint(bili.signed(), relation)
     };
     reply(format!("{}订阅 {name} 成功!{hint}", targets.grant()))
 }
@@ -149,6 +155,28 @@ fn wildcard_hint(signed: bool) -> &'static str {
     }
 }
 
+/// 关注关系那一关放行时到底确认到了什么
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Relation {
+    /// 这一轮真把这个人加进了关注列表
+    Confirmed,
+    /// 只是没被拦住：`attribute` 不是 0/128 所以放行，或者关系根本查不出来
+    Unconfirmed,
+}
+
+/// 有登录态时检测走关注时间线，那份只覆盖这个账号**已关注**的人，所以「放行了却没确认到」这一档
+/// 同样可能是「订上了、每一轮都 0 条」——形状与上面那句通配档一样，只是它不必然是坏的。
+///
+/// 文案只说「没确认到」，不说「你没关注」：`attribute` 的取值表这边没实测过（原插件 `Follow.kt` 那份
+/// 注释给的是 0 未关注 / 2 已关注 / 6 已互粉 / 128 拉黑），代码里除了 0 与 128 都不判方向。
+fn follow_hint(signed: bool, relation: Relation) -> &'static str {
+    if !signed || relation == Relation::Confirmed {
+        return "";
+    }
+    "（没确认到这个账号已经关注他，而登录态下的检测只看关注时间线；\
+     真没关注就一条都不会推——先关注，或把 account.autoFollow 打开）"
+}
+
 /// 这个 uid 在这批目标上订过没有
 fn already(targets: &Targets, uid: i64) -> bool {
     crate::store().read(|data| data.is_subscribed(&targets.keys, targets.cluster.as_deref(), uid))
@@ -158,9 +186,14 @@ fn already(targets: &Targets, uid: i64) -> bool {
 ///
 /// 返回 `Err` 表示这条订阅不该继续。查关系本身失败只记日志——
 /// B 站的 `-412` 之类风控不该让用户以为"订阅功能坏了"。
-async fn relation_guard(call: &Call, bili: &Bili, uid: i64) -> Result<(), String> {
-    if !bili.signed() || bili.uid() == uid {
-        return Ok(());
+/// 放行不等于确认，所以成功的一面带出 `Relation`，由调用方决定要不要多说那半句。
+async fn relation_guard(call: &Call, bili: &Bili, uid: i64) -> Result<Relation, String> {
+    if bili.uid() == uid {
+        // 订的是本账号自己，关注关系这一问没有对象
+        return Ok(Relation::Confirmed);
+    }
+    if !bili.signed() {
+        return Ok(Relation::Unconfirmed);
     }
     let account = &call.conf().account;
     match bili.relation(uid).await {
@@ -177,15 +210,15 @@ async fn relation_guard(call: &Call, bili: &Bili, uid: i64) -> Result<(), String
                 arona::runtime::log::warning(format!("bilibili：移动分组失败：{reason}"));
             }
             arona::runtime::log::info(format!("bilibili：账号已关注 {uid}"));
-            Ok(())
+            Ok(Relation::Confirmed)
         }
         Ok(128) => Err("此账号已被拉黑".to_string()),
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(Relation::Unconfirmed),
         Err(reason) => {
             arona::runtime::log::warning(format!(
                 "bilibili：{uid} 的关注关系查不出来（{reason}），订阅照旧"
             ));
-            Ok(())
+            Ok(Relation::Unconfirmed)
         }
     }
 }
@@ -536,5 +569,27 @@ mod tests {
         );
         assert!(hint.contains("/bili login"), "匿名那句要给出口：{hint}");
         assert_eq!(wildcard_hint(true), "", "有登录态时不该多这一句");
+    }
+
+    /// 有登录态、而关注关系那一关只是"没被拦住"时，那句成功也得把「可能一条都不推」说出来；
+    /// 真确认到了、或根本没有登录态（那时走逐 UP，照常推），都不许多说这一句。
+    #[test]
+    fn an_unconfirmed_follow_says_so_only_when_signed() {
+        let hint = follow_hint(true, Relation::Unconfirmed);
+        assert!(
+            hint.contains("没确认到"),
+            "别写成「你没关注」那种带方向的断言：{hint}"
+        );
+        assert!(hint.contains("autoFollow"), "要给出口：{hint}");
+        assert_eq!(
+            follow_hint(true, Relation::Confirmed),
+            "",
+            "确认到了就不许多话"
+        );
+        assert_eq!(
+            follow_hint(false, Relation::Unconfirmed),
+            "",
+            "匿名走逐 UP 那条路，照常推，不该吓唬人"
+        );
     }
 }
