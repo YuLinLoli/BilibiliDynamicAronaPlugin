@@ -272,7 +272,9 @@ const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// 而实现端对 WebP 的支持并不齐。编码不能跟着运气走。
 /// 已经是 PNG 的原样交出去（自己画的卡片都在这一支，不必重编码）；
 /// 解不开也交原件——宁可编码不合口味，也好过整条推送少一张图。
-/// 动图只留第一帧：素材在解码那一步就已经是静态的了，附件这一路不再单开一支。
+/// 动图走的是后者，而且是故意留的：`image` 这边只装了 png/jpeg/webp 三个解码器，GIF 到
+/// `load_from_memory` 那一步就 Err，于是原字节交出去、动画保住。真要连它一起统一成 PNG
+/// 得加 gif feature，那是把动图压成第一帧，功能倒退。
 pub(crate) fn attachment(bytes: Vec<u8>) -> Vec<u8> {
     if bytes.starts_with(PNG_MAGIC) {
         return bytes;
@@ -338,6 +340,33 @@ mod tests {
             attachment(junk.clone()),
             junk,
             "解不开的也该交原件，别把图片段清空"
+        );
+    }
+
+    /// 一份最小的真 GIF：魔数 + 逻辑屏幕描述符 + 一个图像块 + trailer
+    fn gif() -> Vec<u8> {
+        let mut v = b"GIF89a".to_vec();
+        v.extend_from_slice(&[3, 0, 2, 0, 0, 0, 0]);
+        v.extend_from_slice(&[0x2C, 0, 0, 0, 0, 3, 0, 2, 0, 0x00]);
+        v.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]);
+        v.push(0x3B);
+        v
+    }
+
+    /// 动图原样交这条钉子。前半先确言「这份样例现在解不开」——`Cargo.toml` 没给 `image` 装 gif 解码器，
+    /// 所以 GIF 走的是「解不开交原件」那一支，动画保住。哪天有人把 `gif` feature 加上，
+    /// 前半会红，逼着他显式决定「要不要把动图压成第一帧」，而不是让转码悄悄吃掉动画。
+    #[test]
+    fn a_gif_stays_untouched_because_there_is_no_gif_decoder() {
+        let raw = gif();
+        assert!(
+            image::load_from_memory(&raw).is_err(),
+            "这份 GIF 现在能被解开了——解码器加上了，动图会被压成第一帧，得显式决定"
+        );
+        assert_eq!(
+            attachment(raw.clone()),
+            raw,
+            "动图被改写了，它本该原样交出去"
         );
     }
 }
