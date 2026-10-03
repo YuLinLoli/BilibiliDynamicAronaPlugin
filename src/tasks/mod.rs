@@ -285,11 +285,14 @@ async fn firehose_round(
     let plan = plan_round(&feed, &uids, &marks, wants_all);
     for (slot, newest) in &plan.align {
         crate::store().edit_only(|data| data.advance_watermark(*slot, *newest));
-        arona::runtime::log::info(if *slot == 0 {
-            "bilibili：关注时间线第一次跑，历史动态不推，水位已对齐最新一条".to_string()
+        let who = if *slot == 0 {
+            "关注时间线第一次跑".to_string()
         } else {
-            format!("bilibili：{slot} 是第一次订阅，历史动态不推，水位已对齐最新一条")
-        });
+            format!("{slot} 是第一次订阅")
+        };
+        arona::runtime::log::info(format!(
+            "bilibili：{who}，历史动态不推，水位已对齐到 {newest}"
+        ));
     }
     if !plan.align.is_empty() {
         save(&conf.check);
@@ -334,22 +337,15 @@ async fn per_up_round(
                 .copied()
                 .unwrap_or_default()
         });
-        let mut fresh: Vec<Dynamic> = items
-            .into_iter()
-            .filter(|item| item.id > watermark)
-            .collect();
-        if fresh.is_empty() {
+        let Some((fresh, newest)) = pick_fresh(items, watermark) else {
             continue;
-        }
-        // `feed/space` 正是「含置顶动态」那一个接口（原插件 `Dynamic.kt:28` 用 `hasTop` 挑的就是它）：
-        // 置顶那条排在页首、id 却比近期的小，所以最新得按 id 取最大、推送也得按 id 排——
-        // 照页序取的话第一次订阅会把水位压到那条旧动态上，下一轮整页历史就全被当成新的推出去了
-        fresh.sort_by_key(|item| item.id);
-        let newest = fresh.last().map(|item| item.id).unwrap_or(watermark);
+        };
         if watermark == 0 {
             crate::store().write(|data| data.advance_watermark(uid, newest));
+            // 把写进去的那条 id 念出来：这一档之后几轮会不会重推历史，全看这一个值，
+            // 不念出来就只能靠 `store.yml` 的终态倒推，而终态分不清「对齐写的」还是「推送顶的」
             arona::runtime::log::info(format!(
-                "bilibili：{uid} 是第一次订阅，历史动态不推，水位已对齐最新一条"
+                "bilibili：{uid} 是第一次订阅，历史动态不推，水位已对齐到 {newest}"
             ));
             continue;
         }
@@ -357,6 +353,26 @@ async fn per_up_round(
             push_one(ctx, conf, bili, appearance, uid, dynamic, &targets).await;
         }
     }
+}
+
+/// 从一页动态里挑出比水位新的那些，并给出这一页里最新一条的 id（对齐就用它）。逐 UP 与关注流两条路共用
+///
+/// 手里的顺序一律不信：`per_up_round` 那份是 `parse_feed` 按 `time` **升序**排过的（`model.rs:668`），
+/// 关注流那份是多页拼接加去重，谁都不是「接口给的页序」。旧代码以为前者还是新→旧，`reverse()` 之后取 `last()`
+/// 当最新，实际拿到的是**最旧**那条——水位钉在最旧动态上，下一轮整页历史就全被当成新的推出去（2026-10-03，
+/// 实测 12 条的页重推出 11 条）。所以这里显式按 id 排序取 `last()`，返回的 `fresh` 也是旧→新，
+/// 推出来才和读者看到的时间线一致。
+fn pick_fresh(items: Vec<Dynamic>, watermark: i64) -> Option<(Vec<Dynamic>, i64)> {
+    let mut fresh: Vec<Dynamic> = items
+        .into_iter()
+        .filter(|item| item.id > watermark)
+        .collect();
+    if fresh.is_empty() {
+        return None;
+    }
+    fresh.sort_by_key(|item| item.id);
+    let newest = fresh.last().map(|item| item.id).unwrap_or(watermark);
+    Some((fresh, newest))
 }
 
 /// 各档位当前水位。通配档 `0` 是「全部动态」那一条，键是 uid 的十进制串，解不开的就当没有
@@ -403,18 +419,14 @@ fn plan_round(
             .map(|item| (*item).clone())
             .collect();
         let watermark = marks.get(&slot).copied().unwrap_or_default();
+        let Some((fresh, newest)) = pick_fresh(own, watermark) else {
+            continue;
+        };
         if watermark == 0 {
             // 第一次见到这一档：只对齐水位，不然一订阅就把页里那几条历史全推一遍
-            if let Some(newest) = own.iter().map(|item| item.id).max() {
-                plan.align.insert(slot, newest);
-            }
+            plan.align.insert(slot, newest);
             continue;
         }
-        let mut fresh: Vec<Dynamic> = own.into_iter().filter(|item| item.id > watermark).collect();
-        if fresh.is_empty() {
-            continue;
-        }
-        fresh.sort_by_key(|item| item.id);
         plan.fresh.insert(slot, fresh);
     }
     plan
@@ -1483,6 +1495,49 @@ mod tests {
             !should_fetch_more(&[], &[1], &marks(&[(1, 1)]), false),
             "空页没什么可翻的"
         );
+    }
+
+    /// 顺序只能由 `pick_fresh` 自己定：`parse_feed` 交出来的是按 `time` 升序那份，接口页序又不保证什么。
+    /// 这条把「任何输入顺序都取到页里最大的 id、推送都是旧→新」钉死——不打接口，也就绕开匿名空页那个抖动。
+    #[test]
+    fn pick_fresh_reads_the_page_by_id_whatever_order_it_comes_in() {
+        // 最旧那条摆第一个，正是 `parse_feed` 排完之后逐 UP 那一页的形状
+        let oldest_first = vec![
+            dynamic(1, 100),
+            dynamic(1, 900),
+            dynamic(1, 800),
+            dynamic(1, 200),
+        ];
+        let (fresh, newest) = pick_fresh(oldest_first, 0).expect("水位 0 时整页都算新");
+        assert_eq!(newest, 900, "对齐该钉在页里 id 最大的那条，不是第一个");
+        assert_eq!(ids_of(&fresh), vec![100, 200, 800, 900], "推出去要按旧→新");
+
+        // 同一页轮转四个起点，取到的最大 id 与推送顺序都不能变
+        let mut page = vec![
+            dynamic(1, 900),
+            dynamic(1, 100),
+            dynamic(1, 800),
+            dynamic(1, 200),
+        ];
+        for shift in 0..4 {
+            page.rotate_left(1);
+            let (fresh, newest) = pick_fresh(page.clone(), 150).expect("200 以上还有三条");
+            assert_eq!(newest, 900, "第 {shift} 种页序取到的最大 id 不同");
+            assert_eq!(ids_of(&fresh), vec![200, 800, 900]);
+        }
+    }
+
+    #[test]
+    fn a_page_wholly_at_or_below_the_watermark_is_not_fresh() {
+        // 水位那条本身不算新（`>` 而非 `>=`）；整页都不新就返回 None，这一轮什么都不做
+        assert!(pick_fresh(vec![dynamic(1, 200), dynamic(1, 100)], 200).is_none());
+        let (fresh, newest) = pick_fresh(vec![dynamic(1, 300), dynamic(1, 200)], 200).unwrap();
+        assert_eq!(ids_of(&fresh), vec![300]);
+        assert_eq!(newest, 300);
+    }
+
+    fn ids_of(items: &[Dynamic]) -> Vec<i64> {
+        items.iter().map(|item| item.id).collect()
     }
 
     fn ids(plan: &Plan, slot: i64) -> Vec<i64> {
