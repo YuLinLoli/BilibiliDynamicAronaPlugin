@@ -84,75 +84,138 @@ impl PluginConfig for BiliConfig {
          命令与配置都不依赖任何前置插件。";
 
     fn comment(path: &str) -> Option<&'static str> {
-        Some(match path {
-            "enable" => "总开关：关掉后检测任务不再推送，命令仍然可用",
-            "admin" => "框架管理员之外的额外管理员，写 QQ 号或群号",
-            "notifyEnable" => {
-                "别人（不在 admin 里的人）动了订阅/分组/模板/过滤/@全体 时，\
-                 是否给每个管理员发一条私聊通报\n关掉就只在日志里记"
-            }
-            "showLoadingMessage" => {
-                "慢命令（搜索、最新动态、最新视频）是否先发一条「加载中…」，\n出结果后撤回\n\
-                 模板列表不挂这一档：它用假数据渲染，占位一条只会闪一下"
-            }
-            "command" | "command.names" => {
-                "主命令名与别名，必须带前缀\n多个名字都指向同一棵子命令树\n改名要重启才生效"
-            }
-            "command.prefixFree" => "群聊里是否允许不带前缀直接发（默认要 @机器人 或带 /）",
-            "account" => {
-                "B 站账号 Cookie\n手填写法: SESSDATA=xxx; bili_jct=yyy\n留空也能起：插件会自己去取匿名设备指纹，\
-                 订阅检测/番剧/开播/链接解析都不必登录；只有关注时间线、自动关注与分组才要扫码"
-            }
-            "account.cookie" => "完整 Cookie 串；/bili login 扫码成功后框架会把它写回这里",
-            "account.uid" => "本 Cookie 所属的 B 站 uid，扫码登录会自动填；手填也行",
-            "account.csrf" => "bili_jct，改关系（关注/加组）时要用；留空时从 cookie 里自动解析",
-            "account.autoFollow" => "添加订阅时顺手关注这个 UP",
-            "account.followGroup" => "自动关注时把对方归到哪个 B 站分组（最长 16 字符）",
-            "check" => "检测节奏",
-            "check.interval" => "动态检测间隔(秒)，推荐 15-60",
-            "check.liveInterval" => "直播检测间隔(秒)",
-            "check.lowSpeed" => {
-                "低频时段，例 3-8x2 表示 3 点到 8 点间隔为正常间隔的 2 倍；留空表示全天同速"
-            }
-            "check.reportInterval" => "接口失败时每隔多少分钟记一条日志，0 表示每次失败都记",
-            "check.timeout" => "单次 B 站请求的超时(秒)",
-            "push" => "推送节流",
-            "push.messageInterval" => "同一个群连续发多条之间的间隔(毫秒)，防风控",
-            "push.pushInterval" => "连续两个目标之间的间隔(毫秒)",
-            "push.atAllPlus" => {
-                "@全体 拼在哪：SINGLE_MESSAGE=单独一条，PLUS_END=追加到最后一条后面"
-            }
-            "push.toShortLink" => "是否把推送里的长链换成短链（依赖第三方，不推荐）",
-            "push.liveCloseNotify" => {
-                "是否在直播结束时发一条结束通知；关掉只记状态，不再向订阅目标播报"
-            }
-            "cache" => "图片缓存",
-            "cache.downloadOriginal" => "是否下载动态里的原图（关了就只画卡片，不缓存原图）",
-            "cache.expires" => {
-                "各类图片多少天没被再用到就清理；0 表示不清。键: DRAW/IMAGES/EMOJI/USER/OTHER"
-            }
-            "proxy" => "代理列表，如 http://127.0.0.1:7890；留空跟随系统环境变量",
-            "translate" => "翻译（给非中文动态补一段译文）",
-            "translate.enable" => "翻译开关",
-            "translate.appId" => "百度翻译开放平台的 APP ID",
-            "translate.securityKey" => "百度翻译的密钥，与 APP ID 成对；留空则不调翻译接口",
-            "translate.cutLine" => "正文与译文之间的分割线",
-            "linkResolve" => {
-                "链接解析：把 B 站视频/专栏/番剧/动态/直播间/用户主页/短链这些地址画成一张卡回回去"
-            }
-            "linkResolve.enable" => "解析开关",
-            "linkResolve.trigger" => {
-                "什么时候才去解析：at=只有 @机器人 的消息才看，always=见消息就试，never=不解析"
-            }
-            "linkResolve.returnLink" => "出图之后是否再补一条原始链接",
-            "linkResolve.patterns" => {
-                "自定义识别式，捕获组一是拿去查详情的 id\n留空表示用内置那七条"
-            }
-            "linkResolve.allow" => "允许解析的域名白名单，留空表示内置那一份",
-            "linkResolve.reject" => "额外禁止的域名",
-            _ => return None,
-        })
+        comment_of(BILI_COMMENTS, path)
     }
+}
+
+/// `bili` 区的注释表：点分路径 → 一句话说明。
+/// 做成可枚举的数组而不是 match 分支，是为了让单测能从两头咬住这张表：
+/// `every_key_the_template_renders_has_a_comment` 查「配置里有键没说明」，
+/// `every_comment_path_is_a_real_key` 查「表里留着配置中已经不存在的死键」。
+/// match 的分支枚举不出来，后半句就一直查不了。
+const BILI_COMMENTS: &[(&str, &str)] = &[
+    ("enable", "总开关：关掉后检测任务不再推送，命令仍然可用"),
+    ("admin", "框架管理员之外的额外管理员，写 QQ 号或群号"),
+    (
+        "notifyEnable",
+        "别人（不在 admin 里的人）动了订阅/分组/模板/过滤/@全体 时，\
+         是否给每个管理员发一条私聊通报\n关掉就只在日志里记",
+    ),
+    (
+        "showLoadingMessage",
+        "慢命令（搜索、最新动态、最新视频）是否先发一条「加载中…」，\n出结果后撤回\n\
+         模板列表不挂这一档：它用假数据渲染，占位一条只会闪一下",
+    ),
+    ("command", COMMAND_DOC),
+    ("command.names", COMMAND_DOC),
+    (
+        "command.prefixFree",
+        "群聊里是否允许不带前缀直接发（默认要 @机器人 或带 /）",
+    ),
+    (
+        "account",
+        "B 站账号 Cookie\n手填写法: SESSDATA=xxx; bili_jct=yyy\n留空也能起：插件会自己去取匿名设备指纹，\
+         订阅检测/番剧/开播/链接解析都不必登录；只有关注时间线、自动关注与分组才要扫码",
+    ),
+    (
+        "account.cookie",
+        "完整 Cookie 串；/bili login 扫码成功后框架会把它写回这里",
+    ),
+    (
+        "account.uid",
+        "本 Cookie 所属的 B 站 uid，扫码登录会自动填；手填也行",
+    ),
+    (
+        "account.csrf",
+        "bili_jct，改关系（关注/加组）时要用；留空时从 cookie 里自动解析",
+    ),
+    ("account.autoFollow", "添加订阅时顺手关注这个 UP"),
+    (
+        "account.followGroup",
+        "自动关注时把对方归到哪个 B 站分组（最长 16 字符）",
+    ),
+    ("check", "检测节奏"),
+    ("check.interval", "动态检测间隔(秒)，推荐 15-60"),
+    ("check.liveInterval", "直播检测间隔(秒)"),
+    (
+        "check.lowSpeed",
+        "低频时段，例 3-8x2 表示 3 点到 8 点间隔为正常间隔的 2 倍；留空表示全天同速",
+    ),
+    (
+        "check.reportInterval",
+        "接口失败时每隔多少分钟记一条日志，0 表示每次失败都记",
+    ),
+    ("check.timeout", "单次 B 站请求的超时(秒)"),
+    ("push", "推送节流"),
+    (
+        "push.messageInterval",
+        "同一个群连续发多条之间的间隔(毫秒)，防风控",
+    ),
+    ("push.pushInterval", "连续两个目标之间的间隔(毫秒)"),
+    (
+        "push.atAllPlus",
+        "@全体 拼在哪：SINGLE_MESSAGE=单独一条，PLUS_END=追加到最后一条后面",
+    ),
+    (
+        "push.toShortLink",
+        "是否把推送里的长链换成短链（依赖第三方，不推荐）",
+    ),
+    (
+        "push.liveCloseNotify",
+        "是否在直播结束时发一条结束通知；关掉只记状态，不再向订阅目标播报",
+    ),
+    ("cache", "图片缓存"),
+    (
+        "cache.downloadOriginal",
+        "是否下载动态里的原图（关了就只画卡片，不缓存原图）",
+    ),
+    (
+        "cache.expires",
+        "各类图片多少天没被再用到就清理；0 表示不清。键: DRAW/IMAGES/EMOJI/USER/OTHER",
+    ),
+    (
+        "proxy",
+        "代理列表，如 http://127.0.0.1:7890；留空跟随系统环境变量",
+    ),
+    ("translate", "翻译（给非中文动态补一段译文）"),
+    ("translate.enable", "翻译开关"),
+    ("translate.appId", "百度翻译开放平台的 APP ID"),
+    (
+        "translate.securityKey",
+        "百度翻译的密钥，与 APP ID 成对；留空则不调翻译接口",
+    ),
+    ("translate.cutLine", "正文与译文之间的分割线"),
+    (
+        "linkResolve",
+        "链接解析：把 B 站视频/专栏/番剧/动态/直播间/用户主页/短链这些地址画成一张卡回回去",
+    ),
+    ("linkResolve.enable", "解析开关"),
+    (
+        "linkResolve.trigger",
+        "什么时候才去解析：at=只有 @机器人 的消息才看，always=见消息就试，never=不解析",
+    ),
+    ("linkResolve.returnLink", "出图之后是否再补一条原始链接"),
+    (
+        "linkResolve.patterns",
+        "自定义识别式，捕获组一是拿去查详情的 id\n留空表示用内置那七条",
+    ),
+    (
+        "linkResolve.allow",
+        "允许解析的域名白名单，留空表示内置那一份",
+    ),
+    ("linkResolve.reject", "额外禁止的域名"),
+];
+
+/// `command` 那一档在渲染时会被问到两次（表本身与它的 `names` 子键），说明是同一句
+const COMMAND_DOC: &str =
+    "主命令名与别名，必须带前缀\n多个名字都指向同一棵子命令树\n改名要重启才生效";
+
+/// 注释表按点分路径查。三张表都只有几十条，线性扫够用
+fn comment_of(table: &[(&str, &'static str)], path: &str) -> Option<&'static str> {
+    table
+        .iter()
+        .find(|(key, _)| *key == path)
+        .map(|(_, text)| *text)
 }
 
 /// 命令名：改这里等于改 `/bili` 这一棵树的名字。
@@ -450,42 +513,54 @@ impl PluginConfig for ImageConfig {
          某个订阅想要别的配色，用 /bili color 单独设置，不必动这里。";
 
     fn comment(path: &str) -> Option<&'static str> {
-        Some(match path {
-            "quality" => "图片宽度档位：800w / 1000w / 1200w / 1500w",
-            "theme" => "绘图主题：v3 / v3RainbowOutline / v2",
-            "font" => {
-                "字体名或字体文件名(不用加后缀)，放到 config/bilibili/font/ 下；留空自动找系统中文字体"
-            }
-            "defaultColor" => {
-                "默认主题色，支持多个值自定义渐变，中间用分号分隔，例: #fde8ed;#fde8ed；单个值会自动生成渐变色"
-            }
-            "cardOrnament" => {
-                "卡片装饰：QrCode(右下角画动态链接二维码) / None(不装饰)。FanCard(粉丝勋章) 这一档当前\
-                 不出效果——插件没铺 B 站的勋章数据，填了等同 None"
-            }
-            "badgeEnable" => "卡片顶部的标签，左右两档各一个开关",
-            "badgeEnable.left" => "左边那一档：动态类型（直播卡是分区）那枚标签",
-            "badgeEnable.right" => "右边那一档：动态 id（直播卡是房间号）",
-            "drawEnable" => {
-                "绘图总开关：关掉之后动态与直播推送只发模板文本，一张卡都不画\
-                 （原插件同样只管这两条推送路径，命令的「先看一眼」和链接解析不受它管）"
-            }
-            "colorGenerator" | "colorGenerator.hueStep" => {
-                "渐变色生成器（仅当主题色只给了一个值时生效）"
-            }
-            "colorGenerator.lockSB" => "锁定饱和度与亮度",
-            "colorGenerator.saturation" => "锁定的饱和度 0.0-1.0",
-            "colorGenerator.brightness" => "锁定的亮度 0.0-1.0",
-            "footer" => "图片页脚",
-            "footer.dynamicFooter" => {
-                "动态页脚模板，支持 {name} {uid} {id} {type} {time}；留空不画页脚"
-            }
-            "footer.liveFooter" => "直播页脚模板，同上",
-            "footer.footerAlign" => "页脚对齐：LEFT / CENTER / RIGHT",
-            _ => return None,
-        })
+        comment_of(IMAGE_COMMENTS, path)
     }
 }
+
+/// `image` 区的注释表，口径同 [`BILI_COMMENTS`]
+const IMAGE_COMMENTS: &[(&str, &str)] = &[
+    ("quality", "图片宽度档位：800w / 1000w / 1200w / 1500w"),
+    ("theme", "绘图主题：v3 / v3RainbowOutline / v2"),
+    (
+        "font",
+        "字体名或字体文件名(不用加后缀)，放到 config/bilibili/font/ 下；留空自动找系统中文字体",
+    ),
+    (
+        "defaultColor",
+        "默认主题色，支持多个值自定义渐变，中间用分号分隔，例: #fde8ed;#fde8ed；单个值会自动生成渐变色",
+    ),
+    (
+        "cardOrnament",
+        "卡片装饰：QrCode(右下角画动态链接二维码) / None(不装饰)。FanCard(粉丝勋章) 这一档当前\
+         不出效果——插件没铺 B 站的勋章数据，填了等同 None",
+    ),
+    ("badgeEnable", "卡片顶部的标签，左右两档各一个开关"),
+    (
+        "badgeEnable.left",
+        "左边那一档：动态类型（直播卡是分区）那枚标签",
+    ),
+    ("badgeEnable.right", "右边那一档：动态 id（直播卡是房间号）"),
+    (
+        "drawEnable",
+        "绘图总开关：关掉之后动态与直播推送只发模板文本，一张卡都不画\
+         （原插件同样只管这两条推送路径，命令的「先看一眼」和链接解析不受它管）",
+    ),
+    ("colorGenerator", COLOR_GEN_DOC),
+    ("colorGenerator.hueStep", COLOR_GEN_DOC),
+    ("colorGenerator.lockSB", "锁定饱和度与亮度"),
+    ("colorGenerator.saturation", "锁定的饱和度 0.0-1.0"),
+    ("colorGenerator.brightness", "锁定的亮度 0.0-1.0"),
+    ("footer", "图片页脚"),
+    (
+        "footer.dynamicFooter",
+        "动态页脚模板，支持 {name} {uid} {id} {type} {time}；留空不画页脚",
+    ),
+    ("footer.liveFooter", "直播页脚模板，同上"),
+    ("footer.footerAlign", "页脚对齐：LEFT / CENTER / RIGHT"),
+];
+
+/// 渐变色生成器在渲染时会被问到两次（表本身与它的 `hueStep` 子键），说明是同一句
+const COLOR_GEN_DOC: &str = "渐变色生成器（仅当主题色只给了一个值时生效）";
 
 /// 卡片顶部那两枚标签的开关。左右是两档独立的键（原插件 `BadgeEnable` 就是这个形状，
 /// 默认左边开、右边关），两个都关时整条标签带的高度一起收掉。
@@ -641,24 +716,28 @@ impl PluginConfig for TemplateConfig {
          换行 \\n，拆多条消息 \\r，{>>}…{<<} 之间的内容发成合并转发。";
 
     fn comment(path: &str) -> Option<&'static str> {
-        Some(match path {
-            "defaultDynamicPush" => "动态推送的默认模板名",
-            "defaultLivePush" => "开播推送的默认模板名",
-            "defaultLiveClose" => "直播结束通知的默认模板名",
-            "dynamicPush" => "动态模板表：键是模板名，值是模板串",
-            "livePush" => "直播模板表（不支持 {>>}{<<} 转发）",
-            "liveClose" => "直播结束模板表（不支持 {>>}{<<} 与 \\r）",
-            "forwardCard"
-            | "forwardCard.title"
-            | "forwardCard.preview"
-            | "forwardCard.summary"
-            | "forwardCard.brief" => {
-                "QQ 转发卡片的外观，可用 {name} {uid} {did} {type} {time} {content} {link}"
-            }
-            _ => return None,
-        })
+        comment_of(TEMPLATE_COMMENTS, path)
     }
 }
+
+/// `template` 区的注释表，口径同 [`BILI_COMMENTS`]
+const TEMPLATE_COMMENTS: &[(&str, &str)] = &[
+    ("defaultDynamicPush", "动态推送的默认模板名"),
+    ("defaultLivePush", "开播推送的默认模板名"),
+    ("defaultLiveClose", "直播结束通知的默认模板名"),
+    ("dynamicPush", "动态模板表：键是模板名，值是模板串"),
+    ("livePush", "直播模板表（不支持 {>>}{<<} 转发）"),
+    ("liveClose", "直播结束模板表（不支持 {>>}{<<} 与 \\r）"),
+    ("forwardCard", FORWARD_CARD_DOC),
+    ("forwardCard.title", FORWARD_CARD_DOC),
+    ("forwardCard.preview", FORWARD_CARD_DOC),
+    ("forwardCard.summary", FORWARD_CARD_DOC),
+    ("forwardCard.brief", FORWARD_CARD_DOC),
+];
+
+/// 转发卡片那一整档在渲染时每键都会问到，说明给的是同一句
+const FORWARD_CARD_DOC: &str =
+    "QQ 转发卡片的外观，可用 {name} {uid} {did} {type} {time} {content} {link}";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -848,9 +927,9 @@ mod tests {
         }
     }
 
-    /// 注释表是硬编码的 `match`：键名写错既不会编译失败也不会有警告，只是生成的配置文件里
-    /// 悄悄少一行注释（`lockSB` 那件事就是这么漏进去的，见 README 第 34 条）。
-    /// 这条把「默认配置渲染出来的每个键都得有说明」变成会失败的测试，不用先把表改成可枚举的。
+    /// 键名写错既不会编译失败也不会有警告，只是生成的配置文件里悄悄少一行注释
+    /// （`lockSB` 那件事就是这么漏进去的，见 README 第 34 条）。
+    /// 这条查一个方向：默认配置渲染出来的每个键都得有说明。
     #[test]
     fn every_key_the_template_renders_has_a_comment() {
         let mut missing = Vec::new();
@@ -865,6 +944,41 @@ mod tests {
             counted >= 60,
             "只数到 {counted} 个键，走法八成没跟上结构的改动"
         );
+    }
+
+    /// 反方向：表里留着配置中已经不存在的键（改过名、删过字段）永远问不到，是份死档。
+    /// 表做成可枚举的数组之后这一头才查得了，两条合起来才算咬死。
+    #[test]
+    fn every_comment_path_is_a_real_key() {
+        let mut dead = Vec::new();
+        check_table(SECTION, BILI_COMMENTS, &BiliConfig::default(), &mut dead);
+        check_table(
+            IMAGE_SECTION,
+            IMAGE_COMMENTS,
+            &ImageConfig::default(),
+            &mut dead,
+        );
+        check_table(
+            TEMPLATE_SECTION,
+            TEMPLATE_COMMENTS,
+            &TemplateConfig::default(),
+            &mut dead,
+        );
+        assert!(
+            dead.is_empty(),
+            "注释表里这些路径对应的键已经不存在了，说明永远渲染不出来：{dead:?}"
+        );
+    }
+
+    /// 同一张表里一个路径写两遍，第二条永远不会被读到（查表只命中第一条）
+    #[test]
+    fn comment_tables_have_no_duplicate_keys() {
+        for table in [BILI_COMMENTS, IMAGE_COMMENTS, TEMPLATE_COMMENTS] {
+            let mut seen = std::collections::BTreeSet::new();
+            for (key, _) in table {
+                assert!(seen.insert(*key), "注释表里「{key}」写了两遍");
+            }
+        }
     }
 
     /// 数出这一块默认配置会让框架去问注释的路径个数，没说明的那些挂到 `missing` 上（带区块名前缀好定位）
@@ -883,6 +997,23 @@ mod tests {
                 .map(|path| format!("{section}.{path}")),
         );
         paths.len()
+    }
+
+    /// 一张注释表对着一块默认配置反查：表里每条路径都该被框架真的问到一次
+    fn check_table<T: PluginConfig>(
+        section: &str,
+        table: &[(&str, &str)],
+        config: &T,
+        dead: &mut Vec<String>,
+    ) {
+        let value = serde_yaml::to_value(config).expect("默认配置序列化不出去");
+        let mut paths = Vec::new();
+        template_paths(&value, "", &mut paths);
+        for (key, _) in table {
+            if !paths.iter().any(|path| path == key) {
+                dead.push(format!("{section}.{key}"));
+            }
+        }
     }
 
     /// 拿框架那台渲染器把三块区各生成一遍，确认生成的文件**读回来还是同一套默认值**。
