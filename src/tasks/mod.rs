@@ -52,6 +52,8 @@ static LAST_DYNAMIC_INTERVAL: AtomicU64 = AtomicU64::new(0);
 static LAST_LIVE_INTERVAL: AtomicU64 = AtomicU64::new(0);
 /// 关注流连着几轮读不出来，计数到 [`FALLBACK_AFTER`] 就临时退回逐 UP
 static FIREHOSE_FAILS: AtomicU64 = AtomicU64::new(0);
+/// 已经问过关系接口的订阅者，见 [`probe_unfollowed`]
+static UNFOLLOW_PROBED: OnceLock<Mutex<BTreeSet<i64>>> = OnceLock::new();
 /// `--test-notify` 只测一次，配置热重载不能重复推
 static SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
 /// 接口失败的汇报节流点（unix 秒）
@@ -313,6 +315,9 @@ async fn firehose_round(
     if !plan.align.is_empty() {
         save(&conf.check);
     }
+    // 排在推送**之前**：这一句要说的正是「推送这一路永远轮不到他」，所以它自己不能跟着推送一起断——
+    // 一条过大的附件能把对端连接打崩，那一轮的自我交代就不该被它一起带走。
+    probe_unfollowed(bili, &uids, &feed).await;
     for (slot, dynamics) in &plan.fresh {
         let targets = states_of(*slot);
         if targets.is_empty() {
@@ -323,6 +328,78 @@ async fn firehose_round(
         }
     }
     Firehose::Done
+}
+
+/// 订了、却不在关注流里的 UP 主：关注流这一路结构上就轮不到他，检测永远不会推他一条。
+///
+/// `/bili add` 那句提醒只在发命令那一刻说过一次，之后在 B 站把某人取关（或当初没勾自动关注）就再没人交代。
+/// 「这一轮页里没有他」不能当证据——他只是这几天没发动态时同样不在。所以去问关系接口，
+/// 而且每个 uid 一生只问一次（只有 `0` 与 `128` 才是结论，关注着的那就只是没发动态，不必反复问）；
+/// 一旦他在关注流里露过面就把这条记录摘掉，将来真被取关了还能再查出来。
+/// 一轮只问一个：订几十个人时，第一轮回不该甩出几十次签名接口之外的请求去。
+async fn probe_unfollowed(bili: &Arc<Bili>, uids: &[i64], feed: &[Dynamic]) {
+    let seen: BTreeSet<i64> = feed.iter().map(|item| item.uid).collect();
+    let asked = UNFOLLOW_PROBED.get_or_init(|| Mutex::new(BTreeSet::new()));
+    // 挑人这一段不许横跨 await：`std::sync::MutexGuard` 不是 Send，带着它进 `relation()`
+    // 就把整个任务体的 future 弄成 !Send，而 spawn_as 的边界要 Send。
+    let picked = {
+        let mut probed = asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pick_probe(uids, &seen, &mut probed)
+    };
+    let Some(uid) = picked else {
+        return;
+    };
+    match bili.relation(uid).await {
+        // 0 是没关注、128 是拉黑，两种都让关注流永远轮不到他，只是劝的话不一样；
+        // 其余取值（已关注、互粉）说明他只是这几天没发动态，不该念这一句
+        Ok(attribute @ (0 | 128)) => {
+            let name = crate::store()
+                .read(|data| data.names.get(&uid.to_string()).cloned())
+                .unwrap_or_default();
+            let who = if name.is_empty() {
+                format!("{uid}")
+            } else {
+                format!("{uid}（{name}）")
+            };
+            let advice = if attribute == 128 {
+                "在这一份登录态的黑名单里，关注流不会给他推任何东西——要么在 B 站解除拉黑"
+            } else {
+                "订了却不在这一份登录态的关注列表里，关注流不会给他推任何东西——要么在 B 站关注他"
+            };
+            // 不走 [`report`] 那条节流：这一句一个进程只说一次，撞上节流就永久丢了，
+            // 自我交代不能靠运气。收敛靠的是「一轮最多问一个、问过就不再问」。
+            arona::runtime::log::warning(format!(
+                "bilibili：{who}{advice}，要么 /bili del 取消这一条订阅"
+            ));
+        }
+        Ok(_) => {}
+        Err(reason) => {
+            // 问不成是把标记摘掉的下一轮回重试机会，代价只是一轮一次；
+            // 反过来说，把失败当结论钉死会让这条自我交代永远漏掉。
+            let mut probed = asked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            probed.remove(&uid);
+            arona::runtime::log::debug(format!("bilibili：{uid} 的关注关系没查出来（{reason}）"));
+        }
+    }
+}
+
+/// 本轮该问谁：订了、这一轮页里没露面、且没问过的第一个，选中就把标记落下。
+///
+/// 摘标（这一轮露过面）排在选人前面，所以「他又开始发动态、将来再被取关」这一趟还查得出来。
+fn pick_probe(uids: &[i64], seen: &BTreeSet<i64>, asked: &mut BTreeSet<i64>) -> Option<i64> {
+    for uid in seen {
+        asked.remove(uid);
+    }
+    let uid = uids
+        .iter()
+        .copied()
+        .find(|uid| !seen.contains(uid) && !asked.contains(uid))?;
+    asked.insert(uid);
+    Some(uid)
 }
 
 /// 逐 UP 那一轮（只在没有登录态时用）：每个订阅者各拉一次匿名 `feed/space`
@@ -1128,11 +1205,7 @@ async fn fetch(
     {
         return Some((raw, decoded.to_rgba8()));
     }
-    let attempts: Vec<String> = if original || url.contains('@') || !is_image_host(url) {
-        vec![url.to_string()]
-    } else {
-        vec![format!("{url}@720w.webp"), url.to_string()]
-    };
+    let attempts = fetch_attempts(url, original);
     for attempt in attempts {
         if let Ok(raw) = bili.bytes(&attempt, "https://www.bilibili.com/").await
             && let Ok(decoded) = image::load_from_memory(&raw)
@@ -1144,9 +1217,38 @@ async fn fetch(
     None
 }
 
-/// 只有 B 站图床认 `@720w.webp` 那套缩放语法
+/// 取一张图要试哪几个地址：要原图、URL 自带尺寸档、或图床不认那套缩放语法时只走原件，
+/// 否则先问 `@720w.webp` 那一份缩略，拿不到再回退原件——这是 `cache.downloadOriginal` 那句说明的兑现。
+fn fetch_attempts(url: &str, original: bool) -> Vec<String> {
+    if original || url.contains('@') || !is_image_host(url) {
+        vec![url.to_string()]
+    } else {
+        vec![format!("{url}@720w.webp"), url.to_string()]
+    }
+}
+
+/// 只有 B 站图床认 `@720w.webp` 那套缩放语法。
+/// 认的是**主机段**，不是整串前缀：站方回包里的图 URL 两种写法都常见——scheme 是 `http://`、
+/// 主机除了 i0/i1 还有 i2，先前按 `https://i0.` / `https://i1.` 两个前缀比，
+/// 于是绝大多数稿件封面（实测 `http://i0.hdslb.com/bfs/archive/…`、`http://i2.hdslb.com/…`）
+/// 一次都没问过缩略档，直接拿原件：1920x1080 的封面无损转 PNG 就是几 MB，长图能到几十 MB 并顶爆对端帧上限
+/// （README 预留问题第 8 条的第一环）。主机段比较而不是子串，是为了不被 `i0.hdslb.com.evil.com` 这类冒名顶替。
 fn is_image_host(url: &str) -> bool {
-    url.starts_with("https://i0.hdslb.com/") || url.starts_with("https://i1.hdslb.com/")
+    let authority = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    // `https://用户名@主机/` 里主机在最后一个 `@` 之后
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    let host = host
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "hdslb.com" || host.ends_with(".hdslb.com")
 }
 
 /// 动态详情链接：短链失败退回长链，推的东西不能因为短链挂了就没链接
@@ -1583,6 +1685,83 @@ mod tests {
         assert!(!page_might_hold_more(&page, 0));
         // 空页（匿名接口常回 `code 0`）什么都不说明
         assert!(!page_might_hold_more(&[], 200));
+    }
+
+    /// 「订了却没关注」那句自我交代的选人规则：一轮最多问一个、问过不再问、露面即摘标。
+    #[test]
+    fn only_a_never_asked_absent_subscriber_gets_the_relation_probe() {
+        let mut asked = BTreeSet::new();
+        // 1 在页里露面、2 没有 → 只可能轮到 2
+        let seen = BTreeSet::from([1]);
+        assert_eq!(pick_probe(&[1, 2], &seen, &mut asked), Some(2));
+        // 问过就不再问：这一轮没有第二个可问的
+        assert_eq!(pick_probe(&[1, 2], &seen, &mut asked), None);
+        // 2 又开始发动态了：他没露面这条证据作废，摘标
+        let seen = BTreeSet::from([1, 2]);
+        assert_eq!(pick_probe(&[1, 2], &seen, &mut asked), None);
+        assert!(
+            asked.is_empty(),
+            "露过面就该把标记摘掉，将来真被取关了还查得出来"
+        );
+        let seen = BTreeSet::from([1]);
+        assert_eq!(pick_probe(&[1, 2], &seen, &mut asked), Some(2));
+        // 订的人多、页里一个都没露面：一轮也只吃一个，不该甩出一串关系接口
+        let none = BTreeSet::new();
+        assert_eq!(pick_probe(&[7, 8, 9], &none, &mut asked), Some(7));
+        assert_eq!(pick_probe(&[7, 8, 9], &none, &mut asked), Some(8));
+    }
+
+    /// 站方回包里的图 URL 写法不止一种：scheme 常是 `http://`，主机除了 i0/i1 还有 i2。
+    /// 这三种都得先问 `@720w` 那份缩略——先前按两个 `https://i0.`/`https://i1.` 前缀比，
+    /// 稿件封面一次都没问过缩略档，直接拿原件（1920x1080 起，长图几十 MB），
+    /// `cache.downloadOriginal` 那句说明等于没写。
+    #[test]
+    fn a_cover_over_http_or_on_i2_still_asks_for_the_scaled_variant() {
+        for url in [
+            "http://i0.hdslb.com/bfs/archive/9713f8f22eff53a2ec71ead08695cc54ce656d9a.jpg",
+            "http://i2.hdslb.com/bfs/archive/20f350dbb5ddf77ae86766bab425359914a136c7.jpg",
+            "https://i1.hdslb.com/bfs/face/83ec10ebb202811c6d08be512275fbbff390f9b9.jpg",
+            "https://I0.HDSLB.COM/bfs/archive/x.jpg",
+        ] {
+            let attempts = fetch_attempts(url, false);
+            assert_eq!(attempts.len(), 2, "{url} 该先问缩略那一份、再回退原件");
+            assert!(
+                attempts[0].ends_with("@720w.webp") && attempts[1] == url,
+                "{url} 的两次尝试顺序不对：{attempts:?}"
+            );
+        }
+    }
+
+    /// 只走原件的那三种：真要原图、URL 自带尺寸档、图床不认这套语法。
+    #[test]
+    fn only_the_image_host_gets_the_scaled_variant() {
+        assert_eq!(
+            fetch_attempts("https://i0.hdslb.com/bfs/archive/x.jpg", true),
+            vec!["https://i0.hdslb.com/bfs/archive/x.jpg".to_string()]
+        );
+        assert_eq!(
+            fetch_attempts("https://i0.hdslb.com/bfs/archive/x.jpg@720w.webp", false),
+            vec!["https://i0.hdslb.com/bfs/archive/x.jpg@720w.webp".to_string()]
+        );
+        // 新那家 CDN 认不认这套语法没实测过，所以按原件交——宁可大，也不能拿一次注定失败的请求去挡推送
+        assert!(!is_image_host(
+            "https://archive.biliimg.com/bfs/archive/x.jpg"
+        ));
+        assert!(!is_image_host("https://example.com/x.jpg"));
+    }
+
+    /// 认的是主机段，不是整串子串：冒名顶替的那个域名不能被判成图床。
+    #[test]
+    fn a_lookalike_host_is_not_the_image_host() {
+        assert!(!is_image_host("https://i0.hdslb.com.evil.com/x.jpg"));
+        assert!(!is_image_host("https://i0.hdslb.com@evil.com/x.jpg"));
+        assert!(!is_image_host("https://evil.com/?u=https://i0.hdslb.com/"));
+        // 图床自己的写法都认；带端口只是同一个主机的另一个入口，不改变它是图床这件事。
+        // 子域一视同仁：认的是「谁名下的主机」，不是背下 i0/i1/i2 那三个名字——
+        // 站方哪天换个二级子域出来，不认就退成按原件下，那正是 #146 那次的病。
+        assert!(is_image_host("https://noti0.hdslb.com/x.jpg"));
+        assert!(is_image_host("http://hdslb.com/bfs/archive/x.jpg"));
+        assert!(is_image_host("https://i2.hdslb.com:8443/bfs/archive/x.jpg"));
     }
 
     /// 顺序只能由 `pick_fresh` 自己定：`parse_feed` 交出来的是按 `time` 升序那份，接口页序又不保证什么。
