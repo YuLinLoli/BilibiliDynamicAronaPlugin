@@ -690,6 +690,31 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    B `attachment()` 加一条宽度上限，按 `quality` 档缩放后再转码（保住「交出去的都是 PNG」，代价是长图被压小）；
    C 给一条消息的附件总字节设上限，超出那几张只画进卡片、不单独发（保住消息不崩，代价是模板语义多一条隐规则）。
 
+9. **`/bili login` 扫通之后拆不出 Cookie——差一次取证才能定改法**。2026-10-04 19:38:47 你真人扫的那一遍：
+   poll 从 119（没人扫）→137（已扫待确认）→**326 字节、内层 code 0**，站方那一步是通的，
+   宿主随后回「登录失败 B 站没给出 Cookie」，断点在 `bili/api.rs` 的 `cookie_from_url(data.url)` 这一层。
+   同晚那个一次性抓取器 `capture-poll.sh` **起晚了**（19:46 才起，成功那份 19:38 就过去了），
+   它只抓到一份 86038 失效响应（`url` 长度 0、`Set-Cookie` 0 条、`refresh_token` 0）——
+   所以**成功那一份 url 的真实结构至今没有实测**，下面两条公开材料互相冲突，不能拿来当结论：
+   bilibili-API-collect 的镜像写的是顶层 query 就含 `DedeUserID`/`SESSDATA`/`bili_jct`（`passport.biligame.com/crossDomain?…&gourl=…`），
+   而 2026-10 初一篇讲 BBDown 同类故障的文章说现在 poll 的 url **只带一个短时效标识**，
+   真 Cookie 只在跟随 `crossDomain` 那一跳的 **`Set-Cookie` 响应头**里下发。
+   框架这一侧是读代码钉住的、不是推测：`crates/arona/src/runtime/http.rs` 的代发回调（`deliver` 与 `report`）
+   **只交 `(error | body)`，不交响应头**；而 `local()` 用的是 reqwest 默认重定向策略（自动跟至多 10 跳），
+   所以中间那一跳的 `Set-Cookie` 连宿主都没留下一份。两条改法按这个分叉：
+   * **插件侧、不抬 ABI**：`cookie_from_url` 除了顶层 query，再把 `gourl=` 那一段 percent-decode 之后扫一遍
+     那四个键（若站方只是把 cookie 裹进了子查询，这一改就够）；顺带把那句失败文案改成能指路的
+     （「本版本拿不到站方下发的 Cookie，请用 `cookies.json` 导入」，见 #96）。
+   * **框架侧、要抬 ABI（属架构改动，等你拍板再动）**：给代发回调补响应头出口（`HttpDone` 加 `headers`/`header_count`
+     两段），且 `local()` 必须能看到**重定向链上每一跳**的头——要么把默认策略换成 `Policy::none()` 让插件逐跳，
+     要么在宿主里按域收一份 cookie jar 再交出去。布局 5→6、契约抬版，宿主与插件得同时重建（先例是第 45、61 条那两轮）；
+     落点是 `http.rs` 的 207 / 271 / 341 / 358 / 471 五处，另加探针与 `PLUGIN_DEVELOPMENT.md`。
+   定分支只差一次取证，不需要设计：**在 `/bili login` 下发之前**就把 `capture-poll.sh` 跑起来盯着
+   （上一轮就是起晚了才空跑一趟），把成功那一份的 url 全文键名与长度记下来即可——
+   **"cookie 值一个字符都不落盘"那句照旧**。
+   这要你再造一次真人扫码，所以我没自己动。
+
+
 原来列在这里的第 1 条「**直播卡被真实开播数据驱动**」已经在 2026-09-30 晚间这一轮压到了：
 `feed/space` 里那条直播推荐动态真推出了一张 PNG 直播卡 + 「老番茄 正在直播：最手忙脚乱的一集 /
 分区：其他单机 / 房间号：21852」，直播检测那一轮也真推过「3号直播间 正在直播：哔哩哔哩音悦台」。
