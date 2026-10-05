@@ -390,17 +390,41 @@ mod tests {
             .expect("这条消息里没有图片段")
     }
 
+    /// `{images}` 这一支确实过了转码那道门，两支各钉一头。口径 2026-10-05 从「一律 PNG」改成
+    /// 「JPEG 原件直发、只有 WebP 这类才转 PNG」——原先这条钉的是 PNG 那头，翻不过来就会把
+    /// 单条消息 73MB 那一档请回来。
     #[test]
-    fn a_jpeg_supply_leaves_as_a_png_segment() {
-        let mut out = std::io::Cursor::new(Vec::new());
-        image::ImageBuffer::from_pixel(3, 2, image::Rgb([10u8, 120, 240]))
-            .write_to(&mut out, image::ImageFormat::Jpeg)
-            .expect("样例 JPEG 编不出来");
-        let supply = Supply::for_dynamic(None, vec![out.into_inner()]);
-        let got = render("{images}", &vals(), &supply, &card());
+    fn the_image_supply_passes_the_transcode_gate() {
+        fn encoded(format: image::ImageFormat) -> Vec<u8> {
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::ImageBuffer::from_pixel(3, 2, image::Rgb([10u8, 120, 240]))
+                .write_to(&mut out, format)
+                .expect("样例编不出来");
+            out.into_inner()
+        }
+        let jpeg = encoded(image::ImageFormat::Jpeg);
+        let got = render(
+            "{images}",
+            &vals(),
+            &Supply::for_dynamic(None, vec![jpeg.clone()]),
+            &card(),
+        );
+        assert_eq!(
+            first_image(&got[0]),
+            jpeg,
+            "JPEG 被重编码了——无损转 PNG 能把它撑到约 2.4 倍"
+        );
+
+        let webp = encoded(image::ImageFormat::WebP);
+        let got = render(
+            "{images}",
+            &vals(),
+            &Supply::for_dynamic(None, vec![webp]),
+            &card(),
+        );
         assert!(
             first_image(&got[0]).starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
-            "正文图没走统一转码，交出去的编码又在跟着图床的运气走"
+            "WebP 没转成 PNG，交出去的编码又在跟着图床的运气走"
         );
     }
 
