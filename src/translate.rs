@@ -101,6 +101,7 @@ pub async fn translate(conf: &TranslateConfig, text: &str) -> Option<Rendered> {
         headers: vec![("user-agent".to_string(), USER_AGENT.to_string())],
         body: Default::default(),
         timeout: Some(std::time::Duration::from_secs(10)),
+        ..Default::default()
     };
     let raw = match http::send(request).await {
         Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),

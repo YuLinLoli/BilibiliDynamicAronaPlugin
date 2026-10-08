@@ -228,6 +228,7 @@ impl Bili {
             headers: self.headers(url, referer).await,
             body: arona::runtime::http::Body::Form(form),
             timeout: Some(self.timeout),
+            ..Default::default()
         };
         unwrap_envelope(self.send(request).await?)
     }
@@ -242,6 +243,7 @@ impl Bili {
                 text: json.to_string(),
             },
             timeout: Some(self.timeout),
+            ..Default::default()
         };
         unwrap_envelope(self.send(request).await?)
     }
@@ -638,6 +640,7 @@ impl Bili {
             headers: self.headers(SHORT_LINK, "https://www.bilibili.com/").await,
             body: arona::runtime::http::Body::Form(pairs),
             timeout: Some(self.timeout),
+            ..Default::default()
         };
         let value = self.send(request).await.ok()?;
         unwrap_envelope(value)
@@ -684,9 +687,15 @@ impl Bili {
         let cookie = match code {
             0 => {
                 let url = data.get("url").and_then(Value::as_str).unwrap_or_default();
-                let picked = cookie_from_url(url);
+                let picked = match cookie_from_url(url) {
+                    Some(cookie) => Some(cookie),
+                    // 这一版站方把票下在跳转的 `Set-Cookie` 上，url 里只剩一个短时效 `ticket`。
+                    // 回执是一次性的（第二次问同一把 key 就回 86038），所以当下就得拿票去换，
+                    // 不能留给下一轮 poll。
+                    None => self.exchange_ticket(url).await,
+                };
                 if picked.is_none() {
-                    // 回执是一次性的，这一刻不记下形状就永远记不到了
+                    // 两条路都空：当场把形状钉下来，这一刻不记就永远记不到了
                     arona::runtime::log::warning(format!(
                         "bilibili：扫码通过但 url 里拆不出 Cookie —— {}",
                         url_shape(url)
@@ -697,6 +706,43 @@ impl Bili {
             _ => None,
         };
         Ok((code, message, cookie))
+    }
+
+    /// 拿 url 里那个 `ticket` 去换真 Cookie：响应头（含重定向链上每一跳的 `Set-Cookie`）由宿主带回来。
+    ///
+    /// 只敲自家域（[`is_bili_host`]）：这一趟要拿的是登录凭据，不能把它送到第三方门上去。
+    async fn exchange_ticket(&self, url: &str) -> Option<String> {
+        if url.is_empty() || !is_bili_host(url) {
+            return None;
+        }
+        let request = Request {
+            method: Method::Get,
+            url: url.to_string(),
+            headers: self
+                .headers(url, "https://passport.bilibili.com/login")
+                .await,
+            timeout: Some(self.timeout),
+            want_headers: true,
+            ..Default::default()
+        };
+        let headers = match http::send_with_headers(request).await {
+            Ok((_, headers)) => headers,
+            Err(reason) => {
+                arona::runtime::log::warning(format!(
+                    "bilibili：拿 ticket 换 Cookie 没成功 —— {reason}"
+                ));
+                return None;
+            }
+        };
+        let picked = cookie_from_headers(&headers);
+        if picked.is_none() {
+            arona::runtime::log::warning(format!(
+                "bilibili：换票回来的 {} 条响应头里没有 Cookie —— {}",
+                headers.len(),
+                headers_shape(&headers)
+            ));
+        }
+        picked
     }
 }
 
@@ -740,13 +786,28 @@ fn cookie_from_url(url: &str) -> Option<String> {
     })
 }
 
+/// 登录用的那几个键。站方给回的键不止这些（`buvid`、`DedeUserID__ckMd5`……），多出来的对接口
+/// 调用没用，收进配置只会让人以为这份文件里存着凭据的全部。
+const LOGIN_KEYS: [&str; 4] = ["SESSDATA", "bili_jct", "DedeUserID", "sid"];
+
+/// 挑出来的键渲染成 cookie 串：没有 `SESSDATA` 就当没拿到——只有它才算登录态。
+fn render(picked: BTreeMap<String, String>) -> Option<String> {
+    picked.contains_key("SESSDATA").then(|| {
+        picked
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 /// 从一个「带查询串的 url」里挑那四个登录键，`SESSDATA` 不在就当没拿到。
 fn pick_cookies(url: &str) -> Option<String> {
     let query = url.split_once('?').map(|(_, rest)| rest).unwrap_or(url);
     let mut picked = BTreeMap::new();
     for pair in query.split('&') {
         if let Some((key, value)) = pair.split_once('=')
-            && ["SESSDATA", "bili_jct", "DedeUserID", "sid"].contains(&key)
+            && LOGIN_KEYS.contains(&key)
         {
             picked.insert(
                 key.to_string(),
@@ -756,17 +817,28 @@ fn pick_cookies(url: &str) -> Option<String> {
             );
         }
     }
-    if picked.contains_key("SESSDATA") {
-        Some(
-            picked
-                .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    } else {
-        None
+    render(picked)
+}
+
+/// 从响应头里挑登录键——这一版 B 站的票只下在 `crossDomain` 那一跳的 `Set-Cookie` 上。
+///
+/// `Set-Cookie` 的形制是 `SESSDATA=xxx%2C0900...; Domain=.bilibili.com; HttpOnly; Path=/`：
+/// 只有第一个 `;` 之前那截是键值，后面全是属性。**值不做 percent 解码**——浏览器怎么收的就怎么
+/// 发回去，解码过的值站方不认（`%2C` 本身就是值的一部分）。
+fn cookie_from_headers(headers: &[(String, String)]) -> Option<String> {
+    let mut picked = BTreeMap::new();
+    for (name, value) in headers {
+        if name != "set-cookie" {
+            continue;
+        }
+        let pair = value.split(';').next().unwrap_or_default().trim();
+        if let Some((key, raw)) = pair.split_once('=')
+            && LOGIN_KEYS.contains(&key)
+        {
+            picked.insert(key.to_string(), raw.to_string());
+        }
     }
+    render(picked)
 }
 
 /// 把一次「拆不出 Cookie」的 url 写成能指路的样子：**只报主机+路径与键名、各值长度，值一个字符都不进日志**。
@@ -801,6 +873,17 @@ fn url_shape(url: &str) -> String {
             nested.join("，")
         )
     }
+}
+
+/// 「换票回来的头里也没有 Cookie」那一行的形状：**只报头名与值的长度，值一个字符都不进日志**。
+///
+/// 与 [`url_shape`] 同一个道理——这些头本来可能就是凭据本身，日志要的是能指路的形状，不是内容。
+fn headers_shape(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}({} 字符)", value.chars().count()))
+        .collect::<Vec<_>>()
+        .join("，")
 }
 
 /// 「登录失效」那一句的行头。检测任务要靠它认出「这份 Cookie 已经死了」，
@@ -1044,6 +1127,44 @@ mod tests {
         );
     }
 
+    /// 2026-10-09 这一版站方的另一副形状：url 里只有一个短时效 `ticket`，`SESSDATA` 下在
+    /// `crossDomain` 那一跳的 `Set-Cookie` 上。宿主把重定向链上每一跳的 `Set-Cookie` 都带回来，
+    /// 这里要能从那几行里挑出登录键——#143 缺的就是这一条。
+    #[test]
+    fn login_cookie_is_mined_from_the_set_cookie_header() {
+        let headers = vec![
+            (
+                "set-cookie".to_string(),
+                "ticket=short-lived; Path=/; Max-Age=10".to_string(),
+            ),
+            (
+                "set-cookie".to_string(),
+                "SESSDATA=abc%2C1700000000%2C01b34; Domain=.bilibili.com; HttpOnly; Path=/"
+                    .to_string(),
+            ),
+            (
+                "set-cookie".to_string(),
+                "bili_jct=def; Domain=.bilibili.com".to_string(),
+            ),
+            (
+                "set-cookie".to_string(),
+                "DedeUserID=12345; Domain=.bilibili.com".to_string(),
+            ),
+            ("content-length".to_string(), "4".to_string()),
+        ];
+        let cookie = cookie_from_headers(&headers).expect("Set-Cookie 里那三条登录键该被挑出来");
+        assert_eq!(
+            cookie, "DedeUserID=12345; SESSDATA=abc%2C1700000000%2C01b34; bili_jct=def",
+            "值要原样留着（%2C 解码成逗号反而不认）: {cookie}"
+        );
+        // 只有 ticket 的那一串不算拿到登录态
+        assert!(
+            cookie_from_headers(&[("set-cookie".to_string(), "ticket=x; Path=/".to_string())])
+                .is_none()
+        );
+        assert!(cookie_from_headers(&[]).is_none());
+    }
+
     /// 取证日志的形状：键名与长度要留得下来，**值一个字符都不能进去**。
     #[test]
     fn the_login_url_shape_keeps_keys_but_never_values() {
@@ -1065,6 +1186,22 @@ mod tests {
         );
         // 空 url 也得给得出可读的一行，不能 panic
         assert_eq!(url_shape(""), " 顶层键=[]（没有 gourl 子查询）");
+    }
+
+    /// 换票回来的那行取证日志同样只报形状：头名与值的长度，值绝不落盘。
+    #[test]
+    fn the_response_header_shape_keeps_names_but_never_values() {
+        let headers = vec![(
+            "set-cookie".to_string(),
+            "SESSDATA=a-secret-value; Domain=.bilibili.com".to_string(),
+        )];
+        let shape = headers_shape(&headers);
+        assert!(shape.contains("set-cookie(45 字符)"), "{shape}");
+        assert!(
+            !shape.contains("a-secret-value"),
+            "凭据值绝不能进日志: {shape}"
+        );
+        assert_eq!(headers_shape(&[]), "");
     }
 
     #[test]
