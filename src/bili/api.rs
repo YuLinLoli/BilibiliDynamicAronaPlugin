@@ -682,7 +682,18 @@ impl Bili {
             .unwrap_or_default()
             .to_string();
         let cookie = match code {
-            0 => cookie_from_url(data.get("url").and_then(Value::as_str).unwrap_or_default()),
+            0 => {
+                let url = data.get("url").and_then(Value::as_str).unwrap_or_default();
+                let picked = cookie_from_url(url);
+                if picked.is_none() {
+                    // 回执是一次性的，这一刻不记下形状就永远记不到了
+                    arona::runtime::log::warning(format!(
+                        "bilibili：扫码通过但 url 里拆不出 Cookie —— {}",
+                        url_shape(url)
+                    ));
+                }
+                picked
+            }
             _ => None,
         };
         Ok((code, message, cookie))
@@ -714,6 +725,23 @@ fn is_bili_host(url: &str) -> bool {
 
 /// 从登录跳转 URL 的 query 里捞 SESSDATA / bili_jct / DedeUserID 拼成 cookie 串
 fn cookie_from_url(url: &str) -> Option<String> {
+    pick_cookies(url).or_else(|| {
+        // 站方另一种发法：顶层只留一个短时效标识，真 Cookie 裹在 `gourl=` 那一层的子查询里。
+        // 顶层解不出来时才试这一条——两条都试过还是空，才轮到 url_shape 那条取证日志。
+        let gourl = url.split_once('?')?.1.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "gourl").then(|| {
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+        })?;
+        pick_cookies(&gourl)
+    })
+}
+
+/// 从一个「带查询串的 url」里挑那四个登录键，`SESSDATA` 不在就当没拿到。
+fn pick_cookies(url: &str) -> Option<String> {
     let query = url.split_once('?').map(|(_, rest)| rest).unwrap_or(url);
     let mut picked = BTreeMap::new();
     for pair in query.split('&') {
@@ -738,6 +766,40 @@ fn cookie_from_url(url: &str) -> Option<String> {
         )
     } else {
         None
+    }
+}
+
+/// 把一次「拆不出 Cookie」的 url 写成能指路的样子：**只报主机+路径与键名、各值长度，值一个字符都不进日志**。
+///
+/// `SESSDATA`／`bili_jct` 就是登录凭据，落到日志等于把账号交出去；但归因又必须知道站方这次到底把
+/// 键放在哪一层。扫码成功的回执是一次性的（poll 第二次问同一把 key 就回 86038），所以错过这一刻
+/// 就再没有第二份证据——这一行是当场把形状钉下来的唯一机会。
+fn url_shape(url: &str) -> String {
+    let (head, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut keys = Vec::new();
+    let mut nested = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        keys.push(format!("{key}({} 字符)", value.chars().count()));
+        if key == "gourl" {
+            let decoded = percent_encoding::percent_decode_str(value)
+                .decode_utf8_lossy()
+                .into_owned();
+            let inner = decoded.split_once('?').map(|(_, q)| q).unwrap_or("");
+            nested.extend(inner.split('&').filter(|p| !p.is_empty()).map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                format!("{key}({} 字符)", value.chars().count())
+            }));
+        }
+    }
+    if nested.is_empty() {
+        format!("{head} 顶层键=[{}]（没有 gourl 子查询）", keys.join("，"))
+    } else {
+        format!(
+            "{head} 顶层键=[{}]，gourl 子查询键=[{}]",
+            keys.join("，"),
+            nested.join("，")
+        )
     }
 }
 
@@ -958,6 +1020,51 @@ mod tests {
         // 没带 SESSDATA 就等于没登录成，不能装作拿到了
         assert!(cookie_from_url("https://www.bilibili.com/?mid=1").is_none());
         assert!(cookie_from_url("").is_none());
+    }
+
+    /// 站方把真 Cookie 裹进 `gourl` 子查询的那一种：顶层只有一个短标识，解一层才拿得到。
+    /// 2026-10-08 真人扫码那轮拿到的就是「code 0、326 字节、顶层拆不出」，这一条是那一轮之后补的分叉。
+    #[test]
+    fn login_cookie_is_mined_from_the_nested_gourl() {
+        let inner = "https://www.bilibili.com/?DedeUserID=777&SESSDATA=inner%2C1&bili_jct=jj";
+        let url = format!(
+            "https://passport.bilibili.com/x/passport-login/web/crossDomain?gourl={}&from_spmid=webwindow.0.0",
+            percent_encoding::utf8_percent_encode(inner, percent_encoding::NON_ALPHANUMERIC)
+        );
+        let cookie = cookie_from_url(&url).expect("gourl 子查询里的 SESSDATA 该被挖出来");
+        assert!(cookie.contains("SESSDATA=inner,1"), "{cookie}");
+        assert!(cookie.contains("DedeUserID=777"), "{cookie}");
+        // 顶层有 SESSDATA 时不该去动 gourl（两条各自独立，别互相盖掉）
+        assert!(
+            cookie_from_url(
+                "https://www.bilibili.com/?SESSDATA=top&gourl=https%3A%2F%2Fx%3FSESSDATA%3Dinner"
+            )
+            .unwrap()
+            .contains("SESSDATA=top")
+        );
+    }
+
+    /// 取证日志的形状：键名与长度要留得下来，**值一个字符都不能进去**。
+    #[test]
+    fn the_login_url_shape_keeps_keys_but_never_values() {
+        let url = "https://passport.bilibili.com/x/passport-login/web/crossDomain?ac_time=999&gourl=https%3A%2F%2Fwww.bilibili.com%2F%3FSESSDATA%3Dsecret-value%26mid%3D5";
+        let shape = url_shape(url);
+        assert!(shape.contains("ac_time(3 字符)"), "{shape}");
+        assert!(shape.contains("gourl("), "子查询得报出来: {shape}");
+        assert!(
+            shape.contains("SESSDATA(12 字符)"),
+            "内层键名与长度: {shape}"
+        );
+        assert!(
+            !shape.contains("secret-value"),
+            "凭据值绝不能进日志: {shape}"
+        );
+        assert!(
+            !shape.contains("999&"),
+            "值之后的内容不该被原样带出: {shape}"
+        );
+        // 空 url 也得给得出可读的一行，不能 panic
+        assert_eq!(url_shape(""), " 顶层键=[]（没有 gourl 子查询）");
     }
 
     #[test]
