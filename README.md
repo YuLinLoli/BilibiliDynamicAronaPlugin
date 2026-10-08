@@ -1583,6 +1583,39 @@ HTTP 代发响应闸、日志单行限流）会不会伤到已经发出去的 dl
 给插件作者的一句话：**框架抬布局之后必须重编 dll**。这一条现在是硬拒载而不是静默失效，所以
 "装载被跳过"是正常信号，照提示重编即可，不必怀疑自己的代码。
 
+### 2026-10-09：代发 HTTP 能把响应头交回来、`ABI_LAYOUT` 抬到 7——这一轮改的是插件源码
+
+B 站把扫码回票的形状又改了一次：`poll` 给的 `url` 是 `passport.biligame.com/…/crossDomain?ticket=…&gourl=…`，
+`SESSDATA` **既不在顶层 query 也不在 `gourl` 子查询里**，只下在换票那一次请求的 `Set-Cookie` 上。
+插件此前拿不到响应头（框架的代发通道只回正文），所以"扫通了却登不上"（#143）。框架那一侧补了通道
+（`Request::wanting_headers()` + `send_with_headers`，布局 6→7），这一侧补的是**换票那一刀**：
+
+* `poll` 里 url 拆不出票就当场拿 `ticket` 去换一次。当场是唯一的机会——**poll 的成功回执是一次性的**，
+  第二次问同一把 `qrcode_key` 回的是 86038，留给下一轮就等于永远拿不到。
+* 只敲自家域（`is_bili_host`）：这一趟要的是登录凭据，不能把它送到第三方门上去。
+* `cookie_from_headers` 从每一跳的 `Set-Cookie` 里挑 `SESSDATA`/`bili_jct`/`DedeUserID`/`sid`；
+  **值原样留着不做 percent 解码**（浏览器怎么收的就怎么发回去，解码过的值站方不认；
+  `cookies.json` 那一路本来也是这个口径，见 `cookie_file_needs_both_keys_and_keeps_them_encoded`）。
+* 两条失败支路各留一行取证日志，且**只报头名与值的长度**（`headers_shape`）——这些头本身就是凭据。
+
+实测（dll `bb09b01e3f797abf` 配宿主 `837098d31ac2d489`，同一批 `cargo build --release`）：
+
+* **真人扫码一轮 `run-login-scan.sh`**：握手打「布局 7」；`插件请求代发 …crossDomain?ticket=…` 紧跟
+  `代发成功，响应 170164 字节、27 个头`——头计数非 0 才是这道新通道真过了边界；
+  收尾 `登录成功!`，配置写回 `cookie 长度=309`、`uid=24075161`，宿主 panic 0。
+  两句取证警告（`url 里拆不出 Cookie`、`换票回来的…没有 Cookie`）这一轮**都没出现**，
+  说明票是从 `Set-Cookie` 那一路拿到的，而不是 url 那条老支路侥幸命中。
+* **真登录态一轮 `run-signed.sh`（#85）**：用的就是这枚扫码写回的登录态（`cookies.json` 与图缓存先挪开，
+  判缩放档才有牙齿）。`认:` 关注流 7 次代发、0 次「账号登录失效」、水位前进、1 张 1000 宽的插件卡片；
+  `认:` 图床 2 次出门全是 `@720w.webp`、交出去的附件宽度 720；#145 那句 `通:` 问一次念一次。
+* **命令面一轮 `run-cmdseq.sh`**：46 条 `通` / 0 条可疑，`/bili add 546195` 照样回「订阅成功」——
+  工装侧把**两处登录态一起藏**（`hide-login.sh`／`show-login.sh`：`cookies.json` 与配置里那份 `account.cookie`），
+  只藏文件在布局 7 之后等于没藏。
+* `cargo test` 201 passed / 4 ignored（比上一轮多两条：`login_cookie_is_mined_from_the_set_cookie_header`、
+  `the_response_header_shape_keeps_names_but_never_values`）。
+
+顺带把所有 `Request { … }` 字面量补成 `..Default::default()`——框架往后加字段不再打断插件编译。
+
 ## 功能面差集收口
 
 判"改完了"用的是三面差集，每一面都比到具体条目，不是比总数：
