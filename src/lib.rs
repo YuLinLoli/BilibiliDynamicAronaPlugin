@@ -20,6 +20,8 @@ mod config;
 mod draw;
 mod link;
 mod push;
+/// 把订阅表交给框架的展示板（GUI 的群管理页读那张板子，框架不读本插件的 store.yml）
+mod report;
 mod store;
 mod tasks;
 mod translate;
@@ -115,12 +117,15 @@ impl AronaPlugin for BiliDynamicPlugin {
 
     fn start(&self, ctx: &PluginContext) -> Result<(), String> {
         store();
+        report::attach(ctx);
         tasks::schedule(ctx);
         Ok(())
     }
 
     /// 配置热重载：检测间隔、低频时段、绘图外观都可能变了，按新值重排任务
     fn on_config_reload(&self, ctx: &PluginContext) {
+        // 上下文每轮都不一样（装载器可能换了实例），展示板的上报口跟着重挂一次并补报
+        report::attach(ctx);
         tasks::schedule(ctx);
     }
 }

@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 /// 目标种类过滤器与正则过滤器各自的模式
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -834,6 +834,10 @@ impl Data {
 pub struct Store {
     path: std::path::PathBuf,
     data: RwLock<Data>,
+    /// 订阅表变了就重报一次框架的展示板（GUI 的群管理页读那张板子）。
+    /// 挂在这里而不是让每个改订阅的命令自己调一遍，是因为"谁会忘了调"正是这种面板最先烂掉的方式：
+    /// 落盘的那一手本来就在这里，报出去顺手就跟着做了。为空（还没 start 起来）时什么都不做。
+    reporter: Mutex<Option<Box<dyn Fn(&Data) + Send + Sync>>>,
 }
 
 impl Store {
@@ -853,7 +857,18 @@ impl Store {
         Store {
             path,
             data: RwLock::new(data),
+            reporter: Mutex::new(None),
         }
+    }
+
+    /// 挂上一个"订阅面变了"的回调。回调拿的是已经放开发写锁之后的快照，
+    /// 所以它**可以**去读别的东西，但绝不该再回到 `Store` 里读写（那会把锁套锁）。
+    pub fn attach_reporter(&self, reporter: impl Fn(&Data) + Send + Sync + 'static) {
+        let mut slot = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some(Box::new(reporter));
     }
 
     /// 只读取一次快照
@@ -863,7 +878,7 @@ impl Store {
 
     /// 改完之后自动落盘；落盘失败只记日志，不回滚内存（否则命令会表现为"没反应"）
     pub fn write<T>(&self, f: impl FnOnce(&mut Data) -> T) -> T {
-        {
+        let (result, snapshot) = {
             let mut guard = self.data.write().unwrap();
             let result = f(&mut guard);
             if let Err(reason) = guard.save(&self.path) {
@@ -871,17 +886,37 @@ impl Store {
                     "bilibili：状态没存下去（{reason}），内存里的改动仍然生效"
                 ));
             }
-            result
-        }
+            // 快照是克隆出来的：报板子时不再持着写锁，回调里出任何岔子都不会把整张表锁死
+            (result, guard.clone())
+        };
+        self.tell(&snapshot);
+        result
     }
 
-    /// 改内存但不落盘：批量导入时用，之后自己调一次 [`Store::flush`]
+    /// 改内存但不落盘：批量导入时用，之后自己调一次 [`Store::flush`]（那一手会报板子）
     pub fn edit_only<T>(&self, f: impl FnOnce(&mut Data) -> T) -> T {
         f(&mut self.data.write().unwrap())
     }
 
     pub fn flush(&self) -> Result<(), String> {
-        self.data.read().unwrap().save(&self.path)
+        let (result, snapshot) = {
+            let guard = self.data.read().unwrap();
+            (guard.save(&self.path), guard.clone())
+        };
+        if result.is_ok() {
+            self.tell(&snapshot);
+        }
+        result
+    }
+
+    fn tell(&self, data: &Data) {
+        let reporter = self
+            .reporter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reporter) = reporter.as_ref() {
+            (reporter)(data);
+        }
     }
 }
 
