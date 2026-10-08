@@ -31,6 +31,12 @@ const SEASON_ROW: &str = "番剧";
 pub(crate) fn attach(ctx: &PluginContext) {
     let holder = ctx.clone();
     crate::store().attach_reporter(move |data| publish(&holder, data));
+    // 先把"上次报过什么"清掉再补报：插件被停用又启用时，框架那边按归属把整块收走了，
+    // 而这份对比缓存还留在 dll 的静态里（模块随进程常驻）。不清就等于"内容和上次一样"，
+    // 于是重新启用之后 GUI 那一块会是空的，直到下次真改订阅才回来。
+    if let Ok(mut last) = LAST.lock() {
+        last.clear();
+    }
     crate::store().read(|data| publish(ctx, data));
 }
 
