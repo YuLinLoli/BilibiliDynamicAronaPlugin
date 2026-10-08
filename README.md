@@ -1630,7 +1630,9 @@ B 站把扫码回票的形状又改了一次：`poll` 给的 `url` 是 `passport
   一次门都不敲**。监听一轮 35 条推送、水位前进两次，而展示板只报了 1 次——这条对比是真在起作用的凭据。
 * 只报群（`g` 前缀那批目标）。好友/私聊的订阅 GUI 没有地方放，`/bili list <QQ>` 查得到。
 
-实测（dll `059edb7139c09aa7` 配宿主 `6f440f9daa425a24`，握手打「布局 8」）：
+实测（dll `2fbe3a2c01fe58f2` 配宿主 `6f440f9daa425a24`，握手打「布局 8」；这一枚比上面记的
+`059edb71…` 多一修：**插件被停用又启用时要先把展示板的补报缓存清掉**，否则框架那边按归属收走了条目、
+dll 里那份"上次报过什么"还在，一比就"没变"，GUI 那块会一直空到下次真改订阅）：
 
 * `run-cmdseq.sh`：28 条回话 / 可疑 0 / panic 0；`[展示板] 插件 bilibili 的会话 20001 收下 1 项 →
   2 项 → 1 项 → 摘掉`，正好对上 `/bili add 0`、`/bili add 546195`、`/bili del 546195`、`/bili delall`
@@ -1638,6 +1640,19 @@ B 站把扫码回票的形状又改了一次：`poll` 给的 `url` 是 `passport
 * `run-listen.sh`：35 推送 / 12 条带正文 / 水位前进 / 页底告警 1 次 / panic 0；`[BilibiliDynamic:启动]
   [展示板] … 收下 1 项` 只有这一条，证明**启动补报**与"没变就不敲门的"两格同时成立。
 * 另两个插件 crate（蓝档、插件模板仓）源码一个字未改，重编即过：17 passed 与 1 passed。
+* **十四套工装在布局 8 这批产物上各跑了一遍**（`run-sweep-166.sh` 把判定行收进 `sweep-166.log`）：
+  `signed`／`listen`／`cmdseq`／`relation`（四格全 `认:`）／`firehose`／`translate`（四轮 `认:`）／
+  `config-wizard`（50+57 条回话、可疑 0）／`link`／`season`／`clear`／`mute`／`timeout`／`live404` 全绿，
+  `login` 那套本来就只核发图链与撤码（它没有判定行，判的是 store 与 node 内容）；panic 全程 0。
+  **横扫当场挖出一个工装缺陷**（不是产品缺陷，但它会污染判据）：真凭据现在写在 `arona.yml` 里，
+  而 `relation`／`firehose`／`translate`／`config-wizard` 是"先 `cp` 配置成 .bak、后藏登录态"，
+  .bak 里就带着真 cookie，`round()` 每轮从 .bak 还原 → 本该匿名的轮次带着真登录态跑。
+  症状就在第一轮横扫里：假 cookie 写不进去、匿名轮不匿名、翻译四轮 0 推送 0 出门。
+  收口不是去排顺序，而是**把"拍快照"这件事本身做成永远不带凭据**（`snap.sh`：cp 完就地清掉
+  `cookie`/`uid`），顺带把 `relation` 与 `stall` 尾部"先 show 再还原"的顺序倒过来——那个顺序会把
+  刚放回去的 cookie 再用空快照盖掉，而暂存文件那时已经被 show 删了，等于把凭据弄丢。
+* 缩放档那把仪表在这轮的 `signed` 上**没牙齿**（图床缓存全命中，壳自己写了 `注:` 并指路挪 `IMAGES`）；
+  那一条的凭据是同一批产物更早那一轮：挪开 `IMAGES` 之后 2 次出门全 `@720w.webp`、交出去 720x405。
 * 本插件 `cargo test` 203 passed / 4 ignored（新增 `src/report.rs` 两条：只报群且昵称缺失时用 uid 顶、
   带制表符/换行的昵称伪造不出第二行）。
 
