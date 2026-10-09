@@ -16,11 +16,11 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# 框架在另一个盘（G: 的插件仓 / C: 的框架仓），相对路径写不成，这里用绝对路径。
+# 框架仓与本插件仓同在 G:\rustprojects 下，所以写得成相对路径——整仓挪盘时这一行不用跟着改。
 # 发版时要换成 git 标签或 crates.io，见框架仓库 PLUGIN_DEVELOPMENT.md §16：
 #   arona = { package = "arona-rs", git = "https://github.com/YuLinLoli/Arona-rs", tag = "v1.1.0", default-features = false }
 # default-features = false 是硬要求：gui 由宿主决定，插件带上会把 eframe/wgpu 整条链拖进 dll。
-arona = { package = "arona-rs", path = "C:/Users/cheng/RustroverProjects/Arona-rs/crates/arona", version = "1.1.0", default-features = false }
+arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", version = "1.1.0", default-features = false }
 tokio = { version = "1", features = ["full"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
