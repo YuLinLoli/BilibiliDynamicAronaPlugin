@@ -674,20 +674,13 @@ pub struct TemplateConfig {
 
 impl Default for TemplateConfig {
     fn default() -> Self {
+        // 这三张表逐键、逐字面量照搬原插件 `TemplateConfig`（`BiliConfig.kt:231-247`），不自创档。
+        //
+        // 之前这里另有 `OnlyDraw`（与 `DrawOnly` 同义重复）、`SimpleMsg`（原插件动态表里没这个名字，
+        // 它只存在于 liveClose）、`NoDraw` 三档，而三个 default 又全指着 `SimpleMsg`——那条串
+        // `{draw}\r{content}\r{images}` 会把一条动态摊成「卡片 + 正文 + 原图」三条，可正文和原图
+        // 本来就已经画进卡片了。默认形态因此与原插件不符（原插件默认 `OneMsg`，只发卡片加一行署名）。
         let mut dynamic_push = BTreeMap::new();
-        dynamic_push.insert("OnlyDraw".into(), "{draw}".into());
-        dynamic_push.insert("SimpleMsg".into(), "{draw}\r{content}\r{images}".into());
-        dynamic_push.insert(
-            "ForwardMsg".into(),
-            "{draw}{>>}作者：{name}\nUID：{uid}\n时间：{time}\n类型：{type}\n链接：{link}\r{content}\r{images}{<<}".into(),
-        );
-        dynamic_push.insert(
-            "NoDraw".into(),
-            "{name} 更新了{type}\n{content}\n{images}\n{link}".into(),
-        );
-        // 下面四条是原插件 `TemplateConfig.dynamicPush` 里那几档，名字与内容都照搬
-        // （`BiliConfig.kt:231-237`）：那边配置里写着 `defaultDynamicPush: OneMsg` 的，
-        // 换到这边不改名就该查不到模板，所以这几个名字必须一直在。
         dynamic_push.insert("DrawOnly".into(), "{draw}".into());
         dynamic_push.insert(
             "TextOnly".into(),
@@ -698,16 +691,17 @@ impl Default for TemplateConfig {
             "TwoMsg".into(),
             "{draw}\r{name}@{uid}@{type}\n{time}\n{link}".into(),
         );
+        dynamic_push.insert(
+            "ForwardMsg".into(),
+            "{draw}{>>}作者：{name}\nUID：{uid}\n时间：{time}\n类型：{type}\n链接：{links}\r{content}\r{images}{<<}".into(),
+        );
 
         let mut live_push = BTreeMap::new();
-        live_push.insert("OnlyDraw".into(), "{draw}".into());
-        live_push.insert(
-            "SimpleMsg".into(),
-            "{draw}\r{name} 正在直播：{title}\n分区：{area}\n房间号：{rid}\n{link}".into(),
-        );
-        live_push.insert("TextOnly".into(), "{name} 开播了！\n{title}\n{link}".into());
-        // 同样照搬原插件 `livePush` 那三档（`BiliConfig.kt:238-242`）
         live_push.insert("DrawOnly".into(), "{draw}".into());
+        live_push.insert(
+            "TextOnly".into(),
+            "{name}@直播\n{link}\n标题: {title}".into(),
+        );
         live_push.insert("OneMsg".into(), "{draw}\n{name}@直播\n{link}".into());
         live_push.insert(
             "TwoMsg".into(),
@@ -717,17 +711,16 @@ impl Default for TemplateConfig {
         let mut live_close = BTreeMap::new();
         live_close.insert(
             "SimpleMsg".into(),
-            "{name} 的直播已结束\n标题：{title}\n分区：{area}\n房间号：{rid}\n开播：{startTime}\n结束：{endTime}\n时长：{duration}".into(),
+            "{name} 直播结束啦!\n直播时长: {duration}".into(),
         );
-        // 原插件这一档只有两句（`BiliConfig.kt:244-247`），照原名留着
         live_close.insert(
             "ComplexMsg".into(),
-            "{name} 直播结束啦!\n直播时长: {duration}".into(),
+            "{name} 直播结束啦!\n标题: {title}\n直播时长: {duration}".into(),
         );
 
         TemplateConfig {
-            default_dynamic_push: "SimpleMsg".into(),
-            default_live_push: "SimpleMsg".into(),
+            default_dynamic_push: "OneMsg".into(),
+            default_live_push: "OneMsg".into(),
             default_live_close: "SimpleMsg".into(),
             dynamic_push,
             live_push,
@@ -869,21 +862,49 @@ mod tests {
         assert!(!custom.allows("bad.example.org"));
     }
 
-    /// 原插件 `TemplateConfig` 里那几档模板名必须一直在（`BiliConfig.kt:227-247`）：
-    /// 那边配置里写 `defaultDynamicPush: OneMsg` 的人换到这边不该需要改名
+    /// 三张模板表要与原插件 `TemplateConfig` **逐键、逐字面量**一致，且不许自创档
+    /// （`BiliConfig.kt:231-247`）。只查键名不够：上一版名字全在、`liveClose` 两档的字面量
+    /// 却整体错位，默认档还指着动态表里根本没有的 `SimpleMsg`，一路过了所有单测，
+    /// 直到真数据把一条动态推成「卡片+正文+原图」三条才暴露。
+    /// 把表里的 String 借成 &str，好跟字面量数组逐键比对
+    fn lettered(table: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
+        table.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+    }
+
     #[test]
-    fn the_original_template_names_all_exist() {
+    fn template_tables_match_the_original_to_the_letter() {
         let config = TemplateConfig::default();
-        for name in ["DrawOnly", "TextOnly", "OneMsg", "TwoMsg", "ForwardMsg"] {
-            assert!(
-                config.dynamic_push.contains_key(name),
-                "动态模板少了 {name}"
-            );
-        }
-        for name in ["DrawOnly", "TextOnly", "OneMsg", "TwoMsg"] {
-            assert!(config.live_push.contains_key(name), "直播模板少了 {name}");
-        }
-        assert!(config.live_close.contains_key("ComplexMsg"));
+
+        let mut dynamic = BTreeMap::new();
+        dynamic.insert("DrawOnly", "{draw}");
+        dynamic.insert("TextOnly", "{name}@{type}\n{link}\n{content}\n{images}");
+        dynamic.insert("OneMsg", "{draw}\n{name}@{type}\n{link}");
+        dynamic.insert("TwoMsg", "{draw}\r{name}@{uid}@{type}\n{time}\n{link}");
+        dynamic.insert(
+            "ForwardMsg",
+            "{draw}{>>}作者：{name}\nUID：{uid}\n时间：{time}\n类型：{type}\n链接：{links}\r{content}\r{images}{<<}",
+        );
+        assert_eq!(lettered(&config.dynamic_push), dynamic, "动态模板表与 BiliConfig.kt:231-237 不一致");
+
+        let mut live = BTreeMap::new();
+        live.insert("DrawOnly", "{draw}");
+        live.insert("TextOnly", "{name}@直播\n{link}\n标题: {title}");
+        live.insert("OneMsg", "{draw}\n{name}@直播\n{link}");
+        live.insert("TwoMsg", "{draw}\r{name}@{uid}@直播\n{title}\n{time}\n{link}");
+        assert_eq!(lettered(&config.live_push), live, "直播模板表与 BiliConfig.kt:238-243 不一致");
+
+        let mut close = BTreeMap::new();
+        close.insert("SimpleMsg", "{name} 直播结束啦!\n直播时长: {duration}");
+        close.insert("ComplexMsg", "{name} 直播结束啦!\n标题: {title}\n直播时长: {duration}");
+        assert_eq!(lettered(&config.live_close), close, "直播结束模板表与 BiliConfig.kt:244-247 不一致");
+
+        // 三个默认档必须是各自表里真实存在的名字（原插件：OneMsg / OneMsg / SimpleMsg）
+        assert_eq!(config.default_dynamic_push, "OneMsg");
+        assert_eq!(config.default_live_push, "OneMsg");
+        assert_eq!(config.default_live_close, "SimpleMsg");
+        assert!(config.dynamic_push.contains_key(&config.default_dynamic_push));
+        assert!(config.live_push.contains_key(&config.default_live_push));
+        assert!(config.live_close.contains_key(&config.default_live_close));
     }
 
     /// 模板表要能被配置区渲染出来：空表会被渲染成 `{}`，用户看不出该填什么
@@ -891,7 +912,7 @@ mod tests {
     fn builtin_templates_are_present() {
         let config = TemplateConfig::default();
         assert!(config.dynamic_push.contains_key("ForwardMsg"));
-        assert!(config.live_push.contains_key("SimpleMsg"));
+        assert!(config.live_push.contains_key("OneMsg"));
         assert!(config.live_close.contains_key("SimpleMsg"));
         assert!(
             config

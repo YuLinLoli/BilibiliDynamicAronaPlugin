@@ -830,6 +830,9 @@ impl Data {
     }
 }
 
+/// 订阅表变了要通知谁：拿当前库快照上报展示板的那一个闭包
+type Reporter = Box<dyn Fn(&Data) + Send + Sync>;
+
 /// 内存里那份状态：命令改它、检测任务读它，读写各走一把 RwLock
 pub struct Store {
     path: std::path::PathBuf,
@@ -837,7 +840,7 @@ pub struct Store {
     /// 订阅表变了就重报一次框架的展示板（GUI 的群管理页读那张板子）。
     /// 挂在这里而不是让每个改订阅的命令自己调一遍，是因为"谁会忘了调"正是这种面板最先烂掉的方式：
     /// 落盘的那一手本来就在这里，报出去顺手就跟着做了。为空（还没 start 起来）时什么都不做。
-    reporter: Mutex<Option<Box<dyn Fn(&Data) + Send + Sync>>>,
+    reporter: Mutex<Option<Reporter>>,
 }
 
 impl Store {

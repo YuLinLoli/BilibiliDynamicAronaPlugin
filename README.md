@@ -171,11 +171,11 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 ### `bili-template` — 推送模板
 
-内置模板名：动态 `OnlyDraw` / `SimpleMsg` / `ForwardMsg` / `NoDraw`，另附原插件那五档
-`DrawOnly` / `TextOnly` / `OneMsg` / `TwoMsg` / `ForwardMsg`；直播 `OnlyDraw` / `SimpleMsg` / `TextOnly`，
-另附 `DrawOnly` / `OneMsg` / `TwoMsg`；直播结束 `SimpleMsg` / `ComplexMsg`。
-两边同名的档位内容一致，改名那一档见「已知差别」第 37 条。
-`defaultDynamicPush` / `defaultLivePush` / `defaultLiveClose` 都指向 `SimpleMsg`。
+内置模板名与原插件一档不差、也不多自创档：动态 `DrawOnly` / `TextOnly` / `OneMsg` / `TwoMsg` /
+`ForwardMsg`，直播 `DrawOnly` / `TextOnly` / `OneMsg` / `TwoMsg`，直播结束 `SimpleMsg` / `ComplexMsg`。
+名字与模板串都照搬 `BiliConfig.kt:231-247`，逐键逐字面量由单测钉住。
+三个默认档也与原插件同值：`defaultDynamicPush` 与 `defaultLivePush` 都是 `OneMsg`，
+`defaultLiveClose` 是 `SimpleMsg`。
 自己加项那张表按类型分三个键：动态写进 `dynamicPush`、直播写进 `livePush`、直播结束写进 `liveClose`，
 里面的键名就是 `/bili template` 里写的那个模板名。
 
@@ -190,7 +190,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 `drawEnable: false` 时卡片不画，`{draw}` 那格会落成一句占位文本
 （动态 `[绘制动态失败]`、直播 `[绘制直播图片失败]`）——这与原插件关掉 `drawEnable` 后的行为一致。
-只想要卡片不要文字，把模板换成 `OnlyDraw`；想要文字不要卡片，换成 `NoDraw`。
+只想要卡片不要文字，把模板换成 `DrawOnly`；想要文字不要卡片，换成 `TextOnly`。
 
 ### 导入浏览器 cookie（`cookies.json`）
 
@@ -284,7 +284,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 26. **不解析「互动数 / 置顶 / 仅粉丝可见」这三族字段**：原插件的模板与绘图里都没有它们的功能面，
     带着只会让 `store.yml` 变胖。B 站挡掉正文时（屏蔽、仅粉丝、已删除），卡片上照抄 B 站给的那句提示。
 27. **译文只进卡片，不进文本模板**：与原插件一致——那条 `trans(text)` 只喂给动态卡绘图，
-    `{content}` 从来不带译文。开了 `NoDraw` 那一档就等于没有翻译。
+    `{content}` 从来不带译文。选了不带 `{draw}` 的那一档（`TextOnly`）就等于没有翻译。
     喂进去的那一份是 `Dynamic::text`（`parse_item` 里 `body` 那条取文链：`desc.text` → 富文本节点拼 →
     `major_body`），**不是**模板 `{content}`
     用的 `display_text()`（那两个 `Dynamic` 字段差在哪：转发动静的原文只进 `display_text()`）。
@@ -332,19 +332,24 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     实测**同一秒连打两次就回 `-352 风控校验失败`**（响应只有 120 字节），未登录时等级还回 Lv0。
     链接解析里 `t.bilibili.com/<动态ID>` 那一族仍必须签名（B 站只有那条给单条动态），所以连点会吃到 -352，
     插件如实回一句「把检测间隔调大一些再试」，不静默、不假装成功。
-37. **模板名与原插件一档不改名，另外多三档**：原插件 `TemplateConfig` 那几档（动态
+37. **模板名与模板串一档不改、也不多自创**：原插件 `TemplateConfig` 那几档（动态
     `DrawOnly`/`TextOnly`/`OneMsg`/`TwoMsg`/`ForwardMsg`、直播 `DrawOnly`/`TextOnly`/`OneMsg`/`TwoMsg`、
-    结束 `SimpleMsg`/`ComplexMsg`，`BiliConfig.kt:227-247`）名字与模板串都照搬，那边配置里写
-    `defaultDynamicPush: OneMsg` 的换过来不用改。这边另有 `OnlyDraw` / `SimpleMsg` / `NoDraw` 三档，
-    其中 `SimpleMsg` 用 `\r` 把卡片、正文、配图拆成三条，是默认的推送形态。
-    **配置文件是按当前代码生成的**：旧那份 yml 的 `dynamicPush` 表里没有新补的那几档，把默认指过去会查不到
-    而回退到 `SimpleMsg`——删掉 `config/bilibili/arona.yml` 让框架重生成就行（实测重生成出来九档齐全）。
+    结束 `SimpleMsg`/`ComplexMsg`，`BiliConfig.kt:231-247`）名字与模板串都照搬，那边配置里写
+    `defaultDynamicPush: OneMsg` 的换过来不用改。
+    2026-10-09 之前这里另有 `OnlyDraw`（与 `DrawOnly` 同义重复）、`SimpleMsg`（原插件**动态表里没有**
+    这个名字，它只存在于结束表）、`NoDraw` 三档，而三个默认档全指着自创的那个 `SimpleMsg`——
+    它的串是 `{draw}\r{content}\r{images}`，会把一条动态摊成「卡片 + 正文 + 原图」三条，
+    可正文和原图本来就已经画进卡片里了。第一次拿真数据推动态时暴露，三档已删、默认已改回原插件的
+    `OneMsg`，`config.rs` 另加一条单测把三张表**逐键逐字面量**钉死：原先那条只查键名在不在，
+    所以 `liveClose` 两档字面量整体错位也一路绿灯。
+    **配置文件是按当前代码生成的**：旧 yml 的 `dynamicPush` 表里若还写着上面那三个已删的档名，
+    把它设成默认会查不到而回退到内置兜底串（兜底串同样取原插件的默认档，不会再多发）——
+    删掉 `config/bilibili/arona.yml` 让框架重生成就行。
 38. **几处默认值刻意保守**：`account.followGroup` 原 `"Bot关注"` → 留空（不预设分组名）、
     `cache.downloadOriginal` 原 `true` → `false`
     （默认不落地原图，附件仍照发）、`cardOrnament` 原 `FanCard` → `None`（见第 29 条）、
     `push.messageInterval`/`pushInterval` 从 100/500 毫秒放宽到 500/1000（连打会被 B 站判 -352）、
-    `check.interval` 从 15 秒放宽到 30、`check.timeout` 从 10 秒放宽到 20、`footerAlign` 从 LEFT 改 CENTER、
-    `defaultDynamicPush` 与 `defaultLivePush` 从 `OneMsg` 改成 `SimpleMsg`。
+    `check.interval` 从 15 秒放宽到 30、`check.timeout` 从 10 秒放宽到 20、`footerAlign` 从 LEFT 改 CENTER。
     `account.autoFollow` 曾经也在这一列里（`true` → `false`，理由是「订阅不擅自替你关注」），
     2026-10-03 检测主路径换成关注时间线之后就改回原插件那个 `true` 了：那条只覆盖这个账号**关注过**的人，
     订阅却不关注就成了「订了收不到」。
@@ -684,7 +689,8 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    **那数是下界不是上界**，超限的那条根本没落盘。盘上缓存 119 个文件 131.3MB，最大一张是 4268x5999 的 JPEG，
    8.95MB（25.6 百万像素）；`push::attachment` 按你 2026-10-03 拍的「统一转码」无损重编成 PNG 约 100MB，
    base64 之后约 130MB，而 `ws` 的 `maxPayload` 默认 100MiB——就是这么顶爆的。
-   `SimpleMsg` 那条模板串 `"{draw}\r{content}\r{images}"` 会把**一条动态的全部附件并进同一条消息**，再放大一档
+   当时默认的 `SimpleMsg` 那条串 `"{draw}\r{content}\r{images}"` 会把**一条动态的全部附件并进同一条消息**，再放大一档
+   （这一档是 2026-10-09 才删掉的自创档，见第 37 条；`{images}` 这个占位符本身还在，`TextOnly`/`ForwardMsg` 里都带着）
    ——机制在 `push/template.rs`：模板按字面 `\r` 切成若干条消息，而 `{images}` 那一支把 `supply.images` 整批
    推进同一条消息的段序列。所以「一条动态一张图」的那几轮看不出这一档（本轮 12 条 = 4 正文 + 8 单图，
    每条恰好一个图片段，因为每位动态只有一张附件），**别拿那种轮次当反证**。
@@ -701,7 +707,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
    端到端那一环同一份产物（`e22c6fdedba8528b`）连跑两遍数字一致：图床代发 缩放档=4／原件=0（改前是 1／4），
    附件宽度 1920x1080×4 → 720x405×4，单条最大 4.9MB → 2.7MB（逐条对照见已知差别第 44 条）。
    **但这一修不等于体积问题收口**：`@720w` 只钳宽度，一张 720 宽的长图无损转成 PNG 照样能有几 MB，
-   而 `SimpleMsg` 又把一条动态的全部附件并进同一条消息，所以下面三个口径仍然等你挑：
+   而带 `{images}` 的那几档又把一条动态的全部附件并进同一条消息，所以下面三个口径仍然等你挑：
    A 只把 WebP 那一路转成 PNG、JPEG 原字节直发（回到「统一」之前，体积不再失控，代价是编码口径破了）；
    B `attachment()` 加一条宽度上限，按 `quality` 档缩放后再转码（保住「交出去的都是 PNG」，代价是长图被压小）；
    C 给一条消息的附件总字节设上限，超出那几张只画进卡片、不单独发（保住消息不崩，代价是模板语义多一条隐规则）。
@@ -1018,7 +1024,8 @@ JPEG 原件直发之后「全是 PNG」这句不再成立（那一轮的链接�
   结束：2026年09月30日 21:39:58／时长：3:58:20」。这是这一族通知第二次被真数据驱动。
 - 原插件那几档模板名补齐之后实压过一遍：删掉 `config/bilibili/arona.yml` 让框架按新代码重生成，`dynamicPush`
   表里 `DrawOnly`/`TextOnly`/`OneMsg`/`TwoMsg` 四档都出现了（旧那份 yml 里确实没有，所以先前把
-  `defaultDynamicPush` 指到 `OneMsg` 会查不到而回退成 `SimpleMsg`——F 轮就是这么撞上的，不是渲染 bug）。
+  `defaultDynamicPush` 指到 `OneMsg` 会查不到而回退成当时自创的 `SimpleMsg`——F 轮就是这么撞上的，不是渲染 bug；
+  那个自创档连同默认档一起在 2026-10-09 改回原插件的 `OneMsg` 了，见第 37 条）。
   重生成之后配 `defaultDynamicPush: OneMsg` + `drawEnable: false` 逼一轮，12 条推送**每条恰好三行**：
   「[绘制动态失败]⏎老番茄@视频⏎https://t.bilibili.com/1253703543616962617」，`{type}` 真给出「视频／转发动态」，
   带图 0 条——`OneMsg` 本来就不含 `{images}`，与原插件那串一模一样。
@@ -1727,10 +1734,10 @@ cargo build --release          # 加了 --target 三元组时产物在 target/<�
 工具链由 `rust-toolchain.toml` 钉死（只写 channel，不写 components——写进去会让每次 cargo 都去补装组件）。
 `.cargo/config.toml` 给 msvc 目标加了 `-C target-feature=+crt-static`，这样 dll 不拖 VCRUNTIME。
 
-框架依赖现在是绝对路径（插件仓在 `G:`、框架仓在 `C:`，相对路径写不成）：
+框架依赖走同级目录的相对路径（插件仓与框架仓都在 `G:\rustprojects` 下，仓库整体挪盘时这一行不用跟着改）：
 
 ```toml
-arona = { package = "arona-rs", path = "C:/Users/cheng/RustroverProjects/Arona-rs/crates/arona", version = "1.1.0", default-features = false }
+arona = { package = "arona-rs", path = "../Arona-rs/crates/arona", version = "1.1.0", default-features = false }
 ```
 
 发版时换成 git 标签或 crates.io 那一行（见 `Cargo.toml` 注释）。`default-features = false` 是硬要求：

@@ -50,12 +50,14 @@ impl Kind {
         }
     }
 
-    /// 查不到任何模板时用的兜底串（等价于原插件的 SimpleMsg）
+    /// 查不到任何模板时用的兜底串。取的是原插件那三张表里的**默认档**
+    /// （动态/直播 `OneMsg`、结束 `SimpleMsg`，`BiliConfig.kt:228-230`）——
+    /// 之前这里写的是自创的 `{draw}\r{content}\r{images}`，等于"查不到就多发两条"。
     fn fallback(self) -> &'static str {
         match self {
-            Kind::Dynamic => "{draw}\r{content}\r{images}",
-            Kind::Live => "{draw}\r{name} 正在直播：{title}\n{link}",
-            Kind::LiveClose => "{name} 的直播已结束\n房间号：{rid}\n{link}",
+            Kind::Dynamic => "{draw}\n{name}@{type}\n{link}",
+            Kind::Live => "{draw}\n{name}@直播\n{link}",
+            Kind::LiveClose => "{name} 直播结束啦!\n直播时长: {duration}",
         }
     }
 

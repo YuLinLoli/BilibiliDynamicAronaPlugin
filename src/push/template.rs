@@ -469,6 +469,31 @@ mod tests {
         assert_eq!(text_of(&got[1]), "测试Up");
     }
 
+    /// 默认档必须**只渲染出一条消息**。2026-10-09 之前默认指着自创的 `SimpleMsg`
+    /// （`{draw}\r{content}\r{images}`），一条动态被摊成三条——可卡片里本来就画了正文和配图，
+    /// 后两条纯属重复。第一次拿真数据推动态时被用户当场看出来。
+    /// 串的内容由 `config.rs` 那条逐键逐字面量的单测钉住，这条钉的是"默认档不拆条、不重复发图"。
+    #[test]
+    fn the_default_templates_render_exactly_one_message() {
+        use crate::config::TemplateConfig;
+        let config = TemplateConfig::default();
+
+        let dynamic = config.dynamic_push[&config.default_dynamic_push].clone();
+        let supply = Supply::for_dynamic(Some(bytes()), vec![bytes(), bytes()]);
+        let got = render(&dynamic, &vals(), &supply, &card());
+        assert_eq!(got.len(), 1, "默认动态档不该拆条，串是 {dynamic:?}");
+        assert_eq!(
+            images_of(&got[0]),
+            1,
+            "那一条里只该有卡片这一张图，配图不该再发一遍，串是 {dynamic:?}"
+        );
+
+        let live = config.live_push[&config.default_live_push].clone();
+        let supply = Supply::for_live(Some(bytes()), Some(bytes()));
+        let got = render(&live, &vals(), &supply, &card());
+        assert_eq!(got.len(), 1, "默认开播档不该拆条，串是 {live:?}");
+    }
+
     #[test]
     fn forward_block_becomes_one_card_with_title_rendered() {
         let supply = Supply::for_dynamic(Some(bytes()), Vec::new());
