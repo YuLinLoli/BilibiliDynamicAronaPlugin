@@ -30,7 +30,7 @@ static FORWARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)\{>>}(.*?)\{
 pub struct Vals(BTreeMap<String, String>);
 
 impl Vals {
-    pub(crate) fn fill(items: [(&str, String); 8]) -> Vals {
+    pub(crate) fn fill<const N: usize>(items: [(&str, String); N]) -> Vals {
         let mut map = BTreeMap::new();
         for (key, value) in items {
             map.insert(key.to_string(), value);
@@ -73,7 +73,9 @@ impl Vals {
             ("uid", dynamic.uid.to_string()),
             ("did", dynamic.id.to_string()),
             ("time", dynamic.time_text()),
-            ("type", dynamic.kind.clone()),
+            ("type", dynamic.type_text.clone()),
+            // 判类词单独带一份：@全体 与类型过滤器认的是它，不是上面那个显示词
+            ("kind", dynamic.kind.clone()),
             ("content", dynamic.display_text()),
             ("link", link),
             ("links", links),

@@ -180,8 +180,11 @@ pub struct Dynamic {
     pub uid: i64,
     pub name: String,
     pub face: String,
-    /// 类型中文名：动态 / 转发动态 / 视频 / 音乐 / 专栏 / 直播 / 番剧 / 活动
+    /// 判类用的规范词，只有六个：动态 / 转发动态 / 视频 / 音乐 / 专栏 / 直播。
+    /// 类型过滤器与 @全体 认它，**不要**拿它去显示。
     pub kind: String,
+    /// 显示用的类型名（投稿视频 / 合集 / 番剧…），进卡片角标与模板 `{type}`
+    pub type_text: String,
     pub time: i64,
     pub text: String,
     /// 正文的分段（话题、表情、链接…），绘图按它上色贴图
@@ -275,6 +278,46 @@ pub fn time_of_id(id: i64) -> i64 {
 }
 
 /// 类型英文 → 中文名。过滤器、卡片标签与 {type} 占位符共用这一份。
+/// 判类用的规范词：只有这六个进得了类型过滤器与 @全体 那两张表
+/// （照原插件 `SendTasker.toFilterType()`，`SendTasker.kt:212-230`）。
+///
+/// 必须与显示词分开：那边「投稿视频」「合集」「动态被删除」这些写法，
+/// `FILTER_KINDS` 一个都不认——先前把显示词直接当判类词用，活动位与番剧类动态会被类型过滤器整类拒掉。
+pub fn filter_kind(type_str: &str) -> &'static str {
+    match type_str {
+        "DYNAMIC_TYPE_FORWARD" => "转发动态",
+        "DYNAMIC_TYPE_AV"
+        | "DYNAMIC_TYPE_UGC_SEASON"
+        | "DYNAMIC_TYPE_PGC"
+        | "DYNAMIC_TYPE_PGC_UNION" => "视频",
+        "DYNAMIC_TYPE_MUSIC" => "音乐",
+        "DYNAMIC_TYPE_ARTICLE" | "DYNAMIC_TYPE_READ" => "专栏",
+        "DYNAMIC_TYPE_LIVE" | "DYNAMIC_TYPE_LIVE_RCMD" => "直播",
+        // 文字、图文、活动位（COMMON_*）、被删除与没见过的类型，原插件一律算进「动态」这一类
+        _ => "动态",
+    }
+}
+
+/// 显示词：卡片左上角那一格角标与模板 `{type}` 用
+/// （照原插件 `DynamicType.text`，`Dynamic.kt:39-55`；模板侧见 `SendTasker.kt:423`）。
+///
+/// 与原插件唯一对不上的一处：那边 `DYNAMIC_TYPE_UNKNOWN` 显式写着「未知的动态」，
+/// 而我们拿到的是 B 站原始字符串，没见过的值分不出是「站方的 UNKNOWN」还是「新出的类型」，
+/// 所以两种都落成「动态」。
+pub fn type_label(type_str: &str) -> &'static str {
+    match type_str {
+        "DYNAMIC_TYPE_ARTICLE" | "DYNAMIC_TYPE_READ" => "专栏",
+        "DYNAMIC_TYPE_FORWARD" => "转发动态",
+        "DYNAMIC_TYPE_AV" => "投稿视频",
+        "DYNAMIC_TYPE_MUSIC" => "音乐",
+        "DYNAMIC_TYPE_LIVE" | "DYNAMIC_TYPE_LIVE_RCMD" => "直播",
+        "DYNAMIC_TYPE_PGC" | "DYNAMIC_TYPE_PGC_UNION" => "番剧",
+        "DYNAMIC_TYPE_UGC_SEASON" => "合集",
+        "DYNAMIC_TYPE_NONE" => "动态被删除",
+        _ => "动态",
+    }
+}
+
 pub fn kind_name(type_str: &str) -> String {
     let label = match type_str {
         "DYNAMIC_TYPE_FORWARD" => "转发动态",
@@ -644,7 +687,8 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
         uid,
         name: text(author, &["name"]).unwrap_or_default(),
         face: text(author, &["face"]).unwrap_or_default(),
-        kind: kind_name(&type_str),
+        kind: filter_kind(&type_str).to_string(),
+        type_text: type_label(&type_str).to_string(),
         time: number(author, &["pub_ts"]).unwrap_or_else(|| time_of_id(id)),
         text: body,
         nodes,
@@ -878,6 +922,67 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 判类词永远只能是类型过滤器那六词之一（照原插件 `toFilterType()`，`SendTasker.kt:212-230`）。
+    /// 先前这里把显示词「活动」「番剧」当判类词用，而那两类动态因此在类型过滤器里谁都匹配不上——
+    /// 用户设了白名单就整类静默漏推，设了黑名单则永远删不掉它们。
+    #[test]
+    fn filter_kind_only_ever_emits_words_the_filter_recognizes() {
+        for raw in [
+            "DYNAMIC_TYPE_WORD",
+            "DYNAMIC_TYPE_DRAW",
+            "DYNAMIC_TYPE_ARTICLE",
+            "DYNAMIC_TYPE_READ",
+            "DYNAMIC_TYPE_FORWARD",
+            "DYNAMIC_TYPE_AV",
+            "DYNAMIC_TYPE_MUSIC",
+            "DYNAMIC_TYPE_LIVE",
+            "DYNAMIC_TYPE_LIVE_RCMD",
+            "DYNAMIC_TYPE_PGC",
+            "DYNAMIC_TYPE_PGC_UNION",
+            "DYNAMIC_TYPE_COMMON_SQUARE",
+            "DYNAMIC_TYPE_COMMON_VERTICAL",
+            "DYNAMIC_TYPE_UGC_SEASON",
+            "DYNAMIC_TYPE_NONE",
+            "DYNAMIC_TYPE_UNKNOWN",
+            "DYNAMIC_TYPE_某天真新增的类型",
+        ] {
+            let kind = filter_kind(raw);
+            assert!(
+                crate::store::FILTER_KINDS.contains(&kind),
+                "{raw} 判类成「{kind}」，而过滤器认的词表里没有它"
+            );
+        }
+        // 用户截图那条「个性装扮」走 COMMON_SQUARE：判类与显示都该落回「动态」
+        assert_eq!(filter_kind("DYNAMIC_TYPE_COMMON_SQUARE"), "动态");
+        assert_eq!(type_label("DYNAMIC_TYPE_COMMON_SQUARE"), "动态");
+        // 番剧按原插件归进「视频」这一类判，显示仍写「番剧」
+        assert_eq!(filter_kind("DYNAMIC_TYPE_PGC"), "视频");
+        assert_eq!(type_label("DYNAMIC_TYPE_PGC"), "番剧");
+    }
+
+    /// 显示词逐条对原插件 `DynamicType.text`（`Dynamic.kt:39-55`，模板侧取用见 `SendTasker.kt:423`）
+    #[test]
+    fn type_labels_match_the_original_enum() {
+        for (raw, want) in [
+            ("DYNAMIC_TYPE_WORD", "动态"),
+            ("DYNAMIC_TYPE_DRAW", "动态"),
+            ("DYNAMIC_TYPE_ARTICLE", "专栏"),
+            ("DYNAMIC_TYPE_FORWARD", "转发动态"),
+            ("DYNAMIC_TYPE_AV", "投稿视频"),
+            ("DYNAMIC_TYPE_MUSIC", "音乐"),
+            ("DYNAMIC_TYPE_LIVE", "直播"),
+            ("DYNAMIC_TYPE_LIVE_RCMD", "直播"),
+            ("DYNAMIC_TYPE_PGC", "番剧"),
+            ("DYNAMIC_TYPE_PGC_UNION", "番剧"),
+            ("DYNAMIC_TYPE_COMMON_SQUARE", "动态"),
+            ("DYNAMIC_TYPE_COMMON_VERTICAL", "动态"),
+            ("DYNAMIC_TYPE_UGC_SEASON", "合集"),
+            ("DYNAMIC_TYPE_NONE", "动态被删除"),
+        ] {
+            assert_eq!(type_label(raw), want, "{raw} 的显示词与原插件不一致");
+        }
+    }
+
     /// 结构照真实样例（原插件 test/resources/json/dynamic_item 那批）缩编
     fn draw_item() -> Value {
         json!({
@@ -1039,7 +1144,8 @@ mod tests {
             "pgc": {"title": "第 3 话", "cover": "https://i0.hdslb.com/pgc.jpg", "ep_id": 12345}
         });
         let parsed = parse_item(&item).unwrap();
-        assert_eq!(parsed.kind, "番剧");
+        assert_eq!(parsed.kind, "视频", "番剧按原插件 toFilterType 归进「视频」这一类判");
+        assert_eq!(parsed.type_text, "番剧", "显示词仍是「番剧」");
         assert_eq!(
             parsed.attached.unwrap().url,
             "https://www.bilibili.com/bangumi/play/ep12345"
@@ -1054,7 +1160,12 @@ mod tests {
         item["modules"]["module_dynamic"]["common"] = json!({"title": "一首歌", "cover": "https://c/m.jpg", "jump_url": "https://www.bilibili.com/audio/am1"});
         item["modules"]["module_dynamic"]["major"] = Value::Null;
         let parsed = parse_item(&item).unwrap();
-        assert_eq!(parsed.kind, "活动");
+        assert_eq!(
+            parsed.kind,
+            "动态",
+            "活动位（COMMON_SQUARE）判类必须落回「动态」——六词表里没有「活动」，落错就整类筛不到"
+        );
+        assert_eq!(parsed.type_text, "动态", "与原插件 DynamicType.text 同词");
         assert_eq!(parsed.attached.unwrap().title, "一首歌");
         assert_eq!(parsed.images, vec!["https://c/m.jpg".to_string()]);
     }

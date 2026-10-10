@@ -124,7 +124,7 @@ impl<'a> Board<'a> {
         let body = self.probe(|quiet| quiet.card(card_x, card_w, top, dynamic, false, translation));
         self.card_background(card_x, card_w, top, body + q.card_padding as f32);
         if style.badge_left || style.badge_right {
-            self.badges(card_x, top - badge_h, &dynamic.kind, dynamic.id);
+            self.badges(card_x, top - badge_h, &dynamic.type_text, dynamic.id);
         }
         let used = self.card(card_x, card_w, top, dynamic, false, translation);
         top + used + q.card_margin as f32
@@ -1096,6 +1096,7 @@ mod tests {
             name: "测试Up".to_string(),
             face: "https://face/1.jpg".to_string(),
             kind: "动态".to_string(),
+            type_text: "动态".to_string(),
             time: 1738470120,
             text: text.to_string(),
             nodes: vec![Node::Text(text.to_string())],

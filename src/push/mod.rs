@@ -99,13 +99,17 @@ impl Post {
         }
     }
 
-    /// @全体 判类要的两样东西：订阅者 uid 与内容种类。
-    /// 种类取模板里的 `{type}`（动态可能是"视频/音乐/专栏/转发动态"），
-    /// 因为 @全体 的档位是按具体内容匹配的，不是按"这是动态还是直播"。
+    /// @全体 判类要的两样东西：订阅者 uid 与类型判类词。
+    /// 取 `kind` 而不是 `type`：后者是给人看的显示词（「投稿视频」「合集」「动态被删除」），
+    /// @全体 那张表认的是「视频」「动态」这类判类词（与原插件 `toFilterType()` 同一套）。
+    /// 直播、番剧那几路是手写的 vals，没带 `kind`，退回 `type` 与原插件同口径。
     pub fn at_all_args(&self) -> (i64, &str) {
         (
             self.vals.uid(),
-            self.vals.get("type").unwrap_or_else(|| self.kind.label()),
+            self.vals
+                .get("kind")
+                .or_else(|| self.vals.get("type"))
+                .unwrap_or_else(|| self.kind.label()),
         )
     }
 }
