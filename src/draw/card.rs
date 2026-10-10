@@ -622,7 +622,15 @@ impl<'a> Board<'a> {
         let title_leading = q.title_font + q.line_space as f32;
         let desc_leading = q.desc_font + q.line_space as f32;
         let text_x = x as f32 + cover_w + q.draw_space as f32;
-        let text_w = width as f32 - cover_w - q.draw_space as f32 - pad;
+        // 右侧那一格类型标签先占掉宽度，否则两行标题会直接压在标签上
+        let label_w = if item.kind.is_empty() {
+            0.0
+        } else {
+            style.face.measure(&item.kind, q.sub_title_font, false, &art.emojis)
+                + q.badge_padding as f32 * 2.0
+                + pad
+        };
+        let text_w = width as f32 - cover_w - q.draw_space as f32 - pad - label_w;
         let title_flow = style.face.layout(
             &[Span::new(&item.title, theme.title)],
             q.title_font,
@@ -713,6 +721,35 @@ impl<'a> Board<'a> {
                     false,
                     desc_leading,
                     &art.emojis,
+                );
+            }
+            // 附加卡的类型标签：装扮 / 投票 / 充电抽奖 / 商品…
+            // 原插件 `drawAdditionalCard(label, cover, title, desc, …)` 的第一个参数，
+            // 画在卡片右侧垂直居中。`parse_additional` 一直把它折进 Attached.kind 了，
+            // 只是这里从没画出来过——所以装扮动态的卡片上看不见「装扮」那一格。
+            if !item.kind.is_empty() {
+                let font = q.sub_title_font;
+                let label_text_w = style.face.measure(&item.kind, font, false, &art.emojis);
+                let badge_w = label_text_w + q.badge_padding as f32 * 2.0;
+                let badge_h = font + 12.0;
+                let bx = (x as f32 + width as f32 - badge_w - pad * 0.8).max(text_x);
+                let by = (y + (height - badge_h) / 2.0).max(y);
+                canvas.fill_round_rect(
+                    bx.round() as u32,
+                    by.round() as u32,
+                    badge_w.round() as u32,
+                    badge_h.round() as u32,
+                    Corners::all(badge_h / 2.0),
+                    theme.title,
+                );
+                style.face.draw_line(
+                    canvas,
+                    bx + (badge_w - label_text_w) / 2.0,
+                    by + badge_h / 2.0 + font * 0.36,
+                    &item.kind,
+                    font,
+                    Color::rgb(255, 255, 255),
+                    false,
                 );
             }
         }
