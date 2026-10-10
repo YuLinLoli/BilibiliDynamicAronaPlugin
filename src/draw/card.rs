@@ -219,21 +219,21 @@ impl<'a> Board<'a> {
         let time_y = name_y + gap;
         let avatar = art.face(&dynamic.face);
         if let Some(canvas) = &mut self.canvas {
-            // 没有装扮挂件时，头像放大一圈并描个白边圆
-            canvas.fill_circle(
-                left + side / 2,
-                top + side / 2,
-                side / 2 + inflate as u32 + 1,
-                theme.face_outline,
-            );
+            // 没有装扮挂件时，头像放大一圈并描个白边圆。
+            // 圆心要跟着 inflate 一起外扩：贴图是从 (left, top) 起画 2*(side/2+inflate) 见方，
+            // 它的中心在 left+side/2+inflate，白圆若仍取 left+side/2 就与头像差一个 inflate，
+            // 白边会一边宽一边窄（画出来是左上一道白月牙）。
+            let center_x = left + side / 2 + inflate as u32;
+            let center_y = top + side / 2 + inflate as u32;
+            canvas.fill_circle(center_x, center_y, side / 2 + inflate as u32 + 1, theme.face_outline);
             match avatar {
                 Some(found) => {
                     canvas.paste_circle_image(left, top, side / 2 + inflate as u32, found)
                 }
                 None => canvas.fill_circle(
-                    left + side / 2,
-                    top + side / 2,
-                    side / 2,
+                    center_x,
+                    center_y,
+                    side / 2 + inflate as u32,
                     Color::rgb(0xE3, 0xE5, 0xE7),
                 ),
             }
@@ -1371,9 +1371,23 @@ mod tests {
         let mut nested = sample("２ｗ！？？？？？？？？！");
         nested.origin = Some(Box::new(video.clone()));
 
+        // 用户给的那条「超辉夜姬!粉丝勋章」基准：正文空，只有一张装扮卡
+        // （右侧标签原插件按 bizType=231 给「装扮」，见 Dynamic.kt:1294）
+        let mut deco = sample("");
+        deco.images = Vec::new();
+        deco.attached = Some(Attached {
+            kind: "装扮".to_string(),
+            title: "超辉夜姬!粉丝勋章".to_string(),
+            cover: "https://i/cover.png".to_string(),
+            url: "https://t.bilibili.com/1257441591087333392".to_string(),
+            duration: String::new(),
+            play: String::new(),
+            desc: "动态卡片".to_string(),
+        });
+
         let out = std::env::temp_dir().join("arona-bili-cards");
         std::fs::create_dir_all(&out).unwrap();
-        for (name, item) in [("grid", &grid), ("video", &video), ("nested", &nested)] {
+        for (name, item) in [("grid", &grid), ("video", &video), ("nested", &nested), ("deco", &deco)] {
             let file = out.join(format!("{name}.png"));
             std::fs::write(&file, dynamic_card(item, &art, &style, None)).unwrap();
             println!("{name} -> {}", file.display());

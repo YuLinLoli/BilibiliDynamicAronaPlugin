@@ -502,7 +502,10 @@ fn glyphs(
     for ch in text.chars() {
         let (metrics, coverage) = face.rasterize(ch, px);
         let left = pen.round() as i32 + metrics.xmin;
-        let top = baseline.round() as i32 - metrics.height as i32 + metrics.ymin;
+        // fontdue 给的位图顶边在基线上方 ymax 处，而 Metrics 只有 ymin 与 height，
+        // 于是 ymax = ymin + height - 1。写成 `baseline - height + ymin` 会把每个字形
+        // 按它自己的下伸量挪开 (2*ymin - 1) 像素——汉字与数字的 ymin 不同，一行里就高低不齐。
+        let top = baseline.round() as i32 - (metrics.ymin + metrics.height as i32 - 1);
         for row in 0..metrics.height {
             for column in 0..metrics.width {
                 let alpha = coverage[row * metrics.width + column];
