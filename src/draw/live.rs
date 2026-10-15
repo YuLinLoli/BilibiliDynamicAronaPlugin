@@ -56,7 +56,8 @@ pub fn live_card(live: &LiveInfo, art: &Art, style: &Style) -> Vec<u8> {
         .unwrap_or(0.0);
 
     let top = q.card_margin as f32 + badge_h;
-    let height = (top + body + q.card_margin as f32 + footer_h).ceil() as u32;
+    let height =
+        (top + body + q.card_margin as f32 + super::card::shadow_below(q) + footer_h).ceil() as u32;
     let mut canvas = Canvas::new(q.image_width, height, Color::rgb(255, 255, 255));
     paint_background(&mut canvas, &style.background);
     paint_board(&mut canvas, style, card_x, card_w, top, body);
