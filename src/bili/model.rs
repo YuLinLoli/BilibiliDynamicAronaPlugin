@@ -444,11 +444,17 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
         return Some(Attached {
             kind: "专栏".into(),
             title: text(article, &["title"]).unwrap_or_default(),
+            desc: text(article, &["desc"]).unwrap_or_default(),
             cover: list(article, &["covers"], "")
                 .first()
                 .cloned()
                 .unwrap_or_default(),
-            badge: badge_text(article),
+            // 参考实现那份 `Major.Article` 数据类里根本没有 badge 字段——那一格「专栏」
+            // 是画的时候硬写上去的（`DynamicMajorDraw.kt:734-737`）。站方哪天真给词就用站方的
+            badge: match badge_text(article) {
+                given if !given.is_empty() => given,
+                _ => "专栏".into(),
+            },
             url: format!("https://www.bilibili.com/read/cv{id}"),
             ..Default::default()
         });
@@ -605,7 +611,10 @@ pub fn parse_additional(dynamic: &Value) -> Vec<Attached> {
         .collect()
 }
 
-/// 图片段：DRAW 走 items[].src，OPUS 走 pics[].url（新版），ARTICLE 走 covers[]
+/// 图片段：DRAW 走 items[].src，OPUS 走 pics[].url（新版）或 pics[].src（旧版）。
+///
+/// **专栏的 `covers` 不在这里**——它是附属卡的封面，跟着 `Attached` 走。从前这里也塞一份，
+/// 结果一条专栏被画成「正文 + 一张原图 + 一张带封面的附属卡」，图重复出现两次。
 fn parse_images(major: &Value) -> Vec<String> {
     let mut images = list(major, &["draw", "items"], "src");
     if images.is_empty() {
@@ -613,9 +622,6 @@ fn parse_images(major: &Value) -> Vec<String> {
     }
     if images.is_empty() {
         images = list(major, &["opus", "pics"], "src");
-    }
-    if images.is_empty() {
-        images = list(major, &["article", "covers"], "");
     }
     images
 }
@@ -1042,6 +1048,37 @@ mod tests {
         );
         // desc 没了就从 opus 的标题/摘要兜底，正文不能是空的
         assert!(!parsed.text.is_empty());
+    }
+
+    /// 专栏要落成一张附属卡 + 卡上方那一格「专栏」，封面不许再往正文里塞一份。
+    /// 字段名按参考实现那份 `Major.Article` 数据类（`Dynamic.kt:1084-1097`：
+    /// id/title/desc/label/jump_url/covers），那里面**没有 badge**——「专栏」那格是画时硬写的
+    #[test]
+    fn article_becomes_a_card_with_its_own_label() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["major"] = json!({
+            "type": "MAJOR_TYPE_ARTICLE",
+            "article": {
+                "id": 53416297,
+                "title": "《蔚蓝档案》10月15日维护更新说明",
+                "desc": "欢迎连接【什亭之箱】，老师。",
+                "label": "10月15日维护更新说明",
+                "jump_url": "//www.bilibili.com/read/cv53416297",
+                "covers": ["https://i0.hdslb.com/cover-a.png", "https://i0.hdslb.com/cover-b.png"]
+            }
+        });
+        let parsed = parse_item(&item).unwrap();
+        let attached = parsed.attached.clone().unwrap();
+        assert_eq!(attached.kind, "专栏");
+        assert_eq!(attached.badge, "专栏", "站方没给 badge 时那一格也不能空着");
+        assert_eq!(attached.desc, "欢迎连接【什亭之箱】，老师。");
+        assert_eq!(attached.cover, "https://i0.hdslb.com/cover-a.png");
+        assert!(attached.url.contains("cv53416297"), "{}", attached.url);
+        assert!(
+            parsed.images.is_empty(),
+            "专栏封面被重复塞进正文了：{:?}",
+            parsed.images
+        );
     }
 
     /// B 站把正文挡掉了（仅粉丝 / 已删除）时，卡片上就照抄它给的那句提示

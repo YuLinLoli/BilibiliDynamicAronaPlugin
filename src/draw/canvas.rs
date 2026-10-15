@@ -310,12 +310,15 @@ impl Canvas {
     }
 
     /// 竖直渐变填充
+    // 落点、尺寸、圆角、两端色本来就该一次说全，包成结构体只是多一层搬运
+    #[allow(clippy::too_many_arguments)]
     pub fn fill_vertical_gradient(
         &mut self,
         x: u32,
         y: u32,
         width: u32,
         height: u32,
+        radius: Corners,
         top: Color,
         bottom: Color,
     ) {
@@ -327,6 +330,11 @@ impl Canvas {
             };
             let color = top.mix(bottom, t);
             for column in 0..width {
+                // 压在圆角形状上的那一段渐变必须跟着那个形状裁：方角渐变会把圆掉的
+                // 下角重新糊成一块直角（用户 2026-10-16 圈的「怎么不是圆角」）
+                if !inside_round_area(column, row, width, height, radius) {
+                    continue;
+                }
                 self.blend(x + column, y + row, color, color.0[3]);
             }
         }

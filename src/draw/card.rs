@@ -557,11 +557,17 @@ impl<'a> Board<'a> {
         // `videoCoverHeight = cardContentRect.width * coverImg.height / coverImg.width`
         // （`DynamicMajorDraw.kt:213`）。写死 16:9 会把竖屏投稿裁掉一大截；
         // 图没下下来时退回原插件请求缩略图用的那档 0.625。
-        let cover_h = match cover {
-            Some(found) if found.width() > 0 => {
-                (width as f32 * found.height() as f32 / found.width() as f32).round()
+        // 专栏是另一套：原插件按**固定比例**裁（`articleCoverHeight = 卡宽 × 0.35`，
+        // 三宫格那档是 0.23166，`DynamicMajorDraw.kt:683`），不看封面自己的长短
+        let cover_h = if item.kind == "专栏" {
+            (width as f32 * 0.35).round()
+        } else {
+            match cover {
+                Some(found) if found.width() > 0 => {
+                    (width as f32 * found.height() as f32 / found.width() as f32).round()
+                }
+                _ => (width as f32 * 0.625).round(),
             }
-            _ => (width as f32 * 0.625).round(),
         };
         let title_leading = q.title_font + q.line_space as f32;
         let desc_leading = q.desc_font + q.line_space as f32;
@@ -639,12 +645,20 @@ impl<'a> Board<'a> {
             if let Some(found) = cover {
                 canvas.paste_cover_rounded(cx, cy, cw, ch, radius, found);
             }
-            // 底部两成压一层黑渐变，白字才站得住
+            // 底部两成压一层黑渐变，白字才站得住。这一段必须按封面的下角裁圆：它的底边
+            // 与封面底边对齐、左右也同边，所以只给下面两角半径就正好接上封面那道弧——
+            // 之前这里铺的是直角矩形，圆掉的下角又被糊成了一块方角
+            let band_h = (ch as f32 * 0.2).round() as u32;
             canvas.fill_vertical_gradient(
                 cx,
-                (cy as f32 + ch as f32 * 0.8).round() as u32,
+                cy + ch - band_h,
                 cw,
-                (ch as f32 * 0.2).round() as u32,
+                band_h,
+                Corners {
+                    bottom_left: radius.bottom_left,
+                    bottom_right: radius.bottom_right,
+                    ..Corners::none()
+                },
                 Color::rgba(0, 0, 0, 0),
                 Color::rgba(0, 0, 0, 150),
             );
@@ -661,16 +675,25 @@ impl<'a> Board<'a> {
                 );
             }
             if !play.is_empty() {
-                let label = format!("▶ {play}");
-                let used = style.face.measure(&label, q.desc_font, false, &art.emojis);
+                // 三角不能拼进字符串：所选字体里没有 U+25B6，画出来是一块豆腐
+                let used = style.face.measure(&play, q.desc_font, false, &art.emojis);
+                let mark = q.desc_font * 0.62;
+                let right = cx as f32 + cw as f32 - pad;
                 style.face.draw_line(
                     canvas,
-                    cx as f32 + cw as f32 - used - pad,
+                    right - used,
                     on_cover,
-                    &label,
+                    &play,
                     q.desc_font,
                     Color::rgb(255, 255, 255),
                     false,
+                );
+                paint_play_glyph(
+                    canvas,
+                    right - used - mark - pad * 0.5,
+                    on_cover - q.desc_font * 0.35 - mark / 2.0,
+                    mark,
+                    Color::rgb(255, 255, 255),
                 );
             }
             let text_y = y + cover_h + pad + q.title_font;
@@ -1129,6 +1152,30 @@ fn inner_radius(q: Quality, badge_on_top: bool) -> Corners {
 /// 光栅器，一律用线段描（[`paint_tv_glyph`]、[`paint_forward_glyph`]）。
 type GlyphPainter = fn(&mut Canvas, f32, f32, f32, Color);
 
+/// 一格药丸徽章的底座：先按包边之外铺阴影，再包一圈白，最后落药丸本体。
+/// 外层左、外层右、内卡那格三档共用，包边宽度都是 [`COVER_INSET`]。
+fn paint_pill(canvas: &mut Canvas, style: &Style, pill: Block, bg: Color) {
+    let (band, layers, shift) = shadow_geometry(style.quality);
+    let ring = pill.grown(COVER_INSET, (0, 0));
+    paint_shadow(
+        canvas,
+        ring,
+        style.theme.small_card_shadow,
+        band,
+        layers,
+        shift,
+    );
+    canvas.fill_round_rect(
+        ring.x,
+        ring.y,
+        ring.width,
+        ring.height,
+        ring.radius,
+        style.theme.draw_outline,
+    );
+    canvas.fill_round_rect(pill.x, pill.y, pill.width, pill.height, pill.radius, bg);
+}
+
 /// 卡上方那一格徽章：画在 `card` 矩形正上方、左对齐、下两角直角，卡自己压着它的那个
 /// 上角跟着置直角（`cardBadgeArc` 的语义，见 [`inner_radius`]）。
 ///
@@ -1172,32 +1219,7 @@ fn paint_card_badge(
             ..Corners::all(q.badge_arc as f32)
         },
     };
-    let ring = pill.grown(COVER_INSET, (0, 0));
-    let (band, layers, shift) = shadow_geometry(q);
-    paint_shadow(
-        canvas,
-        ring,
-        style.theme.small_card_shadow,
-        band,
-        layers,
-        shift,
-    );
-    canvas.fill_round_rect(
-        ring.x,
-        ring.y,
-        ring.width,
-        ring.height,
-        ring.radius,
-        style.theme.draw_outline,
-    );
-    canvas.fill_round_rect(
-        pill.x,
-        pill.y,
-        pill.width,
-        pill.height,
-        pill.radius,
-        palette.1,
-    );
+    paint_pill(canvas, style, pill, palette.1);
     let baseline = top as f32 + height as f32 - (height as f32 - font) / 2.0;
     let mut text_x = pill.x as f32 + pad * 4.0;
     if let Some(paint) = glyph {
@@ -1328,18 +1350,17 @@ pub(crate) fn paint_badges(
     let top = y.round() as u32;
     // 基线：徽章条内垂直居中
     let baseline = y + height as f32 - (height as f32 - font) / 2.0;
-    let (band, layers, shift) = shadow_geometry(q);
     if style.badge_left {
         let pill = Block {
-            x,
+            // 与内卡那格同一套：药丸往右让开一格包边，白边左沿正好落在卡的左边缘上
+            x: x + COVER_INSET,
             y: top,
             width: left_w,
             height,
             radius,
         };
-        paint_shadow(canvas, pill, theme.small_card_shadow, band, layers, shift);
-        canvas.fill_round_rect(x, top, left_w, height, radius, theme.main_left_badge.1);
-        let icon_x = x as f32 + pad * 3.0;
+        paint_pill(canvas, style, pill, theme.main_left_badge.1);
+        let icon_x = pill.x as f32 + pad * 3.0;
         paint_tv_glyph(
             canvas,
             icon_x,
@@ -1362,23 +1383,22 @@ pub(crate) fn paint_badges(
     }
     let code = id.to_string();
     let width = (style.face.measure(&code, font, false, &art.emojis) + pad * 8.0).round() as u32;
-    // 左边那一档关掉时右边这档就顶到条的起点，别留一截空白
-    let at = x + if style.badge_left { left_w + 2 } else { 0 };
-    paint_shadow(
-        canvas,
-        Block {
-            x: at,
-            y: top,
-            width,
-            height,
-            radius,
-        },
-        theme.small_card_shadow,
-        band,
-        layers,
-        shift,
-    );
-    canvas.fill_round_rect(at, top, width, height, radius, theme.main_right_badge.1);
+    // 两格之间留 2 像素是**包边之外**的净缝：左边那格的包边占掉两格 COVER_INSET，
+    // 自己这一格的包边还要再往左占一格，所以偏移是 3 格 + 那 2 像素。
+    // 左边那一档关掉时右边这档就顶到条的起点（只让开自己那一格包边），别留一截空白
+    let at = x + if style.badge_left {
+        left_w + 3 * COVER_INSET + 2
+    } else {
+        COVER_INSET
+    };
+    let pill = Block {
+        x: at,
+        y: top,
+        width,
+        height,
+        radius,
+    };
+    paint_pill(canvas, style, pill, theme.main_right_badge.1);
     style.face.draw_line(
         canvas,
         at as f32 + q.badge_padding as f32 * 2.0,
@@ -1445,9 +1465,27 @@ fn paint_forward_glyph(canvas: &mut Canvas, x: f32, y: f32, side: f32, color: Co
     canvas.fill_line(tip, at(0.521, 0.135), side * 0.10, color);
 }
 
-/// 铺满宽的附属卡：只有视频和番剧这类有横封面
+/// 播放数前那个向右的三角。字体里没有 U+25B6，拼进字符串会画成一块豆腐，所以逐行描：
+/// 每一行都从左边那条竖线起，宽度先加到中间再收到右边的尖。
+fn paint_play_glyph(canvas: &mut Canvas, x: f32, y: f32, side: f32, color: Color) {
+    let rows = side.round().max(1.0) as u32;
+    for row in 0..rows {
+        let t = row as f32 / (rows - 1).max(1) as f32;
+        let run = (side * (1.0 - (t * 2.0 - 1.0).abs())).max(1.0);
+        canvas.fill_rect(
+            x.round() as u32,
+            (y + row as f32).round() as u32,
+            run.round() as u32,
+            1,
+            color,
+        );
+    }
+}
+
+/// 铺满宽的附属卡：视频、番剧、合集这类横封面，专栏也算——原插件那张专栏卡
+/// 就是满宽封面压在标题上面（`DynamicMajorDraw.kt:683-692`）
 fn is_wide(item: &Attached) -> bool {
-    matches!(item.kind.as_str(), "视频" | "番剧" | "合集") && !item.cover.is_empty()
+    matches!(item.kind.as_str(), "视频" | "番剧" | "合集" | "专栏") && !item.cover.is_empty()
 }
 
 /// 背景渐变：按停靠点在纵向上分段铺
@@ -1464,7 +1502,15 @@ pub(crate) fn paint_background(canvas: &mut Canvas, stops: &[Color]) {
                     break;
                 }
                 let bottom = (top + span).min(height);
-                canvas.fill_vertical_gradient(0, top, width, bottom - top, pair[0], pair[1]);
+                canvas.fill_vertical_gradient(
+                    0,
+                    top,
+                    width,
+                    bottom - top,
+                    Corners::none(),
+                    pair[0],
+                    pair[1],
+                );
             }
         }
     }
@@ -1713,6 +1759,45 @@ mod tests {
     }
 
     /// 视频卡的封面高度跟着这张封面自己的比例走，不再写死 16:9
+    /// 专栏那一格的封面比例是站方定死的（卡宽 × 0.35），不看封面自己的长短
+    /// （`DynamicMajorDraw.kt:683`）——与投稿视频那条正好相反
+    #[test]
+    fn an_article_cover_ignores_its_own_aspect() {
+        let style = style("1000w");
+        let mut item = sample("专栏");
+        item.attached = Some(Attached {
+            kind: "专栏".to_string(),
+            title: "同一档标题".to_string(),
+            desc: "同一档简介".to_string(),
+            cover: "https://i/portrait.png".to_string(),
+            url: "https://www.bilibili.com/read/cv1".to_string(),
+            badge: "专栏".to_string(),
+            ..Default::default()
+        });
+        let mut art = Art::default();
+        art.pictures.insert(
+            "https://i/portrait.png".to_string(),
+            RgbaImage::from_pixel(360, 640, image::Rgba([9, 9, 9, 255])),
+        );
+        art.pictures.insert(
+            "https://i/landscape.png".to_string(),
+            RgbaImage::from_pixel(640, 360, image::Rgba([9, 9, 9, 255])),
+        );
+        let tall = measure(&item, &art, &style, None);
+        item.attached.as_mut().unwrap().cover = "https://i/landscape.png".to_string();
+        assert_eq!(
+            measure(&item, &art, &style, None),
+            tall,
+            "专栏封面跟着原图比例走了"
+        );
+        // 没封面就退回小卡（左图右文），所以整块要矮一截：这条钉住它走的是大卡那一支
+        item.attached.as_mut().unwrap().cover = String::new();
+        assert!(
+            measure(&item, &art, &style, None) < tall,
+            "专栏没走满宽封面那一支"
+        );
+    }
+
     #[test]
     fn the_video_cover_keeps_its_own_aspect() {
         let style = style("1000w");
@@ -1845,6 +1930,41 @@ mod tests {
             dynamic_card(&column, &art, &card_style, None),
             "类型词渗进卡片里了：外层那格两种动态必须一模一样"
         );
+    }
+
+    /// 压在封面上那层渐变必须按封面的下角裁圆：方角渐变会把圆掉的角重新糊成一块直角
+    /// （用户 2026-10-16 圈的「这里怎么不是圆角？漏了点方角还是灰色的」）
+    #[test]
+    fn the_scrim_follows_the_cover_corner() {
+        let q = Quality::find("1000w");
+        let mut canvas = Canvas::new(200, 200, Color::rgb(255, 255, 255));
+        let (x, y, w, h) = (20u32, 20u32, 160u32, 160u32);
+        let radius = inner_radius(q, false);
+        canvas.fill_round_rect(x, y, w, h, radius, Color::rgb(0x18, 0x1A, 0x1C));
+        let band = (h as f32 * 0.2).round() as u32;
+        canvas.fill_vertical_gradient(
+            x,
+            y + h - band,
+            w,
+            band,
+            Corners {
+                bottom_left: radius.bottom_left,
+                bottom_right: radius.bottom_right,
+                ..Corners::none()
+            },
+            Color::rgba(0, 0, 0, 0),
+            Color::rgba(0, 0, 0, 150),
+        );
+        let corner = canvas.pixel(x, y + h - 1).0;
+        assert_eq!(
+            &corner[..3],
+            &[255, 255, 255],
+            "封面下角被方角渐变糊住了：{:?}",
+            corner
+        );
+        // 中间那一段仍要吃到渐变，否则白字站不住
+        let middle = canvas.pixel(x + w / 2, y + h - 1).0;
+        assert!(middle[0] < 0x18, "渐变没压到封面底边：{:?}", middle);
     }
 
     /// 那一格 tag 是"包边"不是"分离"，而且要与里面的封面对齐：
@@ -2175,7 +2295,7 @@ mod tests {
     /// 三张分别对着原插件 README 的样式预览——九宫格、视频附件、转发嵌套。
     #[test]
     #[ignore = "只出图给人看版式，没有断言"]
-    fn card_preview_writes_three_boards_to_temp() {
+    fn card_preview_writes_every_board_to_temp() {
         let mut style = style("1000w");
         // 背景换成调试配置那一档：defaultColor 单值 #d3edfa 自动扩成三段渐变。
         // 纯白底上根本看不出阴影，人眼验收阴影与徽章融合必须带渐变。
@@ -2256,6 +2376,22 @@ mod tests {
             badge: "装扮".to_string(),
         });
 
+        // 专栏那条：满宽封面（站方定死 0.35 比例）+ 标题 + 三行简介 + 卡上方那一格「专栏」
+        let mut article = sample("维护更新已完成，补偿已发放");
+        article.images = Vec::new();
+        article.attached = Some(Attached {
+            kind: "专栏".to_string(),
+            title: "《蔚蓝档案》10月15日维护更新说明".to_string(),
+            cover: "https://i/cover.png".to_string(),
+            url: "https://www.bilibili.com/read/cv53416297".to_string(),
+            duration: String::new(),
+            play: String::new(),
+            desc: "欢迎连接【什亭之箱】，老师。为保证更好的游戏体验，我们计划于 10 月 15 日 14:00 \
+                   开始进行维护更新，预计持续 4 小时。"
+                .to_string(),
+            badge: "专栏".to_string(),
+        });
+
         let out = std::env::temp_dir().join("arona-bili-cards");
         std::fs::create_dir_all(&out).unwrap();
         for (name, item) in [
@@ -2263,6 +2399,7 @@ mod tests {
             ("video", &video),
             ("nested", &nested),
             ("deco", &deco),
+            ("article", &article),
         ] {
             let file = out.join(format!("{name}.png"));
             std::fs::write(&file, dynamic_card(item, &art, &style, None)).unwrap();
