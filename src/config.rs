@@ -510,6 +510,12 @@ pub struct ImageConfig {
     pub font: String,
     /// 默认主题色，多个用分号分隔构成渐变；单个值按 colorGenerator 自动生成渐变
     pub default_color: String,
+    /// 卡片底色（`#AARRGGBB`）：alpha 那两位就是透明度。留空跟随主题
+    pub card_color: String,
+    /// 卡片描边色。留空跟随主题
+    pub card_outline_color: String,
+    /// 图片与角标那圈描边/包边的颜色。留空跟随主题
+    pub draw_outline_color: String,
     /// 卡片装饰：FanCard / QrCode / None
     pub card_ornament: String,
     /// 卡片顶部的标签，左右两档各一个开关
@@ -528,6 +534,9 @@ impl Default for ImageConfig {
             theme: "v3".into(),
             font: String::new(),
             default_color: "#d3edfa".into(),
+            card_color: String::new(),
+            card_outline_color: String::new(),
+            draw_outline_color: String::new(),
             card_ornament: "None".into(),
             badge_enable: BadgeEnable::default(),
             color_generator: ColorGenerator::default(),
@@ -558,6 +567,20 @@ const IMAGE_COMMENTS: &[(&str, &str)] = &[
     (
         "defaultColor",
         "默认主题色，支持多个值自定义渐变，中间用分号分隔，例: #fde8ed;#fde8ed；单个值会自动生成渐变色",
+    ),
+    (
+        "cardColor",
+        "卡片底色，写 #AARRGGBB 或 #RRGGBB；alpha 那两位就是透明度（原插件 v3 是 #B4FFFFFF，\
+         即约 71% 不透明——内卡透出来的是外卡那一层，不是背景）。留空跟随 image.theme 那套内置配色",
+    ),
+    (
+        "cardOutlineColor",
+        "卡片描边色。留空跟随主题；填了会覆盖主题的整条描边，\
+         所以 v3RainbowOutline 那套彩虹描边会退成单色",
+    ),
+    (
+        "drawOutlineColor",
+        "图片描边与角标那圈白包边的颜色。留空跟随主题（v3 是 #FFFFFF）",
     ),
     (
         "cardOrnament",
@@ -868,7 +891,10 @@ mod tests {
     /// 直到真数据把一条动态推成「卡片+正文+原图」三条才暴露。
     /// 把表里的 String 借成 &str，好跟字面量数组逐键比对
     fn lettered(table: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
-        table.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        table
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
     }
 
     #[test]
@@ -884,25 +910,47 @@ mod tests {
             "ForwardMsg",
             "{draw}{>>}作者：{name}\nUID：{uid}\n时间：{time}\n类型：{type}\n链接：{links}\r{content}\r{images}{<<}",
         );
-        assert_eq!(lettered(&config.dynamic_push), dynamic, "动态模板表与 BiliConfig.kt:231-237 不一致");
+        assert_eq!(
+            lettered(&config.dynamic_push),
+            dynamic,
+            "动态模板表与 BiliConfig.kt:231-237 不一致"
+        );
 
         let mut live = BTreeMap::new();
         live.insert("DrawOnly", "{draw}");
         live.insert("TextOnly", "{name}@直播\n{link}\n标题: {title}");
         live.insert("OneMsg", "{draw}\n{name}@直播\n{link}");
-        live.insert("TwoMsg", "{draw}\r{name}@{uid}@直播\n{title}\n{time}\n{link}");
-        assert_eq!(lettered(&config.live_push), live, "直播模板表与 BiliConfig.kt:238-243 不一致");
+        live.insert(
+            "TwoMsg",
+            "{draw}\r{name}@{uid}@直播\n{title}\n{time}\n{link}",
+        );
+        assert_eq!(
+            lettered(&config.live_push),
+            live,
+            "直播模板表与 BiliConfig.kt:238-243 不一致"
+        );
 
         let mut close = BTreeMap::new();
         close.insert("SimpleMsg", "{name} 直播结束啦!\n直播时长: {duration}");
-        close.insert("ComplexMsg", "{name} 直播结束啦!\n标题: {title}\n直播时长: {duration}");
-        assert_eq!(lettered(&config.live_close), close, "直播结束模板表与 BiliConfig.kt:244-247 不一致");
+        close.insert(
+            "ComplexMsg",
+            "{name} 直播结束啦!\n标题: {title}\n直播时长: {duration}",
+        );
+        assert_eq!(
+            lettered(&config.live_close),
+            close,
+            "直播结束模板表与 BiliConfig.kt:244-247 不一致"
+        );
 
         // 三个默认档必须是各自表里真实存在的名字（原插件：OneMsg / OneMsg / SimpleMsg）
         assert_eq!(config.default_dynamic_push, "OneMsg");
         assert_eq!(config.default_live_push, "OneMsg");
         assert_eq!(config.default_live_close, "SimpleMsg");
-        assert!(config.dynamic_push.contains_key(&config.default_dynamic_push));
+        assert!(
+            config
+                .dynamic_push
+                .contains_key(&config.default_dynamic_push)
+        );
         assert!(config.live_push.contains_key(&config.default_live_push));
         assert!(config.live_close.contains_key(&config.default_live_close));
     }

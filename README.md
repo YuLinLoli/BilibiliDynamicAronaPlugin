@@ -154,9 +154,12 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `theme` | `v3` | 绘图主题：`v3` / `v3RainbowOutline` / `v2` |
 | `font` | `""` | 字体文件**绝对路径**，或放在 `config/bilibili/font/` 下的**文件名**（后缀 `.ttf/.otf/.ttc` 可省）；留空自动找系统中文字体。后可跟 `;` 指定粗体 |
 | `defaultColor` | `#d3edfa` | 默认主题色，多个用 `;` 分隔构成渐变；单个值按 colorGenerator 自动生成 |
+| `cardColor` | `""` | 卡片底色，写 `#AARRGGBB` 或 `#RRGGBB`——**alpha 那两位就是透明度**（原插件 v3 是 `#B4FFFFFF`，约 71% 不透明；内卡透出来的是外卡那一层，不是背景）。留空跟随 `theme` |
+| `cardOutlineColor` | `""` | 卡片描边色。留空跟随 `theme`；填了会覆盖主题的整条描边，所以 `v3RainbowOutline` 那套彩虹描边会退成单色 |
+| `drawOutlineColor` | `""` | 图片描边与角标那圈白包边的颜色。留空跟随 `theme`（v3 是 `#FFFFFF`） |
 | `cardOrnament` | `None` | 卡片装饰：`QrCode` / `None`；`FanCard` 这一档当前不出效果（见「已知差别」第 29 条） |
 | `drawEnable` | `true` | 绘图总开关：关掉之后卡片不画，模板里的 `{draw}` 落文字占位 |
-| `badgeEnable.left` | `true` | 卡片顶部左标签（头像那枚） |
+| `badgeEnable.left` | `true` | 卡片顶部左标签：动态卡是「动态」那枚、直播卡是「直播」，转发里那张原卡是「转发动态」 |
 | `badgeEnable.right` | `false` | 卡片顶部右标签（配色条那枚）；两档都关掉时整条标签带的高度一起收掉 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
 | `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度。全篇只有这一个键带连续大写——原插件自己就写成 `lockSB`（`BiliConfig.kt:181`），字段上单独 `rename` 点名，不让 `rename_all` 把它改成 `lockSb` |

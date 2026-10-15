@@ -26,6 +26,7 @@ use crate::cache;
 use crate::config::{
     BiliConfig, CheckConfig, IMAGE_SECTION, ImageConfig, SECTION, low_speed_window,
 };
+use crate::draw::canvas::Color;
 use crate::draw::card::{Art, Style, dynamic_card};
 use crate::draw::live::live_card;
 use crate::draw::quality::Quality;
@@ -1373,7 +1374,7 @@ fn style_for(
     );
     Ok(Style {
         quality: Quality::find(&appearance.quality),
-        theme: Theme::find(&appearance.theme),
+        theme: themed(appearance),
         face: typeface(&appearance.font)?,
         background: stops,
         badge_left: appearance.badge_enable.left,
@@ -1385,6 +1386,42 @@ fn style_for(
             None
         },
     })
+}
+
+/// 一个「把某个颜色写进主题」的动作——三个覆盖键共用一张表，省掉三段一样的 if
+type ColorSlot = fn(&mut Theme, Color);
+
+/// 主题给的是整套内置配色，`image` 区那三个颜色键是**覆盖**：留空就跟随 `image.theme`。
+/// 认不出的颜色只记一条日志并退回主题值——配色写错不该让这条动态不推。
+fn themed(appearance: &ImageConfig) -> Theme {
+    let mut theme = Theme::find(&appearance.theme);
+    let slots: [(&str, &str, ColorSlot); 3] = [
+        ("cardColor", &appearance.card_color, |t, c| t.card_bg = c),
+        (
+            "cardOutlineColor",
+            &appearance.card_outline_color,
+            |t, c| t.card_outline = vec![c],
+        ),
+        (
+            "drawOutlineColor",
+            &appearance.draw_outline_color,
+            |t, c| t.draw_outline = c,
+        ),
+    ];
+    for (key, raw, put) in slots {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match Color::parse(raw) {
+            Some(found) => put(&mut theme, found),
+            None => arona::runtime::log::warning(format!(
+                "bilibili：image.{key} 认不出来（{raw}），这一项按 {} 主题走",
+                theme.id
+            )),
+        }
+    }
+    theme
 }
 
 /// 字体只发现一次，配置串换了才重新找
