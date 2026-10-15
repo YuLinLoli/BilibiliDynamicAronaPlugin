@@ -195,6 +195,25 @@ pub fn to_hsb(color: Color) -> (f32, f32, f32) {
 mod tests {
     use super::*;
 
+    /// 单个 defaultColor 扩三段：色相按 hueStep 递推（+60/+30/0）、S/B 锁死、alpha 跟着原色。
+    /// 钉死这三组值是为了 hueStep/lockSB 的语义被改动时立刻看出来：三段本来就是淡彩，
+    /// 卡片观感发灰是 `saturation` 配得低（0.25）加上卡面自身 71% 不透明白叠加的结果，
+    /// 不是这里的算式错——要基准那种粉色，改的是 `defaultColor`，不是这段。
+    #[test]
+    fn one_color_expands_into_three_hue_stops() {
+        let stops = background("#d3edfa", 30.0, true, 0.25, 1.0);
+        assert_eq!(stops.len(), 3, "单色该扩成三段");
+        assert_eq!(
+            stops.iter().map(|stop| stop.0).collect::<Vec<_>>(),
+            vec![
+                [212, 191, 255, 255],
+                [191, 202, 255, 255],
+                [191, 234, 255, 255],
+            ],
+            "色相步进或 S/B 锁死改了：{stops:?}"
+        );
+    }
+
     #[test]
     fn unknown_theme_is_v3() {
         assert_eq!(Theme::find("v9").id, "v3");
