@@ -106,6 +106,39 @@ impl Corners {
             bottom_right: 0.0,
         }
     }
+
+    /// 外扩一圈：阴影每往外一层，四角半径同步变大（原插件 `RRect.inflate` 同义）
+    pub const fn grown(&self, by: f32) -> Corners {
+        Corners {
+            top_left: self.top_left + by,
+            top_right: self.top_right + by,
+            bottom_left: self.bottom_left + by,
+            bottom_right: self.bottom_right + by,
+        }
+    }
+}
+
+/// 一块圆角矩形：落点、尺寸与四角半径（阴影要拿它当"挖掉的那一格"）
+#[derive(Clone, Copy, Debug)]
+pub struct Block {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub radius: Corners,
+}
+
+impl Block {
+    /// 外扩 `by` 并整体挪 `shift`：阴影每一层就是这么从本体长出去的
+    pub const fn grown(&self, by: u32, shift: (u32, u32)) -> Block {
+        Block {
+            x: self.x.saturating_add(shift.0).saturating_sub(by),
+            y: self.y.saturating_add(shift.1).saturating_sub(by),
+            width: self.width + by * 2,
+            height: self.height + by * 2,
+            radius: self.radius.grown(by as f32),
+        }
+    }
 }
 
 /// 一张卡片就是一块位图
@@ -243,6 +276,39 @@ impl Canvas {
         }
     }
 
+    /// 阴影那一圈：只落在外框里、`hole`（卡片本体）外。
+    ///
+    /// 原插件画阴影前先把本体 `clipRRect(insides, ClipMode.DIFFERENCE)` 挖掉
+    /// （`draw/General.kt:29-39`）。不挖的话：卡片底是 71% 半透明白，阴影从底下透上来，
+    /// 整张卡被压成 206,200,199 那种死灰，背景渐变一点都过不去。
+    pub fn fill_shadow_ring(&mut self, outer: Block, hole: Block, color: Color) {
+        if outer.width == 0 || outer.height == 0 || color.0[3] == 0 {
+            return;
+        }
+        for row in 0..outer.height {
+            for column in 0..outer.width {
+                if !inside_round_area(column, row, outer.width, outer.height, outer.radius) {
+                    continue;
+                }
+                let (px, py) = (outer.x + column, outer.y + row);
+                let inside_hole = px >= hole.x
+                    && py >= hole.y
+                    && px - hole.x < hole.width
+                    && py - hole.y < hole.height
+                    && inside_round_area(
+                        px - hole.x,
+                        py - hole.y,
+                        hole.width,
+                        hole.height,
+                        hole.radius,
+                    );
+                if !inside_hole {
+                    self.blend(px, py, color, color.0[3]);
+                }
+            }
+        }
+    }
+
     /// 竖直渐变填充
     pub fn fill_vertical_gradient(
         &mut self,
@@ -347,6 +413,27 @@ impl Canvas {
                 self.blend(x + column, y + row, Color::rgba(sr, sg, sb, sa), sa);
             }
         }
+    }
+
+    /// 一条线段：按半像素步长扫过去，每步盖一个 `thickness` 见方的点。
+    /// 徽标那种斜杠没有别的画法可用，圆角矩形拼不出斜的。
+    pub fn fill_line(&mut self, from: (f32, f32), to: (f32, f32), thickness: f32, color: Color) {
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        let steps = (dx.hypot(dy)).max(dy.abs()).ceil().max(1.0) as usize * 2;
+        let half = (thickness / 2.0).max(0.5).round() as u32;
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let x = (from.0 + dx * t).round() as i64 - half as i64;
+            let y = (from.1 + dy * t).round() as i64 - half as i64;
+            let (x, y) = (x.max(0) as u32, y.max(0) as u32);
+            self.fill_round_rect(x, y, half * 2, half * 2, Corners::all(half as f32), color);
+        }
+    }
+
+    /// 读一个像素：版式单测要拿它核对"这一格该是什么色"
+    #[cfg(test)]
+    pub fn pixel(&self, x: u32, y: u32) -> Color {
+        Color(self.image.get_pixel(x, y).0)
     }
 
     /// 居中裁剪后贴进目标框：卡片里的图片都长这样（圆角给 none 就是直角）
