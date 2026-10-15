@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use image::{ImageBuffer, RgbaImage};
 
-use super::canvas::{Canvas, Color, Corners};
+use super::canvas::{Block, Canvas, Color, Corners};
 use super::quality::Quality;
 use super::text::{EmojiSet, Flow, Span, Typeface};
 use super::theme::Theme;
@@ -92,6 +92,38 @@ fn measure(dynamic: &Dynamic, art: &Art, style: &Style, translation: Option<&Ren
     .whole(dynamic, translation)
 }
 
+/// 作者行两行的基线：主卡抄 `drawGeneral`（DynamicModuleDraw.kt:518-523），
+/// 转发行抄 `drawForward`（同文件 493-498）。
+struct AuthorLines {
+    name_y: f32,
+    time_y: f32,
+    /// 转发行是「名字 + 时间」并排在同一条基线上，主行才另起一行
+    time_after_name: bool,
+}
+
+/// `top` 是作者行在卡片内容里的起始 y
+fn author_lines(q: Quality, top: f32, sub: bool) -> AuthorLines {
+    if sub {
+        let face = q.face_size as f32 * 0.6;
+        let name = top + (face - q.name_font) / 2.0 + q.name_font + q.card_padding as f32;
+        return AuthorLines {
+            name_y: name,
+            time_y: name - (q.name_font - q.sub_title_font) / 2.0,
+            time_after_name: true,
+        };
+    }
+    // gap 只是作者行里除两行字号之外的余量三等分，它不是行与行的基线间距：
+    // 第二行要挪 `subTitleFontSize + space*0.5`，只挪 gap 会让时间行顶进名字行的
+    // 下伸区（1000w 那一档差 15 像素，两行直接叠在一起）。
+    let gap = ((q.pendant_size as f32 - q.name_font - q.sub_title_font) / 3.0).max(4.0);
+    let name = top + q.name_font + gap * 1.25;
+    AuthorLines {
+        name_y: name,
+        time_y: name + q.sub_title_font + gap * 0.5,
+        time_after_name: false,
+    }
+}
+
 /// 一遍绘制。`canvas` 是 None 就只累加坐标。
 struct Board<'a> {
     style: &'a Style,
@@ -124,10 +156,17 @@ impl<'a> Board<'a> {
         let body = self.probe(|quiet| quiet.card(card_x, card_w, top, dynamic, false, translation));
         self.card_background(card_x, card_w, top, body + q.card_padding as f32);
         if style.badge_left || style.badge_right {
-            self.badges(card_x, top - badge_h, &dynamic.type_text, dynamic.id);
+            // 外层左角标固定是「动态」：原插件那一格取 `tag ?: 动态/转发动态`
+            // （`DynamicDraw.kt:269`），类型词从不进这一格——它要么在页脚的 {type} 里，
+            // 要么在附属卡自己那一格（`major.*.badge.text`）。转发的那格「转发动态」
+            // 属于里层原卡，见 [`Board::forward`]。
+            self.badges(card_x, top - badge_h, "动态", dynamic.id);
         }
         let used = self.card(card_x, card_w, top, dynamic, false, translation);
-        top + used + q.card_margin as f32
+        // 底板比内容多留一格 card_padding（顶部那格由作者行自己吃进去），图的高度还要在
+        // 底板之外再留一圈 card_margin，并另算出阴影往下伸的那一截——少加任何一样，
+        // 卡片都会顶到图的下边或落影挤进留白里。
+        top + used + q.card_padding as f32 + q.card_margin as f32 + shadow_below(q)
     }
 
     /// 一张卡的主体（不含底板），返回占用高度
@@ -171,7 +210,7 @@ impl<'a> Board<'a> {
             cursor += space;
             cursor += self.forward(content_x, content_w, cursor, source);
         }
-        if !sub {
+        if !sub && !self.style.footer.is_empty() {
             cursor += space;
             cursor += self.footer(content_x, content_w, cursor);
         }
@@ -199,24 +238,30 @@ impl<'a> Board<'a> {
         let art = self.art;
         let theme = &style.theme;
         let pad = q.card_padding as f32;
-        let height = if sub {
-            q.face_size as f32 * 0.6 + pad * 2.0
+        // 行高、头像边长与外扩、头像左上偏移：主行与转发行各一套，来源见 [`author_lines`]
+        let (height, face_side, inflate, face_dx, face_dy) = if sub {
+            (
+                q.face_size as f32 + pad,
+                (q.face_size as f32 * 0.6).round(),
+                0.0,
+                1.5,
+                1.0,
+            )
         } else {
-            q.pendant_size as f32
+            (
+                q.pendant_size as f32,
+                q.face_size as f32,
+                q.face_inflate as f32,
+                1.8,
+                1.2,
+            )
         };
-        let face_side = if sub {
-            (q.face_size as f32 * 0.6).round()
-        } else {
-            q.face_size as f32
-        };
-        let inflate = if sub { 0.0 } else { q.face_inflate as f32 };
-        let left = (x as f32 + pad * if sub { 1.5 } else { 1.8 } - inflate).max(x as f32) as u32;
-        let top = (y + pad * 1.2 - inflate).max(y) as u32;
+        let left = (x as f32 + pad * face_dx - inflate).max(x as f32) as u32;
+        let top = (y + pad * face_dy - inflate).max(y) as u32;
         let side = face_side as u32;
-        let name_x = (x as f32 + face_side + pad * 3.2).min(x as f32 + width as f32 * 0.55);
-        let gap = ((q.pendant_size as f32 - q.name_font - q.sub_title_font) / 3.0).max(4.0);
-        let name_y = y + q.name_font + gap * 1.25;
-        let time_y = name_y + gap;
+        let name_x = (x as f32 + face_side + pad * if sub { 2.5 } else { 3.2 })
+            .min(x as f32 + width as f32 * 0.55);
+        let lines = author_lines(q, y, sub);
         let avatar = art.face(&dynamic.face);
         if let Some(canvas) = &mut self.canvas {
             // 没有装扮挂件时，头像放大一圈并描个白边圆。
@@ -225,7 +270,12 @@ impl<'a> Board<'a> {
             // 白边会一边宽一边窄（画出来是左上一道白月牙）。
             let center_x = left + side / 2 + inflate as u32;
             let center_y = top + side / 2 + inflate as u32;
-            canvas.fill_circle(center_x, center_y, side / 2 + inflate as u32 + 1, theme.face_outline);
+            canvas.fill_circle(
+                center_x,
+                center_y,
+                side / 2 + inflate as u32 + 1,
+                theme.face_outline,
+            );
             match avatar {
                 Some(found) => {
                     canvas.paste_circle_image(left, top, side / 2 + inflate as u32, found)
@@ -246,20 +296,28 @@ impl<'a> Board<'a> {
         let room = ((x + width) as f32 - name_x).max(40.0);
         if let Some(canvas) = &mut self.canvas {
             let line = style.face.truncate(&dynamic.name, q.name_font, true, room);
-            style.face.draw_line(
+            let drawn = style.face.draw_line(
                 canvas,
                 name_x,
-                name_y,
+                lines.name_y,
                 &line,
                 q.name_font,
                 theme.nickname,
                 true,
             );
-            let when = style.face.truncate(&stamp, q.sub_title_font, false, room);
+            let when_x = if lines.time_after_name {
+                name_x + drawn + pad
+            } else {
+                name_x
+            };
+            let when_room = ((x + width) as f32 - when_x).max(40.0);
+            let when = style
+                .face
+                .truncate(&stamp, q.sub_title_font, false, when_room);
             style.face.draw_line(
                 canvas,
-                name_x,
-                time_y,
+                when_x,
+                lines.time_y,
                 &when,
                 q.sub_title_font,
                 theme.sub_title,
@@ -491,7 +549,20 @@ impl<'a> Board<'a> {
         let theme = &style.theme;
         let pad = q.card_padding as f32;
         let fx = x as f32;
-        let cover_h = (width as f32 * 9.0 / 16.0).round();
+        // 站方那格徽章垫在卡上面：下面所有落点都按抬高后的 y 算，块高再把它加回去
+        let badge_h = card_badge_height(style, item);
+        let y = y + badge_h;
+        let cover = art.picture(&item.cover);
+        // 封面高度按**这张封面自己的比例**给：原插件是
+        // `videoCoverHeight = cardContentRect.width * coverImg.height / coverImg.width`
+        // （`DynamicMajorDraw.kt:213`）。写死 16:9 会把竖屏投稿裁掉一大截；
+        // 图没下下来时退回原插件请求缩略图用的那档 0.625。
+        let cover_h = match cover {
+            Some(found) if found.width() > 0 => {
+                (width as f32 * found.height() as f32 / found.width() as f32).round()
+            }
+            _ => (width as f32 * 0.625).round(),
+        };
         let title_leading = q.title_font + q.line_space as f32;
         let desc_leading = q.desc_font + q.line_space as f32;
         let text_w = width as f32 - pad * 2.0;
@@ -521,45 +592,63 @@ impl<'a> Board<'a> {
             } else {
                 q.line_space as f32 + style.face.height(&desc_flow, desc_leading)
             };
-        let height = cover_h + pad + text_h;
-        let cover = art.picture(&item.cover);
+        let height = badge_h + cover_h + pad + text_h;
         let duration = item.duration.clone();
         let play = item.play.clone();
         if let Some(canvas) = &mut self.canvas {
-            let radius = Corners {
-                top_left: q.card_arc as f32,
-                top_right: q.card_arc as f32,
-                bottom_left: 0.0,
-                bottom_right: 0.0,
-            };
-            canvas.fill_round_rect(
+            // 底板先落，封面与文字再往上压：原插件这一族也是同一个 drawCard
+            paint_inner_board(
+                canvas,
+                style,
                 x,
                 y.round() as u32,
                 width,
-                cover_h.round() as u32,
-                radius,
-                Color::rgb(0x18, 0x1A, 0x1C),
+                (height - badge_h).round() as u32,
+                inner_radius(q, badge_h > 0.0),
             );
-            if let Some(found) = cover {
-                canvas.paste_cover_rounded(
-                    x,
-                    y.round() as u32,
-                    width,
-                    cover_h.round() as u32,
-                    radius,
-                    found,
+            if badge_h > 0.0 {
+                paint_card_badge(
+                    canvas,
+                    style,
+                    art,
+                    Block {
+                        x,
+                        y: y.round() as u32,
+                        width,
+                        height: (height - badge_h).round() as u32,
+                        radius: inner_radius(q, true),
+                    },
+                    &item.badge,
+                    style.theme.sub_left_badge,
+                    None,
                 );
+            }
+            // 封面的四角必须与卡同一套：徽章压着左上角时这里也得是直角，
+            // 否则圆掉的封面角会把下面那层卡体白底露出来（用户圈的缺口）
+            let radius = inner_radius(q, badge_h > 0.0);
+            // 封面往里缩 COVER_INSET，四周就露出一圈卡体白边。原插件缩的是 1 像素
+            // （`videoCardRect.inflate(-1)`），2026-10-16 用户要看 10 像素的观感——
+            // 只改 [`COVER_INSET`] 这一个数，下面那几处都以画出来的这块为准，别各自算
+            let inset = COVER_INSET;
+            let (cx, cy) = (x + inset, y.round() as u32 + inset);
+            let (cw, ch) = (
+                width.saturating_sub(inset * 2),
+                (cover_h.round() as u32).saturating_sub(inset * 2),
+            );
+            canvas.fill_round_rect(cx, cy, cw, ch, radius, Color::rgb(0x18, 0x1A, 0x1C));
+            if let Some(found) = cover {
+                canvas.paste_cover_rounded(cx, cy, cw, ch, radius, found);
             }
             // 底部两成压一层黑渐变，白字才站得住
             canvas.fill_vertical_gradient(
-                x,
-                (y + cover_h * 0.8).round() as u32,
-                width,
-                (cover_h * 0.2).round() as u32,
+                cx,
+                (cy as f32 + ch as f32 * 0.8).round() as u32,
+                cw,
+                (ch as f32 * 0.2).round() as u32,
                 Color::rgba(0, 0, 0, 0),
                 Color::rgba(0, 0, 0, 150),
             );
-            let on_cover = y + cover_h - pad * 0.6;
+            let on_cover = cy as f32 + ch as f32 - pad * 0.6;
             if !duration.is_empty() {
                 style.face.draw_line(
                     canvas,
@@ -576,7 +665,7 @@ impl<'a> Board<'a> {
                 let used = style.face.measure(&label, q.desc_font, false, &art.emojis);
                 style.face.draw_line(
                     canvas,
-                    fx + width as f32 - used - pad,
+                    cx as f32 + cw as f32 - used - pad,
                     on_cover,
                     &label,
                     q.desc_font,
@@ -626,7 +715,9 @@ impl<'a> Board<'a> {
         let label_w = if item.kind.is_empty() {
             0.0
         } else {
-            style.face.measure(&item.kind, q.sub_title_font, false, &art.emojis)
+            style
+                .face
+                .measure(&item.kind, q.sub_title_font, false, &art.emojis)
                 + q.badge_padding as f32 * 2.0
                 + pad
         };
@@ -657,19 +748,39 @@ impl<'a> Board<'a> {
             } else {
                 q.line_space as f32 + style.face.height(&desc_flow, desc_leading)
             };
+        let badge_h = card_badge_height(style, item);
+        let y = y + badge_h;
         let height = (q.additional_card_height as f32).max(used + pad * 2.0);
         let cover = art.picture(&item.cover).cloned();
         let duration = item.duration.clone();
         if let Some(canvas) = &mut self.canvas {
-            let radius = Corners::all(q.card_arc as f32);
-            canvas.fill_round_rect(
+            let radius = inner_radius(q, badge_h > 0.0);
+            paint_inner_board(
+                canvas,
+                style,
                 x,
                 y.round() as u32,
                 width,
                 height.round() as u32,
                 radius,
-                Color::rgb(0xF0, 0xF2, 0xF5),
             );
+            if badge_h > 0.0 {
+                paint_card_badge(
+                    canvas,
+                    style,
+                    art,
+                    Block {
+                        x,
+                        y: y.round() as u32,
+                        width,
+                        height: height.round() as u32,
+                        radius,
+                    },
+                    &item.badge,
+                    style.theme.sub_left_badge,
+                    None,
+                );
+            }
             canvas.fill_round_rect(
                 x,
                 y.round() as u32,
@@ -731,21 +842,21 @@ impl<'a> Board<'a> {
                 let font = q.sub_title_font;
                 let label_text_w = style.face.measure(&item.kind, font, false, &art.emojis);
                 let badge_w = label_text_w + q.badge_padding as f32 * 2.0;
-                let badge_h = font + 12.0;
+                let label_h = font + 12.0;
                 let bx = (x as f32 + width as f32 - badge_w - pad * 0.8).max(text_x);
-                let by = (y + (height - badge_h) / 2.0).max(y);
+                let by = (y + (height - label_h) / 2.0).max(y);
                 canvas.fill_round_rect(
                     bx.round() as u32,
                     by.round() as u32,
                     badge_w.round() as u32,
-                    badge_h.round() as u32,
-                    Corners::all(badge_h / 2.0),
+                    label_h.round() as u32,
+                    Corners::all(label_h / 2.0),
                     theme.title,
                 );
                 style.face.draw_line(
                     canvas,
                     bx + (badge_w - label_text_w) / 2.0,
-                    by + badge_h / 2.0 + font * 0.36,
+                    by + label_h / 2.0 + font * 0.36,
                     &item.kind,
                     font,
                     Color::rgb(255, 255, 255),
@@ -753,7 +864,7 @@ impl<'a> Board<'a> {
                 );
             }
         }
-        height
+        height + badge_h
     }
 
     /// 附加小卡（预约、投票、商品、充电抽奖、合集）：一行标题加一行说明
@@ -798,13 +909,14 @@ impl<'a> Board<'a> {
             };
         let height = used + pad * 1.6;
         if let Some(canvas) = &mut self.canvas {
-            canvas.fill_round_rect(
+            paint_inner_board(
+                canvas,
+                style,
                 x,
                 y.round() as u32,
                 width,
                 height.round() as u32,
-                Corners::all(q.card_arc as f32),
-                Color::rgba(0, 0, 0, 18),
+                inner_radius(q, false),
             );
             let first = y + pad * 0.8 + q.title_font;
             style.face.draw(
@@ -870,41 +982,60 @@ impl<'a> Board<'a> {
     /// 转发的那条原文：内缩一块浅底，内容递归整卡
     fn forward(&mut self, x: u32, width: u32, y: f32, source: &Dynamic) -> f32 {
         let q = self.style.quality;
+        let pad = q.card_padding as f32;
         let inner_x = x + q.card_padding;
         let inner_w = width - q.card_padding * 2;
-        let body = self.probe(|quiet| quiet.card(inner_x, inner_w, y, source, true, None));
-        let height = body + q.card_padding as f32 * 2.0;
+        // 转发里那张原卡自己也要有一格角标：原插件走的是同一个 `assembleCard`，
+        // 只是 `isForward=true`（`DynamicDraw.kt:266-279`），词固定是「转发动态」、
+        // 图标换成 FORWARD、配色仍是 mainLeftBadge。这一格同样带那圈白包边，仍贴着卡顶。
+        let badge_h = if self.style.badge_left {
+            q.badge_height as f32 + COVER_INSET as f32
+        } else {
+            0.0
+        };
+        let top = y + badge_h;
+        let body = self.probe(|quiet| quiet.card(inner_x, inner_w, top + pad, source, true, None));
+        let height = badge_h + body + pad * 2.0;
         if let Some(canvas) = &mut self.canvas {
-            canvas.fill_round_rect(
+            let card = Block {
                 x,
-                y.round() as u32,
+                y: top.round() as u32,
                 width,
-                height.round() as u32,
-                Corners::all(q.card_arc as f32),
-                Color::rgb(0xF4, 0xF5, 0xF7),
+                height: (height - badge_h).round() as u32,
+                radius: inner_radius(q, badge_h > 0.0),
+            };
+            paint_inner_board(
+                canvas,
+                self.style,
+                card.x,
+                card.y,
+                card.width,
+                card.height,
+                card.radius,
             );
+            if badge_h > 0.0 {
+                paint_card_badge(
+                    canvas,
+                    self.style,
+                    self.art,
+                    card,
+                    "转发动态",
+                    self.style.theme.main_left_badge,
+                    Some(paint_forward_glyph),
+                );
+            }
         }
-        self.card(
-            inner_x,
-            inner_w,
-            y + q.card_padding as f32,
-            source,
-            true,
-            None,
-        );
+        self.card(inner_x, inner_w, top + pad, source, true, None);
         height
     }
 
-    /// 页脚
+    /// 页脚。空页脚由调用方整块跳过——原插件也是"没有这行字就不接这张图"
     fn footer(&mut self, x: u32, width: u32, y: f32) -> f32 {
         let q = self.style.quality;
         let style = self.style;
         let art = self.art;
         let font = q.footer_font;
         let height = font + q.card_padding as f32 * 0.8;
-        if style.footer.is_empty() {
-            return height;
-        }
         let used = style.face.measure(&style.footer, font, false, &art.emojis);
         if let Some(canvas) = &mut self.canvas {
             style.face.draw_line(
@@ -921,6 +1052,209 @@ impl<'a> Board<'a> {
     }
 }
 
+/// 卡片阴影的几何：每一环多厚、铺几环、整体往右下挪多少。
+/// 底板与整图高度都从这里取数，别各算各的。
+fn shadow_geometry(q: Quality) -> (u32, u32, u32) {
+    let band = q.card_outline.max(1);
+    (band, q.card_outline + 3, band * 2)
+}
+
+/// 阴影往卡片下方伸出多高。整图必须在 card_margin 之外再给它留出这一截，
+/// 否则落影挤进留白里，卡片下沿看着就贴着图边（原插件是连续高斯淡出，看不出挤；
+/// 我们是一档一档的台阶，24 像素的落影压在 30 像素的边距上就很闷）。
+pub(crate) fn shadow_below(q: Quality) -> f32 {
+    let (band, layers, shift) = shadow_geometry(q);
+    (band * layers + shift) as f32
+}
+
+/// 一圈软阴影：按环带铺，每环只画自己那一圈，越往外越淡，整体往右下挪。
+///
+/// 两处口径：
+/// * 原插件是 `Theme.Shadow("#46000000", 6, 6, 25, 0)` 的高斯投影（`DynamicImageTheme.kt:37`），
+///   贴边那一环最多只有一半浓度、向外线性收。之前每层都从自己的外沿一路填到本体边，
+///   六层全叠在贴着边的第一环上——实测卡片上沿那条 15 像素的带把背景从 251 压到 69，
+///   就是用户圈的「大黑边」。
+/// * 本体永远在洞内：阴影不许压在半透明卡体上（见 [`Canvas::fill_shadow_ring`]）。
+fn paint_shadow(
+    canvas: &mut Canvas,
+    body: Block,
+    color: Color,
+    band: u32,
+    layers: u32,
+    shift: u32,
+) {
+    if color.0[3] == 0 || band == 0 || layers == 0 {
+        return;
+    }
+    let peak = color.0[3] as f32 * 0.5;
+    for step in (1..=layers).rev() {
+        let outer = body.grown(step * band, (shift, shift));
+        let hole = if step == 1 {
+            body
+        } else {
+            body.grown((step - 1) * band, (shift, shift))
+        };
+        let fade = (peak * (layers - step + 1) as f32 / layers as f32) as u8;
+        canvas.fill_shadow_ring(outer, hole, color.alpha(fade));
+    }
+}
+
+/// 内卡这一圈白边留多少像素：封面四周各缩这一格，卡上方那格徽章外面也包这一格白。
+/// 原插件封面是 `videoCardRect.inflate(-1)`（1 像素），徽章外面那一圈是 `drawBadge` 里
+/// `rrect.inflate(1f)` 的小阴影；2026-10-16 用户两处都要 3 像素，所以共用这一个数。
+/// **徽章仍然贴在卡片顶边上**——那 3 像素是徽章自己的白包边，不是把它抬起来分离。
+const COVER_INSET: u32 = 3;
+
+/// 附属卡上方那一格徽章占多高：站方 `badge.text` 有词、且左徽章整档开着才留这一格。
+/// 留的是「药丸本身 + 它外面那圈白包边」，药丸底边照旧压在卡顶。
+/// 原插件无条件留 `badgeHeight`（text 为空时会画出一个空药丸），我们不留——见 README 已知差别。
+fn card_badge_height(style: &Style, item: &Attached) -> f32 {
+    if style.badge_left && !item.badge.is_empty() {
+        style.quality.badge_height as f32 + COVER_INSET as f32
+    } else {
+        0.0
+    }
+}
+
+/// 卡中卡的四角：压着徽章的那个左上角必须直角（同 `cardBadgeArc` 的语义）。
+/// 徽章外面那圈白包边会盖住这个角，但形状仍要照原插件置直角，见 [`paint_card_badge`]。
+fn inner_radius(q: Quality, badge_on_top: bool) -> Corners {
+    Corners {
+        top_left: if badge_on_top { 0.0 } else { q.card_arc as f32 },
+        ..Corners::all(q.card_arc as f32)
+    }
+}
+
+/// 徽章里那一格图标的描法。原插件是 `loadSVG("icon/…")` 直接栅格化，我们没有 SVG
+/// 光栅器，一律用线段描（[`paint_tv_glyph`]、[`paint_forward_glyph`]）。
+type GlyphPainter = fn(&mut Canvas, f32, f32, f32, Color);
+
+/// 卡上方那一格徽章：画在 `card` 矩形正上方、左对齐、下两角直角，卡自己压着它的那个
+/// 上角跟着置直角（`cardBadgeArc` 的语义，见 [`inner_radius`]）。
+///
+/// 两档共用这一个画法，差在配色与图标（图标就是传进来的那个描法）：
+/// * 转发里那张原卡：固定「转发动态」，`mainLeftBadge` + [`paint_forward_glyph`]
+///   （`DynamicDraw.kt:266-279`，主卡那一格是同一段代码换了图标，走 [`paint_badges`]）；
+/// * 附属卡：站方 `badge.text`，`subLeftBadge`，**没有图标**（`badge.icon_url` 实测一直是空的）。
+fn paint_card_badge(
+    canvas: &mut Canvas,
+    style: &Style,
+    art: &Art,
+    card: Block,
+    text: &str,
+    palette: (Color, Color),
+    glyph: Option<GlyphPainter>,
+) {
+    let q = style.quality;
+    let font = q.sub_title_font;
+    let pad = q.badge_padding as f32;
+    let height = q.badge_height;
+    // 图标边长取 contentFont：原插件把 SVG 渲染成 `contentFontSize` 见方，宽度也按这个
+    // 数参与徽章宽公式（`drawBadge` 的 `textLine.width + badgePadding * 8 + icon.width`）
+    let icon = glyph.map_or(0.0, |_| q.content_font);
+    let width = (style.face.measure(text, font, false, &art.emojis) + pad * 8.0 + icon)
+        .round()
+        .max(1.0) as u32;
+    // 药丸底边压在卡片顶边上（原插件 `drawBadge` 的 TOP_LEFT 配方：下两角直角），
+    // 外面再包一圈 `COVER_INSET` 白——那圈白向下也压进卡顶那一格，这就是用户圈的"包边"。
+    // 徽章本身不分离，只是被白边裹住；阴影按原插件打在包边之外（`rrect.inflate(1f)`）。
+    // 往右让开一格包边：这样白边左沿正好落在卡的左边缘上（不往卡外突出），
+    // 药丸本体又与里面那张封面的左边缘同一条竖线（用户 2026-10-16 圈的"对齐一点"）。
+    let top = card.y.saturating_sub(height);
+    let pill = Block {
+        x: card.x + COVER_INSET,
+        y: top,
+        width,
+        height,
+        radius: Corners {
+            bottom_left: 0.0,
+            bottom_right: 0.0,
+            ..Corners::all(q.badge_arc as f32)
+        },
+    };
+    let ring = pill.grown(COVER_INSET, (0, 0));
+    let (band, layers, shift) = shadow_geometry(q);
+    paint_shadow(
+        canvas,
+        ring,
+        style.theme.small_card_shadow,
+        band,
+        layers,
+        shift,
+    );
+    canvas.fill_round_rect(
+        ring.x,
+        ring.y,
+        ring.width,
+        ring.height,
+        ring.radius,
+        style.theme.draw_outline,
+    );
+    canvas.fill_round_rect(
+        pill.x,
+        pill.y,
+        pill.width,
+        pill.height,
+        pill.radius,
+        palette.1,
+    );
+    let baseline = top as f32 + height as f32 - (height as f32 - font) / 2.0;
+    let mut text_x = pill.x as f32 + pad * 4.0;
+    if let Some(paint) = glyph {
+        // 有图标时整条往左挪一格 badgePadding，图标落定后文字再让开一个图标宽
+        text_x -= pad;
+        paint(
+            canvas,
+            text_x,
+            top as f32 + (height as f32 - icon) / 2.0,
+            icon,
+            palette.0,
+        );
+        text_x += icon + pad * 2.0;
+    }
+    style
+        .face
+        .draw_line(canvas, text_x, baseline, text, font, palette.0, true);
+}
+
+/// 卡中卡的底板：与主卡同一档半透明白 + 同一份描边 + 那一圈小阴影。
+///
+/// 原插件这些块（转发原文卡、附属视频卡、附加小卡）全都调同一个 `drawCard()`
+/// （`DynamicDraw.kt:360-377`），填的是主题的 `cardBgColorHex`（v3 = `#B4FFFFFF`）。
+/// 所以内卡看着"几乎透明"——透出来的是外卡那一层颜色。我们此前逐块写死实心灰
+/// （`#F4F5F7` / `#F0F2F5` / `rgba(0,0,0,18)`），扣在渐变背景上就是一块与主题脱节的死灰。
+fn paint_inner_board(
+    canvas: &mut Canvas,
+    style: &Style,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    radius: Corners,
+) {
+    let q = style.quality;
+    let theme = &style.theme;
+    let block = Block {
+        x,
+        y,
+        width,
+        height,
+        radius,
+    };
+    let (band, layers, shift) = shadow_geometry(q);
+    paint_shadow(canvas, block, theme.small_card_shadow, band, layers, shift);
+    canvas.fill_round_rect(x, y, width, height, radius, theme.card_bg);
+    canvas.stroke_round_rect(
+        x,
+        y,
+        width,
+        height,
+        radius,
+        q.card_outline,
+        theme.outline_at(0.5),
+    );
+}
+
 /// 卡片底板：阴影 + 半透明底 + 描边。动态卡与直播卡共用。
 pub(crate) fn paint_board(
     canvas: &mut Canvas,
@@ -932,32 +1266,33 @@ pub(crate) fn paint_board(
 ) {
     let q = style.quality;
     let theme = &style.theme;
-    let radius = q.card_arc as f32;
+    let arc = q.card_arc as f32;
+    // 压着徽章的那一个上角必须是直角，否则圆掉的卡片角与方底的徽章之间会豁开一道
+    // ——原插件 `cardBadgeArc` 就是照徽章开关摆四个角的（`DynamicDraw.kt:164-168`）
+    let radius = Corners {
+        top_left: if style.badge_left { 0.0 } else { arc },
+        top_right: if style.badge_right { 0.0 } else { arc },
+        bottom_left: arc,
+        bottom_right: arc,
+    };
     let top = y.round() as u32;
     let tall = (height.round() as u32).max(1);
-    if theme.card_shadow.0[3] > 0 {
-        // blur 近似：向外扩几层，逐层变淡
-        let layers = q.card_outline + 3;
-        for step in (1..=layers).rev() {
-            let grow = step * q.card_outline.max(1);
-            let fade = (theme.card_shadow.0[3] as f32 * step as f32 / layers as f32) as u8;
-            canvas.fill_round_rect(
-                x.saturating_sub(grow),
-                top.saturating_add(q.card_outline).saturating_sub(grow),
-                width + grow * 2,
-                tall + grow * 2,
-                Corners::all(radius + grow as f32),
-                theme.card_shadow.alpha(fade),
-            );
-        }
-    }
-    canvas.fill_round_rect(x, top, width, tall, Corners::all(radius), theme.card_bg);
+    let card = Block {
+        x,
+        y: top,
+        width,
+        height: tall,
+        radius,
+    };
+    let (band, layers, shift) = shadow_geometry(q);
+    paint_shadow(canvas, card, theme.card_shadow, band, layers, shift);
+    canvas.fill_round_rect(x, top, width, tall, radius, theme.card_bg);
     canvas.stroke_round_rect(
         x,
         top,
         width,
         tall,
-        Corners::all(radius),
+        radius,
         q.card_outline,
         theme.outline_at(0.5),
     );
@@ -978,9 +1313,12 @@ pub(crate) fn paint_badges(
     let theme = &style.theme;
     let height = q.badge_height;
     let font = q.sub_title_font;
-    let icon = font;
+    let pad = q.badge_padding as f32;
+    // 图标那一格的边长取 contentFont：原插件把 SVG 渲染成 `contentFontSize` 见方
+    // （`DynamicDraw.kt:275`），宽度也按这个数参与徽章宽公式
+    let icon = q.content_font;
     let text = style.face.measure(label, font, false, &art.emojis);
-    let left_w = (text + q.badge_padding as f32 * 8.0 + icon * 1.6).round() as u32;
+    let left_w = (text + pad * 8.0 + icon).round() as u32;
     let radius = Corners {
         top_left: q.badge_arc as f32,
         top_right: q.badge_arc as f32,
@@ -990,20 +1328,28 @@ pub(crate) fn paint_badges(
     let top = y.round() as u32;
     // 基线：徽章条内垂直居中
     let baseline = y + height as f32 - (height as f32 - font) / 2.0;
+    let (band, layers, shift) = shadow_geometry(q);
     if style.badge_left {
+        let pill = Block {
+            x,
+            y: top,
+            width: left_w,
+            height,
+            radius,
+        };
+        paint_shadow(canvas, pill, theme.small_card_shadow, band, layers, shift);
         canvas.fill_round_rect(x, top, left_w, height, radius, theme.main_left_badge.1);
-        // 徽标是 SVG，这里不引解码器：用品牌色圆角块顶上去
-        canvas.fill_round_rect(
-            x + q.badge_padding * 2,
-            (y + (height as f32 - icon) / 2.0).round() as u32,
-            icon.round() as u32,
-            icon.round() as u32,
-            Corners::all(icon / 4.0),
+        let icon_x = x as f32 + pad * 3.0;
+        paint_tv_glyph(
+            canvas,
+            icon_x,
+            y + (height as f32 - icon) / 2.0,
+            icon,
             theme.main_left_badge.0,
         );
         style.face.draw_line(
             canvas,
-            x as f32 + q.badge_padding as f32 * 2.0 + icon * 1.6,
+            icon_x + icon + pad * 2.0,
             baseline,
             label,
             font,
@@ -1015,10 +1361,23 @@ pub(crate) fn paint_badges(
         return;
     }
     let code = id.to_string();
-    let width = (style.face.measure(&code, font, false, &art.emojis) + q.badge_padding as f32 * 8.0)
-        .round() as u32;
+    let width = (style.face.measure(&code, font, false, &art.emojis) + pad * 8.0).round() as u32;
     // 左边那一档关掉时右边这档就顶到条的起点，别留一截空白
     let at = x + if style.badge_left { left_w + 2 } else { 0 };
+    paint_shadow(
+        canvas,
+        Block {
+            x: at,
+            y: top,
+            width,
+            height,
+            radius,
+        },
+        theme.small_card_shadow,
+        band,
+        layers,
+        shift,
+    );
     canvas.fill_round_rect(at, top, width, height, radius, theme.main_right_badge.1);
     style.face.draw_line(
         canvas,
@@ -1029,6 +1388,61 @@ pub(crate) fn paint_badges(
         theme.main_right_badge.0,
         true,
     );
+}
+
+/// B 站那个小电视：机身描边 + 两根天线 + 两只眼睛。
+///
+/// 原插件画的是资源里那份徽标 SVG，插件不引 SVG 解码器；但这个标是纯几何图形，
+/// 几条线就够——之前用一块品牌色圆角方块顶上去，图上读起来只是「一个色点」。
+fn paint_tv_glyph(canvas: &mut Canvas, x: f32, y: f32, side: f32, color: Color) {
+    let at = |fx: f32, fy: f32| (x + fx * side, y + fy * side);
+    let line = (side * 0.11).round().max(1.0) as u32;
+    canvas.fill_line(at(0.26, 0.04), at(0.38, 0.28), side * 0.09, color);
+    canvas.fill_line(at(0.74, 0.04), at(0.62, 0.28), side * 0.09, color);
+    // 机身只描边，中间留空：填实了就又变回那块被顶替的色块
+    let (body_x, body_y) = at(0.05, 0.24);
+    canvas.stroke_round_rect(
+        body_x.round() as u32,
+        body_y.round() as u32,
+        (side * 0.9).round().max(3.0) as u32,
+        (side * 0.71).round().max(3.0) as u32,
+        Corners::all(side * 0.2),
+        line,
+        color,
+    );
+    for fx in [0.28, 0.63] {
+        let (ex, ey) = at(fx, 0.46);
+        canvas.fill_round_rect(
+            ex.round() as u32,
+            ey.round() as u32,
+            (side * 0.1).round().max(1.0) as u32,
+            (side * 0.22).round().max(2.0) as u32,
+            Corners::all(side * 0.05),
+            color,
+        );
+    }
+}
+
+/// 转发图标：原插件那一份是 `icon/FORWARD.svg`——一个圆角框，一支箭头从框里往右上指出去。
+/// 我们没有 SVG 光栅器，所以照同一套几何用线段描。
+fn paint_forward_glyph(canvas: &mut Canvas, x: f32, y: f32, side: f32, color: Color) {
+    let at = |fx: f32, fy: f32| (x + fx * side, y + fy * side);
+    let line = (side * 0.11).round().max(1.0) as u32;
+    let (box_x, box_y) = at(0.02, 0.34);
+    canvas.stroke_round_rect(
+        box_x.round() as u32,
+        box_y.round() as u32,
+        (side * 0.64).round().max(3.0) as u32,
+        (side * 0.64).round().max(3.0) as u32,
+        Corners::all(side * 0.16),
+        line,
+        color,
+    );
+    // 箭头：杆从框内起，头朝右上；两撇按杆的方向对称张开
+    let tip = at(0.82, 0.16);
+    canvas.fill_line(at(0.30, 0.44), tip, side * 0.10, color);
+    canvas.fill_line(tip, at(0.694, 0.432), side * 0.10, color);
+    canvas.fill_line(tip, at(0.521, 0.135), side * 0.10, color);
 }
 
 /// 铺满宽的附属卡：只有视频和番剧这类有横封面
@@ -1219,6 +1633,420 @@ mod tests {
     }
 
     #[test]
+    fn the_publish_time_line_clears_the_nickname() {
+        for step in ["800w", "1000w", "1200w", "1500w"] {
+            let q = Quality::find(step);
+            let lines = author_lines(q, 0.0, false);
+            assert!(
+                lines.time_y - lines.name_y >= q.sub_title_font,
+                "{step} 两行基线只差 {}，发布时间会压进昵称那行",
+                lines.time_y - lines.name_y
+            );
+            assert!(
+                lines.time_y + q.sub_title_font * 0.25 <= q.pendant_size as f32,
+                "{step} 发布时间画到作者行（{}）外面",
+                q.pendant_size
+            );
+        }
+        // 转发那一行是名字与时间并排，不另起一行
+        let forward = author_lines(Quality::find("1000w"), 0.0, true);
+        assert!(forward.time_after_name);
+        assert!(forward.time_y <= forward.name_y);
+        assert!(
+            forward.name_y > 0.0 && forward.name_y < Quality::find("1000w").face_size as f32,
+            "转发行的基线该落在头像那一块里"
+        );
+    }
+
+    /// 阴影不许压在卡片本体上：本体是 71% 半透明白，压上去整张卡会灰成一片
+    /// （基准图里卡片是亮的，我们改之前实测是 206,200,199）
+    #[test]
+    fn the_shadow_stays_outside_the_card_body() {
+        let style = style("1000w");
+        let q = style.quality;
+        let bg = Color::rgb(0x80, 0x90, 0xA0);
+        let mut board = Canvas::new(400, 300, bg);
+        paint_board(&mut board, &style, 60, 280, 40.0, 200.0);
+        let mut body_only = Canvas::new(400, 300, bg);
+        body_only.fill_round_rect(
+            60,
+            40,
+            280,
+            200,
+            Corners::all(q.card_arc as f32),
+            style.theme.card_bg,
+        );
+        assert_eq!(board.pixel(200, 150), body_only.pixel(200, 150));
+        // 但卡片外那一圈必须还有阴影，不然等于把整块阴影删了（最外一层只扩到 18 像素）
+        assert_ne!(board.pixel(50, 150), bg);
+    }
+
+    /// 底板之外还要一圈 card_margin 的干净留白，落影另外再占一截：
+    /// 少算任何一格，卡片就顶到图的下边、或阴影把留白填满（用户圈的「图片下方空间小了」）
+    #[test]
+    fn the_image_keeps_ground_below_the_card_and_its_shadow() {
+        let art = Art::default();
+        let style = style("1000w");
+        let q = style.quality;
+        let bytes = dynamic_card(&sample("一段短正文"), &art, &style, None);
+        let back = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        // 测试样式的背景是这一档纯色，卡片本体与阴影都跟它不同
+        let flat = Color::rgb(211, 237, 250);
+        let at = |y: u32| Color(back.get_pixel(500, y).0);
+        let sum = |c: Color| -> u32 { c.0[..3].iter().map(|v| *v as u32).sum() };
+        let last = back.height() - 1;
+        for y in [last, last - q.card_margin / 2, last - q.card_margin + 1] {
+            assert_eq!(at(y), flat, "第 {y} 行还被阴影占着：图的下边距不够");
+        }
+        let ground = last - q.card_margin;
+        assert_ne!(
+            at(ground - 2),
+            flat,
+            "干净留白之上该是落影，可那里什么都没有"
+        );
+        let board = ground - shadow_below(q) as u32;
+        assert!(
+            sum(at(board - 8)) > sum(flat),
+            "底板下沿没画到 board={} 那一格",
+            board
+        );
+    }
+
+    /// 视频卡的封面高度跟着这张封面自己的比例走，不再写死 16:9
+    #[test]
+    fn the_video_cover_keeps_its_own_aspect() {
+        let style = style("1000w");
+        let q = style.quality;
+        let content_w = (q.card_width() - q.card_padding * 2) as f32;
+        let mut item = sample("投稿");
+        item.attached = Some(Attached {
+            kind: "视频".to_string(),
+            title: "同一档标题".to_string(),
+            cover: "https://i/portrait.png".to_string(),
+            url: "https://b23.tv/p".to_string(),
+            duration: String::new(),
+            play: String::new(),
+            desc: String::new(),
+            badge: "投稿视频".to_string(),
+        });
+        let mut art = Art::default();
+        art.pictures.insert(
+            "https://i/portrait.png".to_string(),
+            RgbaImage::from_pixel(360, 640, image::Rgba([9, 9, 9, 255])),
+        );
+        art.pictures.insert(
+            "https://i/landscape.png".to_string(),
+            RgbaImage::from_pixel(640, 360, image::Rgba([9, 9, 9, 255])),
+        );
+        let tall = measure(&item, &art, &style, None);
+        item.attached.as_mut().unwrap().cover = "https://i/landscape.png".to_string();
+        let wide = measure(&item, &art, &style, None);
+        // 两遍之间只有封面比例不同，所以高度差必须正好等于两档封面高之差
+        let owed = content_w * (640.0 / 360.0 - 360.0 / 640.0);
+        assert!(
+            (tall - wide - owed).abs() < 1.0,
+            "竖屏与横屏只差 {}，该差 {owed}",
+            tall - wide
+        );
+    }
+
+    /// 站方那格徽章：有词就多留一格、左徽章整档关掉就不留
+    #[test]
+    fn the_station_badge_gets_its_own_band() {
+        let art = Art::default();
+        let mut item = sample("投稿");
+        item.attached = Some(Attached {
+            kind: "视频".to_string(),
+            title: "标题".to_string(),
+            cover: "https://i/c.png".to_string(),
+            url: "https://b23.tv/c".to_string(),
+            badge: "投稿视频".to_string(),
+            ..Default::default()
+        });
+        let mut blank = item.clone();
+        blank.attached.as_mut().unwrap().badge = String::new();
+        let card_style = style("1000w");
+        // 那一格留的是「药丸本身 + 它外面那圈白包边」
+        let band = card_style.quality.badge_height as f32 + COVER_INSET as f32;
+        let gap =
+            measure(&item, &art, &card_style, None) - measure(&blank, &art, &card_style, None);
+        assert!(
+            (gap - band).abs() < 1.0,
+            "有徽章那一格该多 {band} 像素，实得 {gap}"
+        );
+        let mut off = style("1000w");
+        off.badge_left = false;
+        let quiet = measure(&item, &art, &off, None) - measure(&blank, &art, &off, None);
+        assert!(quiet.abs() < 1.0, "左徽章关掉时不该留这一格，实得 {quiet}");
+    }
+
+    /// 转发的那张原卡自己占一格角标，外层那一格固定写「动态」不跟类型词走
+    /// （用户 2026-10-16 圈的 #182 剩下一半：真卡上外层成了「转发动态」，里层反倒空着）
+    #[test]
+    fn a_forward_reserves_a_second_badge_band_below_the_outer_one() {
+        let art = Art::default();
+        let on = style("1000w");
+        let mut off = style("1000w");
+        off.badge_left = false;
+        let band = on.quality.badge_height as f32;
+        // 里层那一格是「药丸 + 外面那圈白包边」，外层那一格仍按原插件贴顶不包边
+        let inner_band = band + COVER_INSET as f32;
+
+        let plain = sample("转发语");
+        let mut nested = sample("转发语");
+        nested.origin = Some(Box::new(sample("被转发的那条原文正文")));
+
+        // 关掉左徽章只少外层那一格；开着时转发要多出里层那一格
+        let plain_gap = measure(&plain, &art, &on, None) - measure(&plain, &art, &off, None);
+        assert!(
+            (plain_gap - band).abs() < 1.0,
+            "普通动态只该有外层那一格（{band}），实得 {plain_gap}"
+        );
+        let forward_gap = measure(&nested, &art, &on, None) - measure(&nested, &art, &off, None);
+        assert!(
+            (forward_gap - (band + inner_band)).abs() < 1.0,
+            "转发该有外层 {band} + 里层 {inner_band} 两格，实得 {forward_gap}"
+        );
+
+        // 里层那一格是真画了字的：整列里带图标/文字那支青色的行数，转发要明显多于普通
+        let cyan_rows = |dynamic: &Dynamic| -> u32 {
+            let img = image::load_from_memory(&dynamic_card(dynamic, &art, &on, None))
+                .unwrap()
+                .to_rgba8();
+            (0..img.height())
+                .filter(|row| {
+                    (0..img.width()).any(|col| {
+                        let p = img.get_pixel(col, *row).0;
+                        p[2] > 150 && p[1] > 140 && p[0] < 120
+                    })
+                })
+                .count() as u32
+        };
+        assert!(
+            cyan_rows(&nested) > cyan_rows(&plain) * 3 / 2,
+            "里层那格没画出字来：普通 {} 行，转发 {} 行",
+            cyan_rows(&plain),
+            cyan_rows(&nested)
+        );
+    }
+
+    /// 外层角标不许写类型词：原插件那一格取 `tag ?: 动态/转发动态`，
+    /// 「投稿视频」这类词只出现在附属卡自己那格与页脚的 {type} 里
+    #[test]
+    fn the_outer_badge_ignores_the_type_word() {
+        let art = Art::default();
+        let card_style = style("1000w");
+        let mut video = sample("同一段正文");
+        video.type_text = "投稿视频".to_string();
+        let mut column = sample("同一段正文");
+        column.type_text = "专栏".to_string();
+        assert_eq!(
+            dynamic_card(&video, &art, &card_style, None),
+            dynamic_card(&column, &art, &card_style, None),
+            "类型词渗进卡片里了：外层那格两种动态必须一模一样"
+        );
+    }
+
+    /// 那一格 tag 是"包边"不是"分离"，而且要与里面的封面对齐：
+    /// 药丸底边压在卡顶上、外面裹一圈白，白边左沿正好落在卡左边缘上（不往卡外突出），
+    /// 药丸本体则与封面左边缘同一条竖线。
+    /// （用户 2026-10-16 两次纠正：「我说3像素包边，谁让你分离了？」「这里对齐一点」）
+    #[test]
+    fn the_tag_is_wrapped_not_detached() {
+        let card_style = style("1000w");
+        let q = card_style.quality;
+        let bg = Color::rgb(0x80, 0x90, 0xA0);
+        let mut canvas = Canvas::new(400, 300, bg);
+        let card = Block {
+            x: 60,
+            y: 120,
+            width: 300,
+            height: 120,
+            radius: inner_radius(q, true),
+        };
+        paint_card_badge(
+            &mut canvas,
+            &card_style,
+            &Art::default(),
+            card,
+            "专栏",
+            card_style.theme.sub_left_badge,
+            None,
+        );
+        let same = |x: u32, y: u32, want: Color| canvas.pixel(x, y).0[..3] == want.0[..3];
+        let white = Color::rgb(255, 255, 255);
+        let mid = card.y - q.badge_height / 2;
+        assert!(
+            !same(card.x - 1, mid, white),
+            "包边往卡外突出了：卡左边缘外那一格不该是白的（阴影会到那儿，但白边不会）"
+        );
+        assert!(
+            same(card.x + 1, mid, white),
+            "包边没画出来：卡左边缘内侧那一格该是白的"
+        );
+        assert!(
+            same(
+                card.x + COVER_INSET + 1,
+                mid,
+                card_style.theme.sub_left_badge.1
+            ),
+            "药丸本体没让开那一格包边：它该与封面左边缘同一条竖线"
+        );
+        assert!(
+            same(card.x + 40, card.y - 1, card_style.theme.sub_left_badge.1),
+            "药丸与卡顶之间被留出了缝：那一行该是药丸底色"
+        );
+    }
+
+    /// 阴影向外必须渐淡，且贴边那一环不许叠成硬黑边（用户 2026-10-15 圈的「大黑边」）
+    #[test]
+    fn the_shadow_tapers_outward() {
+        let style = style("1000w");
+        let bg = Color::rgb(255, 255, 255);
+        let mut canvas = Canvas::new(400, 300, bg);
+        paint_board(&mut canvas, &style, 60, 280, 40.0, 200.0);
+        let edge = 240; // 卡片底边：40 + 200
+        let dark = |y: u32| {
+            let pixel = canvas.pixel(200, y).0;
+            3 * 255 - pixel[..3].iter().map(|c| *c as u32).sum::<u32>()
+        };
+        let mut previous: Option<u32> = None;
+        for step in 0..16 {
+            let now = dark(edge + step);
+            if let Some(inside) = previous {
+                assert!(
+                    now <= inside,
+                    "往外第 {step} 环比里面还黑（{now} > {inside}）：阴影全叠在贴边那一圈"
+                );
+            }
+            previous = Some(now);
+        }
+        // 高斯阴影在形状边缘最多给一半浓度：#46 = 70 → 最深那一环每通道到 35 上下（三通道和 105），
+        // 不该是六层叠出来的 160（实测旧画法把背景从 251 压到 69）
+        assert!(dark(edge) <= 3 * 45, "贴边那一环深到 {}", dark(edge));
+    }
+
+    /// 徽章压着的那一个卡片上角必须是直角：圆角卡片 + 方底徽章之间会豁开一道
+    #[test]
+    fn the_card_corner_under_an_enabled_badge_is_square() {
+        let mut style = style("1000w");
+        let bg = Color::rgb(0x80, 0x90, 0xA0);
+        let bright = |canvas: &Canvas, x: u32, y: u32| {
+            canvas.pixel(x, y).0[..3]
+                .iter()
+                .map(|c| *c as u32)
+                .sum::<u32>()
+        };
+        style.badge_left = true;
+        let mut with = Canvas::new(400, 300, bg);
+        paint_board(&mut with, &style, 60, 280, 40.0, 200.0);
+        style.badge_left = false;
+        let mut without = Canvas::new(400, 300, bg);
+        paint_board(&mut without, &style, 60, 280, 40.0, 200.0);
+        assert!(
+            bright(&without, 61, 41) + 100 < bright(&with, 61, 41),
+            "开着左徽章时那个角该画到卡体，关掉才该圆出去"
+        );
+    }
+
+    /// 角标那格画的是小电视，不是一块实心色块
+    #[test]
+    fn the_badge_glyph_is_a_tv_not_a_solid_block() {
+        let style = style("1000w");
+        let ink = style.theme.main_left_badge.0;
+        let side = style.quality.sub_title_font;
+        let mut canvas = Canvas::new(64, 64, Color::rgb(255, 255, 255));
+        paint_tv_glyph(&mut canvas, 8.0, 8.0, side, ink);
+        let is_ink =
+            |x: f32, y: f32| canvas.pixel((8.0 + x * side) as u32, (8.0 + y * side) as u32) == ink;
+        // 机身正中必须是空的，两只眼睛之间那一格也是
+        assert!(!is_ink(0.50, 0.60), "机身被填实了，又成那块色点");
+        // 机身左沿与天线要有墨
+        assert!(is_ink(0.06, 0.60), "机身描边没画出来");
+        assert!(is_ink(0.30, 0.10), "天线没画出来");
+        // 眼睛
+        assert!(is_ink(0.30, 0.52) || is_ink(0.66, 0.52), "两只眼睛都没了");
+    }
+
+    /// 卡中卡必须吃主题那层半透明白：改 alpha 就得跟着变（原插件的透明度在 ImageTheme.yml 里）
+    #[test]
+    fn the_inner_card_uses_the_theme_ground() {
+        let card_style = style("1000w");
+        let q = card_style.quality;
+        let base = Color::rgb(0x80, 0x90, 0xA0);
+        let mut painted = Canvas::new(300, 200, base);
+        paint_inner_board(
+            &mut painted,
+            &card_style,
+            30,
+            30,
+            240,
+            140,
+            Corners::all(q.card_arc as f32),
+        );
+        let mut ground = Canvas::new(300, 200, base);
+        ground.fill_round_rect(
+            30,
+            30,
+            240,
+            140,
+            Corners::all(q.card_arc as f32),
+            card_style.theme.card_bg,
+        );
+        // 中心那一格只该有主题那层白，不许再掺写死的灰（此前是 #F4F5F7／#F0F2F5／rgba(0,0,0,18)）
+        assert_eq!(painted.pixel(150, 100), ground.pixel(150, 100));
+        let mut thin = style("1000w");
+        thin.theme.card_bg = Color::rgba(255, 255, 255, 40);
+        let mut faint = Canvas::new(300, 200, base);
+        paint_inner_board(
+            &mut faint,
+            &thin,
+            30,
+            30,
+            240,
+            140,
+            Corners::all(q.card_arc as f32),
+        );
+        assert_ne!(
+            faint.pixel(150, 100),
+            painted.pixel(150, 100),
+            "换了主题 alpha 内卡没反应，说明还是写死的"
+        );
+    }
+
+    /// 页脚留空时整块跳过：白占一行字高会把卡片底下撑出一段没内容的空白
+    #[test]
+    fn an_empty_footer_reserves_nothing_below_the_body() {
+        let art = Art::default();
+        let body = sample("一段短正文");
+        let mut quiet = style("1000w");
+        quiet.footer = String::new();
+        let q = quiet.quality;
+        let empty = measure(&body, &art, &quiet, None);
+        let owed = q.content_space as f32 + q.footer_font + q.card_padding as f32 * 0.8;
+        let with_footer = measure(&body, &art, &style("1000w"), None);
+        assert!(
+            (with_footer - empty - owed).abs() < 1.0,
+            "页脚那一档差 {}，该差 {owed}",
+            with_footer - empty
+        );
+        // 空页脚时整图高 = 上边距 + 徽章 + 作者行 + 间距 + 一行正文 + 底板留白 + 下边距 + 落影
+        let expected = q.card_margin as f32
+            + q.badge_height as f32
+            + q.pendant_size as f32
+            + q.content_space as f32
+            + (q.content_font + q.line_space as f32)
+            + q.card_padding as f32
+            + q.card_margin as f32
+            + shadow_below(q);
+        assert!(
+            (empty - expected).abs() < 1.0,
+            "空页脚还多占 {} 像素",
+            empty - expected
+        );
+    }
+
+    #[test]
     fn a_blocked_dynamic_adds_the_notice_band() {
         let plain = sample("正文");
         let mut hidden = sample("正文");
@@ -1300,6 +2128,7 @@ mod tests {
             duration: "12:34".to_string(),
             play: "1.2万播放".to_string(),
             desc: "简介文字".to_string(),
+            badge: "投稿视频".to_string(),
         };
         let mut board = Board {
             style: &style,
@@ -1347,7 +2176,10 @@ mod tests {
     #[test]
     #[ignore = "只出图给人看版式，没有断言"]
     fn card_preview_writes_three_boards_to_temp() {
-        let style = style("1000w");
+        let mut style = style("1000w");
+        // 背景换成调试配置那一档：defaultColor 单值 #d3edfa 自动扩成三段渐变。
+        // 纯白底上根本看不出阴影，人眼验收阴影与徽章融合必须带渐变。
+        style.background = crate::draw::theme::background("#d3edfa", 30.0, true, 0.25, 1.0);
         let mut art = Art::default();
         art.faces.insert(
             "https://face/1.jpg".to_string(),
@@ -1403,6 +2235,7 @@ mod tests {
             duration: "01:29".to_string(),
             play: "1.2万播放".to_string(),
             desc: "ばんばん".to_string(),
+            badge: "投稿视频".to_string(),
         });
 
         let mut nested = sample("２ｗ！？？？？？？？？！");
@@ -1420,11 +2253,17 @@ mod tests {
             duration: String::new(),
             play: String::new(),
             desc: "动态卡片".to_string(),
+            badge: "装扮".to_string(),
         });
 
         let out = std::env::temp_dir().join("arona-bili-cards");
         std::fs::create_dir_all(&out).unwrap();
-        for (name, item) in [("grid", &grid), ("video", &video), ("nested", &nested), ("deco", &deco)] {
+        for (name, item) in [
+            ("grid", &grid),
+            ("video", &video),
+            ("nested", &nested),
+            ("deco", &deco),
+        ] {
             let file = out.join(format!("{name}.png"));
             std::fs::write(&file, dynamic_card(item, &art, &style, None)).unwrap();
             println!("{name} -> {}", file.display());

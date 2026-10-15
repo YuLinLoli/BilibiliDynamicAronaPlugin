@@ -133,6 +133,11 @@ pub struct Attached {
     pub play: String,
     /// 副标题：附加卡与活动卡上的第二行
     pub desc: String,
+    /// 站方给的附属卡标签（`major.<族>.badge.text`，如「投稿视频」「专栏」）。
+    /// 原插件那一格徽章的文字与配色都直接取这个对象（`Dynamic.kt` 的 `Badge`），
+    /// 不是插件自己那套六词判类表——两者常常不同词（这条 UP 的视频动态：
+    /// 站方「投稿视频」，我们的判类表只有「视频」）。
+    pub badge: String,
 }
 
 /// 直播间信息
@@ -403,6 +408,11 @@ fn parse_live(major: &Value, own_uid: i64) -> Option<LiveInfo> {
     })
 }
 
+/// 站方给的那格附属卡标签：`major.<族>.badge.text`
+fn badge_text(node: &Value) -> String {
+    text(node, &["badge", "text"]).unwrap_or_default()
+}
+
 /// 解析 major / module_dynamic.common 里的附带内容
 fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Attached> {
     // 视频那一支单独处理：bvid 与 aid 两种写法都要认，时长和播放量也只在它身上有
@@ -424,6 +434,7 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                     .unwrap_or_default(),
                 play: text(major, &[slot, "stat", "view"]).unwrap_or_default(),
                 desc: text(major, &[slot, "desc"]).unwrap_or_default(),
+                badge: badge_text(major.get(slot)?),
                 url,
             });
         }
@@ -437,6 +448,7 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 .first()
                 .cloned()
                 .unwrap_or_default(),
+            badge: badge_text(article),
             url: format!("https://www.bilibili.com/read/cv{id}"),
             ..Default::default()
         });
@@ -452,6 +464,7 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
             kind: "番剧".into(),
             title: text(pgc, &["title"]).unwrap_or_default(),
             cover: text(pgc, &["cover"]).unwrap_or_default(),
+            badge: badge_text(pgc),
             url,
             ..Default::default()
         });
@@ -465,6 +478,7 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 .or_else(|| text(music, &["url"]))
                 .unwrap_or_default(),
             duration: text(music, &["duration_text"]).unwrap_or_default(),
+            badge: badge_text(music),
             ..Default::default()
         });
     }
@@ -483,6 +497,7 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 .or_else(|| text(common, &["url"]))
                 .unwrap_or_default(),
             play: text(common, &["sub_title"]).unwrap_or_default(),
+            badge: badge_text(common),
             ..Default::default()
         });
     }
@@ -582,6 +597,7 @@ pub fn parse_additional(dynamic: &Value) -> Vec<Attached> {
                 desc,
                 title,
                 cover,
+                badge: pick(&["badge", "text"]).unwrap_or_default(),
                 url: pick(&["jump_url"]).unwrap_or_default(),
                 ..Default::default()
             })
@@ -617,15 +633,10 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
     let attached = parse_attached(&major, dynamic, &type_str);
     let live = parse_live(&major, uid);
 
-    // 封面没有独立字段时，把附带内容的封面并进图片列表（原插件的 {images} 就是这么来的）
-    if let Some(cover) = attached
-        .as_ref()
-        .map(|item| item.cover.clone())
-        .filter(|c| !c.is_empty())
-        && !images.contains(&cover)
-    {
-        images.push(cover);
-    }
+    // 附属内容的封面**不进**图片列表：原插件那一份封面只画在它自己的附属卡里
+    // （`drawGeneral` 的 archive/article/… 那一族），而模板占位符 `{images}` 取的
+    // `BiliMessage.images` 在原插件根本没被填过（全仓库只有声明与展开两处）。
+    // 之前这里把封面并进来，投稿动态于是画成两张一模一样的大图。
     if let Some(room) = &live
         && !room.cover.is_empty()
         && !images.contains(&room.cover)
@@ -1079,13 +1090,16 @@ mod tests {
         assert_eq!(attached.url, "https://www.bilibili.com/video/BV1xx411c7mD");
         assert_eq!(attached.duration, "03:12");
         assert_eq!(attached.play, "1.2万");
-        assert_eq!(
-            parsed.images,
-            vec!["https://i0.hdslb.com/cover.jpg".to_string()]
+        // 封面只归附属卡：并进 images 的话，卡片上会出现"同一张封面画两遍"
+        assert!(
+            parsed.images.is_empty(),
+            "附属内容的封面不该出现在图片列表里：{:?}",
+            parsed.images
         );
         assert_eq!(
             parsed.cover(),
-            Some("https://i0.hdslb.com/cover.jpg".to_string())
+            Some("https://i0.hdslb.com/cover.jpg".to_string()),
+            "转发卡片的封面仍要从附属卡取到"
         );
         assert_eq!(parsed.links[0].label, "视频");
     }
@@ -1144,7 +1158,10 @@ mod tests {
             "pgc": {"title": "第 3 话", "cover": "https://i0.hdslb.com/pgc.jpg", "ep_id": 12345}
         });
         let parsed = parse_item(&item).unwrap();
-        assert_eq!(parsed.kind, "视频", "番剧按原插件 toFilterType 归进「视频」这一类判");
+        assert_eq!(
+            parsed.kind, "视频",
+            "番剧按原插件 toFilterType 归进「视频」这一类判"
+        );
         assert_eq!(parsed.type_text, "番剧", "显示词仍是「番剧」");
         assert_eq!(
             parsed.attached.unwrap().url,
@@ -1161,13 +1178,21 @@ mod tests {
         item["modules"]["module_dynamic"]["major"] = Value::Null;
         let parsed = parse_item(&item).unwrap();
         assert_eq!(
-            parsed.kind,
-            "动态",
+            parsed.kind, "动态",
             "活动位（COMMON_SQUARE）判类必须落回「动态」——六词表里没有「活动」，落错就整类筛不到"
         );
         assert_eq!(parsed.type_text, "动态", "与原插件 DynamicType.text 同词");
-        assert_eq!(parsed.attached.unwrap().title, "一首歌");
-        assert_eq!(parsed.images, vec!["https://c/m.jpg".to_string()]);
+        assert_eq!(parsed.attached.as_ref().unwrap().title, "一首歌");
+        assert!(
+            parsed.images.is_empty(),
+            "附属内容的封面不进图片列表：{:?}",
+            parsed.images
+        );
+        assert_eq!(
+            parsed.cover(),
+            Some("https://c/m.jpg".to_string()),
+            "封面仍要从附属卡取到"
+        );
     }
 
     /// B 站以后加的新类型不能整条丢
