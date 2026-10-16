@@ -698,6 +698,14 @@ pub struct TemplateConfig {
     pub forward_card: ForwardCard,
 }
 
+/// 早年自创、2026-10-16 起**查表时一律当不存在**的那三档。
+///
+/// 为什么不是删掉就完事：老运行目录里那份 `arona.yml` 是当年生成的，里面 `defaultDynamicPush`
+/// 还指着 `SimpleMsg`，而模板表整张覆盖内置表——**光换 dll 救不回来**，用户看到的仍是
+/// 「卡片 + 正文 + 原图」三条。查表时跳过这三个名字，就落到原插件的默认档（一条消息）；
+/// 用户自己另起的名字不受影响，照旧能覆盖。
+pub(crate) const RETIRED_TEMPLATES: [&str; 3] = ["SimpleMsg", "OnlyDraw", "NoDraw"];
+
 impl Default for TemplateConfig {
     fn default() -> Self {
         // 这三张表逐键、逐字面量照搬原插件 `TemplateConfig`（`BiliConfig.kt:231-247`），不自创档。

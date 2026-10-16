@@ -630,6 +630,21 @@ async fn push_one(
         save(&conf.check);
         return;
     }
+    // 归属要留在日志里：用户问「我在这个群触发，怎么其他群也收到了」时，
+    // 只看素材下载数不出答案。`targets` 是 `states_of(订阅档)` 给的——订了这个 uid
+    // 或订了通配档 `0`（`/bili add 0`＝我关注的所有人都推）的会话才会进来
+    arona::runtime::log::info(format!(
+        "bilibili：动态 {}（作者 {}，订阅档 {}）推给 {} 个会话：{}",
+        dynamic.id,
+        dynamic.uid,
+        slot,
+        chosen.len(),
+        chosen
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<&str>>()
+            .join(" ")
+    ));
     let live = live_of(dynamic).filter(|_| kind == "直播");
     let living = live.is_some();
     // 机翻只贴动态卡：原插件那一路也只在画动态卡时调 trans，直播卡与文本模板都不带译文。

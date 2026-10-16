@@ -12,7 +12,9 @@
 
 pub(crate) mod template;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use arona::bot::Bot;
@@ -20,7 +22,9 @@ use arona::plugin::PluginContext;
 use arona::runtime::message::{MessageSegment, MessageTarget, OutgoingMessage};
 use image::ImageFormat;
 
-use crate::config::{BiliConfig, ForwardCard, SECTION, TEMPLATE_SECTION, TemplateConfig};
+use crate::config::{
+    BiliConfig, ForwardCard, RETIRED_TEMPLATES, SECTION, TEMPLATE_SECTION, TemplateConfig,
+};
 use crate::store::{self, TargetState};
 use template::Vals;
 
@@ -131,12 +135,72 @@ fn pick_template(ctx: &PluginContext, state: &TargetState, kind: Kind) -> (Strin
         .template(kind.template_key())
         .map(str::to_string)
         .unwrap_or(default_name.clone());
-    let text = table
-        .get(&name)
-        .or_else(|| table.get(default_name.as_str()))
-        .cloned()
-        .unwrap_or_else(|| kind.fallback().to_string());
-    (name, text)
+    template_of(table, &name, &default_name, kind)
+}
+
+/// 这一档该用哪个名字与哪个串：目标覆盖 → 默认档 → 兜底，中间跳过 [`Kind::retired`]。
+/// 返回**生效的那个名字**，不然是调用原名字——`/bili info` 报「dynamic: SimpleMsg」
+/// 而实际只发一条，那是谎报。拆成纯函数是为了能把"老配置整表盖住新默认"这条路直接钉进单测
+fn template_of(
+    table: &BTreeMap<String, String>,
+    wanted: &str,
+    default_name: &str,
+    kind: Kind,
+) -> (String, String) {
+    let alive = |key: &str| {
+        if kind.retired(key) {
+            return None;
+        }
+        table.get(key).cloned()
+    };
+    if let Some(text) = alive(wanted) {
+        return (wanted.to_string(), text);
+    }
+    let (fell_back, text) = match alive(default_name) {
+        Some(text) => (default_name.to_string(), text),
+        None => (kind.default_name().to_string(), kind.fallback().to_string()),
+    };
+    if kind.retired(wanted) {
+        tell_retired(wanted, &fell_back);
+    }
+    (fell_back, text)
+}
+
+/// 那一类东西的原插件默认档叫什么（兜底串就是按它写的）
+impl Kind {
+    fn default_name(self) -> &'static str {
+        match self {
+            Kind::Dynamic | Kind::Live => "OneMsg",
+            Kind::LiveClose => "SimpleMsg",
+        }
+    }
+
+    /// 这个名字在这一张表里是不是当年自创、现已废弃的那一档。
+    /// **只有动态表与直播表要跳**：`SimpleMsg` 在直播结束表里是原插件的正牌名字
+    /// （`BiliConfig.kt:229` 与 `245`），一刀切会把用户改过的结束通知内容吞掉
+    fn retired(self, name: &str) -> bool {
+        match self {
+            Kind::LiveClose => false,
+            _ => RETIRED_TEMPLATES.contains(&name),
+        }
+    }
+}
+
+/// 同一档只念一次：这是配置层面的事，不该每推一条就刷一遍日志
+fn tell_retired(name: &str, effective: &str) {
+    static SAID: std::sync::OnceLock<Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+    let said = SAID.get_or_init(Default::default);
+    let fresh = said
+        .lock()
+        .map(|mut seen| seen.insert(name.to_string()))
+        .unwrap_or(true);
+    if fresh {
+        arona::runtime::log::warning(format!(
+            "bilibili：模板档「{name}」是插件早年自创、已随模板表对齐原插件时删掉的那一档，\
+             老配置里留着它会把一条动态摊成好几条。现在按「{effective}」走；\
+             要换推送形态请用 /bili template 选一档表里真有的"
+        ));
+    }
 }
 
 /// 目标键 → 发送地址
@@ -516,6 +580,50 @@ mod tests {
             attachment(raw.clone()),
             raw,
             "动图被改写了，它本该原样交出去"
+        );
+    }
+
+    /// 老配置整表盖住新默认档这条路必须堵死：`arona.yml` 是当年生成的，`defaultDynamicPush`
+    /// 还指着自创的 `SimpleMsg`（`{draw}\r{content}\r{images}`），表里也留着那一档——
+    /// 换 dll 不生效，用户看到的仍是「卡片 + 正文 + 原图」三条。
+    /// 这条查的是"最终生效的是哪条串"，不是"键在不在"（只查键名当年一路绿灯）
+    #[test]
+    fn a_legacy_config_cannot_spread_one_dynamic_over_three_messages() {
+        use super::{Kind, template_of};
+        use std::collections::BTreeMap;
+        let mut table = BTreeMap::new();
+        table.insert("SimpleMsg".into(), "{draw}\r{content}\r{images}".into());
+        table.insert("DrawOnly".into(), "{draw}".into());
+        table.insert("OneMsg".into(), "{draw}\n{name}@{type}\n{link}".into());
+        // 默认档与目标覆盖都指着那三档自创名时，取到的必须是原插件的默认串：不拆条、不再发配图，
+        // 而且报出来的是**生效的那一档**（`/bili info` 不能继续说 SimpleMsg）
+        let (name, text) = template_of(&table, "SimpleMsg", "SimpleMsg", Kind::Dynamic);
+        assert_eq!(
+            (name.as_str(), text.as_str()),
+            ("OneMsg", Kind::Dynamic.fallback())
+        );
+        assert!(
+            !text.contains('\r') && !text.contains("{images}"),
+            "{text:?}"
+        );
+        let (name, _) = template_of(&table, "NoDraw", "OnlyDraw", Kind::Dynamic);
+        assert_eq!(
+            name, "OneMsg",
+            "两档都是自创名时也该落到兜底，而不是静默不推"
+        );
+        // 用户自己起的名字不受影响，照旧能覆盖
+        assert_eq!(
+            template_of(&table, "DrawOnly", "OneMsg", Kind::Dynamic),
+            ("DrawOnly".into(), "{draw}".into()),
+            "把没废弃的档一并跳过了"
+        );
+        // `SimpleMsg` 在**直播结束表**里是原插件的正牌名字，不能一刀切跳过
+        let mut close = BTreeMap::new();
+        close.insert("SimpleMsg".into(), "{name} 直播结束啦!".into());
+        assert_eq!(
+            template_of(&close, "SimpleMsg", "SimpleMsg", Kind::LiveClose).1,
+            "{name} 直播结束啦!",
+            "结束通知那一档被误当成废弃档了"
         );
     }
 }
