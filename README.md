@@ -13,7 +13,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 ## 安装
 
-1. 先有 Arona-rs 框架（≥ 1.1.0）。
+1. 先有 Arona-rs 框架，**符号布局要对上**：这一版插件是布局 9（启动日志里那行
+   `[Arona] 插件 ABI 握手通过: 布局 9，契约 1.0.0` 就是判据）。布局 9 还没随任何已发布的标签出去，
+   所以现在只能用框架仓库 HEAD 自己构建的那份宿主；混了版本不会静默出错，装载那一步会直接拒载并说明差在哪。
 2. 构建：`cargo build --release`，产物 `target/release/bilibili_dynamic_plugin.dll`。
 3. **框架停着的时候**把 dll 放进框架运行目录的 `plugins/bilibili/`：
 
@@ -1894,10 +1896,19 @@ NotoSansSC-VF 16.9 MB→170 MB、msyhl 11.6 MB→160 MB。常驻只跟**字形�
 它另有真粗体档位，所以「粗体」这一档不用合成假粗。
 
 **观感**：思源宋体是衬线体，跟雅黑那一档黑体差得很明显——这是**换字面**的效果，不是换后端的副作用（后端那一边几何上逐格相同）。
-版式类改动仍然只能肉眼验收；这一批预览图（去掉了右上角那格）本轮末重出，编号 21。
+版式类改动仍然只能肉眼验收；这一批预览图（去掉了右上角那格）已经重出，调试目录编号 21。
+复现：把 `Arona-rs/installer/fonts/*.otf` 拷进插件仓的 `fonts/`（`paths::root()` 就是工作目录，这样才走生产那一级
+解析），再 `cargo test --release --lib -- --ignored --nocapture card_preview`，产物落在 `%TEMP%/arona-bili-cards/`。
+**那批图里的 unicode 表情是豆腐块**，不是思源宋体的锅：预览工装只有设了 `ARONA_TWEMOJI_DIR` 才贴图（第 42 条），
+生产路径上 `gather` 会把 twemoji 的 png 拉下来按图贴，不走字体。
 
 **`ABI_LAYOUT` 固定到 9**：框架侧早就抬到 9 但那一版从没装过，这一轮三个插件全部对齐 9 重编。
 本插件侧不需要为 ABI 改任何源码——那个数是 arona crate 里的常量，插件只跟着重编（与 2026-10-08 抬到 6 那一轮同一形状）。
+三枚 dll 都拿框架的握手探针复核过（`ARONA_PROBE_DLL=<dll> cargo test --release -p arona-rs --lib dump_a_dlls_handshake -- --ignored --nocapture`）：
+`packed = 0x0000000900010000`，布局 9、契约 1.0.0，工具链指纹与 release 宿主逐字相同
+（`arona/1.1.0|rustc/1.98.0|host/x86_64-pc-windows-msvc|target/x86_64-pc-windows-msvc|profile/release|crt-static/1|features/`）。
+**注意这条判据得用 `--release` 跑**：探针打出来的"宿主指纹"那一行取的是**跑探针的那个构建**的 profile，
+debug 跑出来会显示 `profile/debug`，而握手是按 profile 一致才放行的（见 `abi.rs` 那句拒载文案）。
 
 **门禁**：`cargo test --release --lib` **232 passed / 0 failed / 5 ignored**。删掉的用例都是"断言对象已经不存在"那一类：
 右档三条（`the_id_pill_sits_on_the_right_edge`、`the_right_switch_alone_decides_whether_the_id_shows`、
