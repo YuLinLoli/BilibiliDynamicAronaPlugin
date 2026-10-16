@@ -671,11 +671,26 @@ impl<'a> Board<'a> {
                     let corner = Corners {
                         top_left: if idx == 0 { radius.top_left } else { 0.0 },
                         bottom_left: if idx == 0 { radius.bottom_left } else { 0.0 },
-                        top_right: if idx + 1 == slots { radius.top_right } else { 0.0 },
-                        bottom_right: if idx + 1 == slots { radius.bottom_right } else { 0.0 },
+                        top_right: if idx + 1 == slots {
+                            radius.top_right
+                        } else {
+                            0.0
+                        },
+                        bottom_right: if idx + 1 == slots {
+                            radius.bottom_right
+                        } else {
+                            0.0
+                        },
                     };
                     let tx = cx + idx as u32 * step;
-                    canvas.fill_round_rect(tx, cy, tile_w, ch, corner, Color::rgb(0x18, 0x1A, 0x1C));
+                    canvas.fill_round_rect(
+                        tx,
+                        cy,
+                        tile_w,
+                        ch,
+                        corner,
+                        Color::rgb(0x18, 0x1A, 0x1C),
+                    );
                     if let Some(found) = art.picture(url) {
                         canvas.paste_cover_rounded(tx, cy, tile_w, ch, corner, found);
                     }
@@ -1882,10 +1897,7 @@ mod tests {
                 if *pixel != want {
                     continue;
                 }
-                let (x, y) = (
-                    index as u32 % board.width(),
-                    index as u32 / board.width(),
-                );
+                let (x, y) = (index as u32 % board.width(), index as u32 / board.width());
                 found = match found {
                     None => Some((x, y, x, y)),
                     Some((left, top, right, bottom)) => {
@@ -1931,11 +1943,12 @@ mod tests {
         );
 
         // 一张封面时仍是满宽那一档（0.35），不跟着三宫格变矮
-        item.attached.as_mut().unwrap().covers
-            = vec!["https://i/a.png".to_string()];
+        item.attached.as_mut().unwrap().covers = vec!["https://i/a.png".to_string()];
         let single = measure(&item, &art, &style, None);
-        item.attached.as_mut().unwrap().covers =
-            ["https://i/a.png", "https://i/b.png"].iter().map(|url| url.to_string()).collect();
+        item.attached.as_mut().unwrap().covers = ["https://i/a.png", "https://i/b.png"]
+            .iter()
+            .map(|url| url.to_string())
+            .collect();
         assert!(
             measure(&item, &art, &style, None) < single,
             "两张时没换到 0.23166 那一档"

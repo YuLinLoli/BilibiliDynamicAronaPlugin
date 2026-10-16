@@ -1080,7 +1080,10 @@ mod tests {
         assert_eq!(attached.cover, "https://i0.hdslb.com/cover-a.png");
         assert_eq!(
             attached.covers,
-            vec!["https://i0.hdslb.com/cover-a.png", "https://i0.hdslb.com/cover-b.png"],
+            vec![
+                "https://i0.hdslb.com/cover-a.png",
+                "https://i0.hdslb.com/cover-b.png"
+            ],
             "站方那张列表只剩第一页，三宫格就永远排不出来"
         );
         assert!(attached.url.contains("cv53416297"), "{}", attached.url);
