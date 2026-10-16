@@ -126,6 +126,10 @@ pub struct Attached {
     pub kind: String,
     pub title: String,
     pub cover: String,
+    /// 只有专栏那一支才有值：站方 `major.article.covers` 本来就是列表
+    /// （参考实现那份 `Major.Article` 数据类里的 `covers: List<String>`，`Dynamic.kt:1095`），
+    /// 一张时满宽、两张以上走原插件那档三宫格。其余附属卡只用 [`Attached::cover`]
+    pub covers: Vec<String>,
     pub url: String,
     /// 时长文案，视频封面右下角那一格
     pub duration: String,
@@ -436,19 +440,20 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 desc: text(major, &[slot, "desc"]).unwrap_or_default(),
                 badge: badge_text(major.get(slot)?),
                 url,
+                // 视频只有一张封面，`covers` 是专栏那一支才用的列表
+                covers: Vec::new(),
             });
         }
     }
     if let Some(article) = at(major, &["article"]) {
         let id = number(article, &["id"]).unwrap_or_default();
+        let covers = list(article, &["covers"], "");
         return Some(Attached {
             kind: "专栏".into(),
             title: text(article, &["title"]).unwrap_or_default(),
             desc: text(article, &["desc"]).unwrap_or_default(),
-            cover: list(article, &["covers"], "")
-                .first()
-                .cloned()
-                .unwrap_or_default(),
+            cover: covers.first().cloned().unwrap_or_default(),
+            covers: covers.to_vec(),
             // 参考实现那份 `Major.Article` 数据类里根本没有 badge 字段——那一格「专栏」
             // 是画的时候硬写上去的（`DynamicMajorDraw.kt:734-737`）。站方哪天真给词就用站方的
             badge: match badge_text(article) {
@@ -1073,6 +1078,11 @@ mod tests {
         assert_eq!(attached.badge, "专栏", "站方没给 badge 时那一格也不能空着");
         assert_eq!(attached.desc, "欢迎连接【什亭之箱】，老师。");
         assert_eq!(attached.cover, "https://i0.hdslb.com/cover-a.png");
+        assert_eq!(
+            attached.covers,
+            vec!["https://i0.hdslb.com/cover-a.png", "https://i0.hdslb.com/cover-b.png"],
+            "站方那张列表只剩第一页，三宫格就永远排不出来"
+        );
         assert!(attached.url.contains("cv53416297"), "{}", attached.url);
         assert!(
             parsed.images.is_empty(),

@@ -553,14 +553,25 @@ impl<'a> Board<'a> {
         let badge_h = card_badge_height(style, item);
         let y = y + badge_h;
         let cover = art.picture(&item.cover);
+        // 专栏那一支从头到尾是另一套版式：封面按站方定死的比例裁、多张时排三宫格，
+        // 卡面上也不压那层底部渐变（`Major.Article.drawGeneral` 里没有这一笔；
+        // 时长与播放数也不画——那份数据类根本没有这两个字段，取数时就是空的）
+        let article = item.kind == "专栏";
+        // 专栏的多封面：站方给的是 `major.article.covers` 那个列表，原插件两张以上
+        // 一律按**三宫格**排（`DynamicMajorDraw.kt:717-730`），不是有几张排几列
+        let tiles: &[String] = if article && item.covers.len() > 1 {
+            &item.covers
+        } else {
+            &[]
+        };
         // 封面高度按**这张封面自己的比例**给：原插件是
         // `videoCoverHeight = cardContentRect.width * coverImg.height / coverImg.width`
         // （`DynamicMajorDraw.kt:213`）。写死 16:9 会把竖屏投稿裁掉一大截；
         // 图没下下来时退回原插件请求缩略图用的那档 0.625。
         // 专栏是另一套：原插件按**固定比例**裁（`articleCoverHeight = 卡宽 × 0.35`，
         // 三宫格那档是 0.23166，`DynamicMajorDraw.kt:683`），不看封面自己的长短
-        let cover_h = if item.kind == "专栏" {
-            (width as f32 * 0.35).round()
+        let cover_h = if article {
+            (width as f32 * if tiles.is_empty() { 0.35 } else { 0.231_66 }).round()
         } else {
             match cover {
                 Some(found) if found.width() > 0 => {
@@ -641,27 +652,54 @@ impl<'a> Board<'a> {
                 width.saturating_sub(inset * 2),
                 (cover_h.round() as u32).saturating_sub(inset * 2),
             );
-            canvas.fill_round_rect(cx, cy, cw, ch, radius, Color::rgb(0x18, 0x1A, 0x1C));
-            if let Some(found) = cover {
-                canvas.paste_cover_rounded(cx, cy, cw, ch, radius, found);
+            if tiles.is_empty() {
+                // 图还没下下来时先垫一块深色，别让封面块露出卡体白底
+                canvas.fill_round_rect(cx, cy, cw, ch, radius, Color::rgb(0x18, 0x1A, 0x1C));
+                if let Some(found) = cover {
+                    canvas.paste_cover_rounded(cx, cy, cw, ch, radius, found);
+                }
+            } else {
+                // 原插件的三宫格：格宽 `卡宽/3 - 4`、步进 `卡宽/3 + 2`，三格首尾相接刚好铺满
+                // 整条卡宽（`DynamicMajorDraw.kt:718-728`），再由 `clipRRect(coverRRect)` 裁一次
+                // 圆角。这里没有裁剪面，改成首格带左两角、末格带右两角、中间方角——同一条弧线，
+                // 格与格之间露出来的是卡体白底。站方专栏最多三张，第四张起不排
+                let unit = cw / 3;
+                let tile_w = unit.saturating_sub(4).max(1);
+                let step = unit + 2;
+                let slots = tiles.len().min(ARTICLE_COVER_SLOTS);
+                for (idx, url) in tiles.iter().take(slots).enumerate() {
+                    let corner = Corners {
+                        top_left: if idx == 0 { radius.top_left } else { 0.0 },
+                        bottom_left: if idx == 0 { radius.bottom_left } else { 0.0 },
+                        top_right: if idx + 1 == slots { radius.top_right } else { 0.0 },
+                        bottom_right: if idx + 1 == slots { radius.bottom_right } else { 0.0 },
+                    };
+                    let tx = cx + idx as u32 * step;
+                    canvas.fill_round_rect(tx, cy, tile_w, ch, corner, Color::rgb(0x18, 0x1A, 0x1C));
+                    if let Some(found) = art.picture(url) {
+                        canvas.paste_cover_rounded(tx, cy, tile_w, ch, corner, found);
+                    }
+                }
             }
             // 底部两成压一层黑渐变，白字才站得住。这一段必须按封面的下角裁圆：它的底边
             // 与封面底边对齐、左右也同边，所以只给下面两角半径就正好接上封面那道弧——
             // 之前这里铺的是直角矩形，圆掉的下角又被糊成了一块方角
-            let band_h = (ch as f32 * 0.2).round() as u32;
-            canvas.fill_vertical_gradient(
-                cx,
-                cy + ch - band_h,
-                cw,
-                band_h,
-                Corners {
-                    bottom_left: radius.bottom_left,
-                    bottom_right: radius.bottom_right,
-                    ..Corners::none()
-                },
-                Color::rgba(0, 0, 0, 0),
-                Color::rgba(0, 0, 0, 150),
-            );
+            if !article {
+                let band_h = (ch as f32 * 0.2).round() as u32;
+                canvas.fill_vertical_gradient(
+                    cx,
+                    cy + ch - band_h,
+                    cw,
+                    band_h,
+                    Corners {
+                        bottom_left: radius.bottom_left,
+                        bottom_right: radius.bottom_right,
+                        ..Corners::none()
+                    },
+                    Color::rgba(0, 0, 0, 0),
+                    Color::rgba(0, 0, 0, 150),
+                );
+            }
             let on_cover = cy as f32 + ch as f32 - pad * 0.6;
             if !duration.is_empty() {
                 style.face.draw_line(
@@ -1127,6 +1165,10 @@ fn paint_shadow(
 /// `rrect.inflate(1f)` 的小阴影；2026-10-16 用户两处都要 3 像素，所以共用这一个数。
 /// **徽章仍然贴在卡片顶边上**——那 3 像素是徽章自己的白包边，不是把它抬起来分离。
 const COVER_INSET: u32 = 3;
+
+/// 专栏三宫格最多排几张：原插件按 `卡宽/3` 定死档位却照着列表全排（`DynamicMajorDraw.kt:722`），
+/// 第四张起会跑到卡外。站方专栏封面最多三张，这里就收到三张
+const ARTICLE_COVER_SLOTS: usize = 3;
 
 /// 附属卡上方那一格徽章占多高：站方 `badge.text` 有词、且左徽章整档开着才留这一格。
 /// 留的是「药丸本身 + 它外面那圈白包边」，药丸底边照旧压在卡顶。
@@ -1798,6 +1840,108 @@ mod tests {
         );
     }
 
+    /// 两张以上的专栏换原插件那一档三宫格：块高换成 `卡宽 × 0.23166`，格宽 `卡宽/3 - 4`、
+    /// 步进 `卡宽/3 + 2`（`DynamicMajorDraw.kt:683-728`），三格首尾相接铺满整条封面块，
+    /// 格与格之间露出的不是封面色。第四张起不排（站方最多给三张）
+    #[test]
+    fn three_article_covers_lay_out_as_a_trip_grid() {
+        let style = style("1000w");
+        let q = style.quality;
+        let content = q.card_width() - q.card_padding * 2;
+        let mut item = sample("三张封面的那一档专栏");
+        item.images = Vec::new();
+        item.attached = Some(Attached {
+            kind: "专栏".to_string(),
+            title: "同一档标题".to_string(),
+            desc: "同一档简介".to_string(),
+            cover: "https://i/a.png".to_string(),
+            covers: ["https://i/a.png", "https://i/b.png", "https://i/c.png"]
+                .iter()
+                .map(|url| url.to_string())
+                .collect(),
+            url: "https://www.bilibili.com/read/cv2".to_string(),
+            badge: "专栏".to_string(),
+            ..Default::default()
+        });
+        let mut art = Art::default();
+        for (url, color) in [
+            ("https://i/a.png", image::Rgba([214, 96, 96, 255])),
+            ("https://i/b.png", image::Rgba([96, 168, 214, 255])),
+            ("https://i/c.png", image::Rgba([112, 200, 132, 255])),
+            ("https://i/d.png", image::Rgba([224, 176, 88, 255])),
+        ] {
+            art.pictures
+                .insert(url.to_string(), RgbaImage::from_pixel(400, 400, color));
+        }
+
+        let bytes = dynamic_card(&item, &art, &style, None);
+        let board = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let box_of = |want: image::Rgba<u8>| {
+            let mut found: Option<(u32, u32, u32, u32)> = None;
+            for (index, pixel) in board.pixels().enumerate() {
+                if *pixel != want {
+                    continue;
+                }
+                let (x, y) = (
+                    index as u32 % board.width(),
+                    index as u32 / board.width(),
+                );
+                found = match found {
+                    None => Some((x, y, x, y)),
+                    Some((left, top, right, bottom)) => {
+                        Some((left.min(x), top.min(y), right.max(x), bottom.max(y)))
+                    }
+                };
+            }
+            found
+        };
+        let red = box_of(image::Rgba([214, 96, 96, 255])).expect("第一格封面没画出来");
+        let blue = box_of(image::Rgba([96, 168, 214, 255])).expect("第二格封面没画出来");
+        let green = box_of(image::Rgba([112, 200, 132, 255])).expect("第三格封面没画出来");
+        assert!(
+            box_of(image::Rgba([224, 176, 88, 255])).is_none(),
+            "第四张封面排到卡外去了"
+        );
+
+        // 块高按 0.23166 那一档，四周仍然缩 COVER_INSET 那一圈白
+        let expect_h = (content as f32 * 0.231_66).round() as u32 - COVER_INSET * 2;
+        for tile in [red, blue, green] {
+            assert_eq!(tile.3 - tile.1 + 1, expect_h, "三宫格那一档的块高不对");
+        }
+        // 三格等宽、从左到右排开，而且格与格之间确实空出了一条不是封面的缝
+        let unit = (content - COVER_INSET * 2) / 3;
+        for tile in [red, blue, green] {
+            assert_eq!(tile.2 - tile.0 + 1, unit - 4, "格宽不是 卡宽/3 - 4");
+        }
+        assert!(red.0 < blue.0 && blue.0 < green.0, "三格顺序错了");
+        assert!(
+            blue.0 - red.2 > 1 && green.0 - blue.2 > 1,
+            "格与格之间没留缝，看着会糊成一整条"
+        );
+        // 缝里露的是卡体底色，不是「图没下下来」那块深色垫底——整块先铺深色会把缝糊成黑条
+        let gap = board.get_pixel((red.2 + blue.0) / 2, (red.1 + red.3) / 2).0;
+        assert_ne!(gap, [0x18, 0x1A, 0x1C, 255], "三宫格那条缝被深色垫底糊住了");
+        // 首格左沿与末格右沿就是那块封面的边界：三格铺满，不往卡外突。
+        // 原插件那两处是浮点除法，这里按整数像素走，卡宽不是 3 的整数倍时末格会短一两像素
+        let block = content - COVER_INSET * 2;
+        let span = green.2 - red.0 + 1;
+        assert!(
+            span <= block && span + 2 >= block,
+            "三格没铺满封面块：{span} 对 {block}"
+        );
+
+        // 一张封面时仍是满宽那一档（0.35），不跟着三宫格变矮
+        item.attached.as_mut().unwrap().covers
+            = vec!["https://i/a.png".to_string()];
+        let single = measure(&item, &art, &style, None);
+        item.attached.as_mut().unwrap().covers =
+            ["https://i/a.png", "https://i/b.png"].iter().map(|url| url.to_string()).collect();
+        assert!(
+            measure(&item, &art, &style, None) < single,
+            "两张时没换到 0.23166 那一档"
+        );
+    }
+
     #[test]
     fn the_video_cover_keeps_its_own_aspect() {
         let style = style("1000w");
@@ -1813,6 +1957,7 @@ mod tests {
             play: String::new(),
             desc: String::new(),
             badge: "投稿视频".to_string(),
+            covers: Vec::new(),
         });
         let mut art = Art::default();
         art.pictures.insert(
@@ -2249,6 +2394,7 @@ mod tests {
             play: "1.2万播放".to_string(),
             desc: "简介文字".to_string(),
             badge: "投稿视频".to_string(),
+            covers: Vec::new(),
         };
         let mut board = Board {
             style: &style,
@@ -2356,6 +2502,7 @@ mod tests {
             play: "1.2万播放".to_string(),
             desc: "ばんばん".to_string(),
             badge: "投稿视频".to_string(),
+            covers: Vec::new(),
         });
 
         let mut nested = sample("２ｗ！？？？？？？？？！");
@@ -2374,6 +2521,7 @@ mod tests {
             play: String::new(),
             desc: "动态卡片".to_string(),
             badge: "装扮".to_string(),
+            covers: Vec::new(),
         });
 
         // 专栏那条：满宽封面（站方定死 0.35 比例）+ 标题 + 三行简介 + 卡上方那一格「专栏」
@@ -2390,6 +2538,23 @@ mod tests {
                    开始进行维护更新，预计持续 4 小时。"
                 .to_string(),
             badge: "专栏".to_string(),
+            covers: vec!["https://i/cover.png".to_string()],
+        });
+
+        // 三张封面的那条专栏：原插件在这里换成 0.23166 那一档并排三宫格
+        // （`DynamicMajorDraw.kt:683`、`717-730`）
+        let mut trio = sample("三张封面的那一档专栏");
+        trio.images = Vec::new();
+        trio.attached = Some(Attached {
+            kind: "专栏".to_string(),
+            title: "《蔚蓝档案》版本前瞻：三宫格封面这一档".to_string(),
+            cover: urls[0].clone(),
+            covers: vec![urls[0].clone(), urls[1].clone(), urls[2].clone()],
+            url: "https://www.bilibili.com/read/cv53416298".to_string(),
+            duration: String::new(),
+            play: String::new(),
+            desc: "站方的专栏封面本来就是列表，两张以上一律排三宫格。".to_string(),
+            badge: "专栏".to_string(),
         });
 
         let out = std::env::temp_dir().join("arona-bili-cards");
@@ -2400,6 +2565,7 @@ mod tests {
             ("nested", &nested),
             ("deco", &deco),
             ("article", &article),
+            ("trio", &trio),
         ] {
             let file = out.join(format!("{name}.png"));
             std::fs::write(&file, dynamic_card(item, &art, &style, None)).unwrap();
