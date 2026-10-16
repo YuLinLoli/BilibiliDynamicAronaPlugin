@@ -1918,8 +1918,9 @@ debug 跑出来会显示 `profile/debug`，而握手是按 profile 一致才放�
 改动文件 rustfmt 干净、`cargo build --release` 出 dll 正常。
 
 **还欠着的**：① 部署机要**重装**才拿得到 `fonts/`，只换 dll 时字面退回系统候选（观感不变差，
-但"全家同一套字"这条不成立）；② 上一轮列的 ②③ 两件（不需要卡的目标仍按配色各画一张、框架侧 wgpu
-与各插件各自静态链接的那份依赖）没有动。
+但"全家同一套字"这条不成立）；② 框架侧那几笔不在本插件手里（GUI 的 wgpu 约 150~300 MB、
+每个插件各自静态链接的那份 arona/tokio/reqwest）。2026-10-16 列的三件里，① 与 ② 都做完
+（② 见下面"同日第三件"）。
 
 ### 同日第二轮：三份重复的惰性实现并成框架那一份
 
@@ -1950,6 +1951,26 @@ debug 跑出来会显示 `profile/debug`，而握手是按 profile 一致才放�
 `stroke_and_slant_still_change_the_picture`，探针从"宽限期内不被回收 + 过期回收"换成
 "放手即归零 + 归零后再拿还长得回来"。三仓门禁：本插件 230 passed、BlueArchive 18、petpet 33，
 clippy 全 0 警告；框架 `cargo test -p arona-rs --lib` 267 passed（新增 7 条字面判据）。
+
+**同日第三件：把 2026-10-16 列的 ② 做掉了**——没人要卡的动态不再画卡。收集配色那一步以前把
+这一批目标**全部**的 `state.color` 去重，于是"二十个群的模板都只有文本"这一轮照样按配色各画一张
+PNG、各编一遍、各落一次 `DRAW` 缓存，而那张卡谁都收不到。现在先问一句
+[`push::wants_card`](src/push/mod.rs)：这一档目标**最终生效的那条模板串**里有没有 `{draw}`，
+静音的目标直接算没有。判据走 `template::uses_draw`，与渲染**同一个分词**（`TAG` 那条正则），
+不是 `contains("{draw}")`——大写 `{Draw}` 渲染端根本不认，`contains` 会替它白画一张。
+两个边界：转发块 `{>>}…{<<}` 里的那一个**算**要卡（块内走的是同一条 `push_runs`、带着 supply，
+卡片会被塞进转发节点）；模板表是整张覆盖的（预留 3 那条），所以必须按 `pick_template` 出来的串判，
+只看 `state.template(..)` 那一格会判错。
+
+落空的这一档不只是省一次渲染：一张卡都不必画时 `paints` 直接假，`gather` 退成 `Want::Bytes`，
+**素材位图一张都不解码**（省的是上上轮那条 55 MB 当量的解码峰值）。开播那条路径同一口径，
+顺带把 `link`/`vals`/配色收集挪到 `gather` 之前——封面字节照样要下（`{cover}` 发原件），
+只有"要不要解码成位图"跟着这一步走。
+
+判据两条：`only_a_template_that_asks_for_the_card_gets_one`（四条边界）、
+`the_draw_verdict_matches_what_render_actually_emits`（判据说要的串，渲染出来必须真带一个图片段；
+说不用的，渲染也不许塞图片段）——两边不一致就是判据在骗人。
+`cargo test --release --lib` 232 passed / 0 failed。
 
 ## 功能面差集收口
 

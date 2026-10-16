@@ -118,6 +118,22 @@ impl Post {
     }
 }
 
+/// 这个目标这一条推出去用不用得上那张卡。
+///
+/// 判据是**最终生效的那条模板串**里有没有 `{draw}`：目标那一格没写就走默认档，而模板表是整张
+/// 覆盖的（预留 3 那条），所以只看 `state.template(..)` 会判错。静音的目标直接算"用不上"——
+/// [`push_state`] 第一行就把这条跳了，替它画一张是纯浪费。
+///
+/// 调用方在**收集配色**那一步用它，一张卡都不必画：一轮里二十个群都只要文本时，
+/// 连素材位图都不用解码（`gather` 那一路退成 `Want::Bytes`）。
+pub fn wants_card(ctx: &PluginContext, state: &TargetState, kind: Kind) -> bool {
+    if state.muted {
+        return false;
+    }
+    let (_, source) = pick_template(ctx, state, kind);
+    template::uses_draw(&source)
+}
+
 /// 这个目标该用的模板串。返回 (模板名, 模板串)，名字只为出问题时好写日志。
 fn pick_template(ctx: &PluginContext, state: &TargetState, kind: Kind) -> (String, String) {
     let config = ctx.config::<TemplateConfig>(TEMPLATE_SECTION).get();

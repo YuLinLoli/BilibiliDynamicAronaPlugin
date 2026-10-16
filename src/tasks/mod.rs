@@ -705,10 +705,23 @@ async fn push_one(
     // 一、出卡。`drawEnable=false` 时这两条推送路径都不画卡（原插件 gate 的也正是这两处：
     // DynamicMessageTasker.kt:217 与 LiveMessageTasker.kt:48），命令的「先看一眼」照旧出图。
     // 同一档配色只画一张：一个群一个色，二十个群别画二十遍。
+    // 模板里根本没有 `{draw}` 的目标（以及静音的）不进这张表——它们收不到卡，
+    // 替它们画一张是纯浪费：一轮二十个群都只要文本时，连素材位图都不解码。
     let bucket = if living { "live" } else { "dynamic" };
-    // 先把这一批目标用到的配色去重，再按配色各算一个卡片键
+    let card_kind = if living {
+        push::Kind::Live
+    } else {
+        push::Kind::Dynamic
+    };
+    // 先把这一批目标里真要用卡的那些、用到的配色去重，再按配色各算一个卡片键
     let mut colors: Vec<String> = Vec::new();
-    for (_, state) in &chosen {
+    for (key, state) in &chosen {
+        if !push::wants_card(ctx, state, card_kind) {
+            arona::runtime::log::debug(format!(
+                "bilibili：{key} 那一档模板里没有 {{draw}}，这一条不替它画卡"
+            ));
+            continue;
+        }
         let color = state.color.clone().unwrap_or_default();
         if !colors.contains(&color) {
             colors.push(color);
@@ -956,24 +969,18 @@ async fn broadcast_live(
             avatars.push(anchor.face);
         }
     }
-    let drawing = appearance.draw_enable;
-    let Material { art, bytes } = gather(
-        bili,
-        &avatars,
-        std::slice::from_ref(&info.cover),
-        &[],
-        conf.cache.download_original,
-        if drawing { Want::Both } else { Want::Bytes },
-    )
-    .await;
     let link = info.link();
     let vals = Vals::live(info, link.clone(), &format_time(now()));
-    // 直播卡带着实时在线人数与标题，不落到盘上，只在这一轮里按配色复用一张
+    // 直播卡带着实时在线人数与标题，不落到盘上，只在这一轮里按配色复用一张。
+    // 与动态那条同一口径：模板里没有 `{draw}` 的目标不进这张表，一张都不该画。
     let mut colors: Vec<String> = Vec::new();
     for (_, state) in targets
         .iter()
         .filter(|(_, state)| wants(state, info.uid, "直播", &info.title))
     {
+        if !push::wants_card(ctx, state, push::Kind::Live) {
+            continue;
+        }
         let color = state.color.clone().unwrap_or_default();
         if !colors.contains(&color) {
             colors.push(color);
@@ -993,6 +1000,17 @@ async fn broadcast_live(
             (color, key)
         })
         .collect();
+    // 封面字节无论如何都要下（`{cover}` 是原件那条），只有"要不要解码成位图"跟着这一步走
+    let drawing = appearance.draw_enable && !keys.is_empty();
+    let Material { art, bytes } = gather(
+        bili,
+        &avatars,
+        std::slice::from_ref(&info.cover),
+        &[],
+        conf.cache.download_original,
+        if drawing { Want::Both } else { Want::Bytes },
+    )
+    .await;
     let mut drawn: HashMap<String, Option<Ready>> = HashMap::new();
     if drawing {
         for (color, key) in &keys {

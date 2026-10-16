@@ -268,6 +268,15 @@ fn normalize(template: &str) -> String {
     template.replace('\n', "\\n").replace('\r', "\\r")
 }
 
+/// 这一档模板用不用得上那张卡：串里有没有 `{draw}` 这个占位符。
+///
+/// 走的是与渲染**同一个分词**（[`TAG`]），不是 `contains("{draw}")`——后者会把
+/// `\{draw}` 这类没被认成占位符的字面量也算进去，判成"要卡"就多画一张没人收的图。
+pub fn uses_draw(template: &str) -> bool {
+    let text = normalize(template);
+    TAG.captures_iter(&text).any(|found| &found[1] == "draw")
+}
+
 /// 一段模板按字面 `\r` 拆成若干条消息
 fn push_runs(out: &mut Vec<OutgoingMessage>, chunk: &str, vals: &Vals, supply: &Supply) {
     for run in chunk.split("\\r") {
@@ -531,6 +540,41 @@ mod tests {
     fn uppercase_tag_is_left_alone_because_the_original_regex_is_a_z_only() {
         let got = render("开播：{startTime}", &vals(), &Supply::default(), &card());
         assert_eq!(text_of(&got[0]), "开播：{startTime}");
+    }
+
+    /// 画不画卡只看这一档模板里有没有 `{draw}`。四条边界：
+    /// 纯文本档不算数、转发块里的那一个**算**数（块内走的是同一条 `push_runs`，
+    /// 带 supply，所以卡会被塞进转发节点里）、大写 `{Draw}` 不算（渲染端根本不认它）、
+    /// 真换行与字面换行两种写法都要认（判据与渲染同一个分词，差在这里）。
+    #[test]
+    fn only_a_template_that_asks_for_the_card_gets_one() {
+        assert!(uses_draw("{draw}\\r{content}"));
+        assert!(uses_draw("{content}\n{draw}"));
+        assert!(uses_draw("{>>}作者：{name}\\r{draw}{<<}"));
+        assert!(!uses_draw("{name} 更新了：{content}\\r{images}"));
+        assert!(!uses_draw("开播：{startTime}，看 {Draw}"));
+        assert!(!uses_draw(""));
+    }
+
+    /// 判据说"要卡"的串，渲染出来必须真带一个图片段——两边不一致就是判据在骗人，
+    /// 会出现"替没人要卡的画了一张"或"该画的没画"
+    #[test]
+    fn the_draw_verdict_matches_what_render_actually_emits() {
+        let with = "{draw}\\r{content}";
+        let without = "{name} 更新了：{content}";
+        assert!(uses_draw(with) != uses_draw(without));
+        let supply = Supply {
+            draw: Some(bytes()),
+            draw_missing: String::new(),
+            images: Vec::new(),
+            cover: None,
+        };
+        let got = render(with, &vals(), &supply, &card());
+        let drawn: usize = got.iter().map(images_of).sum();
+        assert_eq!(drawn, 1, "判据说要卡，渲染却没把卡片段发出去");
+        let got = render(without, &vals(), &supply, &card());
+        let drawn: usize = got.iter().map(images_of).sum();
+        assert_eq!(drawn, 0, "判据说要不到卡，渲染却塞了图片段");
     }
 
     #[test]
