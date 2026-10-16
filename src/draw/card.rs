@@ -2307,6 +2307,49 @@ mod tests {
         );
     }
 
+    /// 本轮改动的回归闸：`badgeEnable.right` 默认关着（照原插件 `BiliConfig.kt:187-189`），
+    /// 所以**没开这一档的人看到的卡不该有一个像素的变化**——那串号有没有都进不了画面。
+    /// 真数据这一轮取不到（关注流第二组直接代发失败），就把这条钉在这儿
+    #[test]
+    fn the_right_switch_alone_decides_whether_the_id_shows() {
+        let mut art = Art::default();
+        art.pictures.insert(
+            "https://i/cover.png".to_string(),
+            RgbaImage::from_pixel(640, 400, image::Rgba([40, 44, 52, 255])),
+        );
+        let mut item = sample("翻唱投稿");
+        item.images = Vec::new();
+        let code = "av53416297  |  BV1GJ411x7h9";
+        item.attached = Some(Attached {
+            kind: "视频".to_string(),
+            title: "同一档标题".to_string(),
+            cover: "https://i/cover.png".to_string(),
+            url: "https://b23.tv/x".to_string(),
+            duration: "01:29".to_string(),
+            play: "1.2万播放".to_string(),
+            desc: String::new(),
+            badge: "投稿视频".to_string(),
+            badge_right: code.to_string(),
+            covers: Vec::new(),
+        });
+        let off = style("1000w");
+        let mut on = style("1000w");
+        on.badge_right = true;
+        let before = dynamic_card(&item, &art, &off, None);
+        item.attached.as_mut().unwrap().badge_right = String::new();
+        assert_eq!(
+            dynamic_card(&item, &art, &off, None),
+            before,
+            "右档关着时那串号不该进画面：带号与不带号画出来的一样"
+        );
+        item.attached.as_mut().unwrap().badge_right = code.to_string();
+        assert_ne!(
+            dynamic_card(&item, &art, &on, None),
+            before,
+            "右档开了却没画出那一格"
+        );
+    }
+
     /// 阴影向外必须渐淡，且贴边那一环不许叠成硬黑边（用户 2026-10-15 圈的「大黑边」）
     #[test]
     fn the_shadow_tapers_outward() {
