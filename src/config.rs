@@ -587,14 +587,10 @@ const IMAGE_COMMENTS: &[(&str, &str)] = &[
         "卡片装饰：QrCode(右下角画动态链接二维码) / None(不装饰)。FanCard(粉丝勋章) 这一档当前\
          不出效果——插件没铺 B 站的勋章数据，填了等同 None",
     ),
-    ("badgeEnable", "卡片顶部的标签，左右两档各一个开关"),
+    ("badgeEnable", "卡片顶部的标签，左边那一档的开关"),
     (
         "badgeEnable.left",
         "左边那一档：动态类型（直播卡是分区）那枚标签。外层主卡与内卡（附属卡、转发里那张原卡）都归它管",
-    ),
-    (
-        "badgeEnable.right",
-        "右边那一档：动态 id（直播卡是房间号；附属卡是 av|BV / cv / ep 那串号）。同样外层与内卡都管",
     ),
     (
         "drawEnable",
@@ -618,22 +614,20 @@ const IMAGE_COMMENTS: &[(&str, &str)] = &[
 /// 渐变色生成器在渲染时会被问到两次（表本身与它的 `hueStep` 子键），说明是同一句
 const COLOR_GEN_DOC: &str = "渐变色生成器（仅当主题色只给了一个值时生效）";
 
-/// 卡片顶部那两枚标签的开关。左右是两档独立的键（原插件 `BadgeEnable` 就是这个形状，
-/// 默认左边开、右边关），两个都关时整条标签带的高度一起收掉。
+/// 卡片顶部那枚标签的开关。原插件这里左右是两档（`BadgeEnable`，默认左开右关），
+/// 右边那一档（动态 id / 房间号 / `av|BV`·`cv`·`ep`·`au` 那串号）按用户 2026-10-17 的意见
+/// 整条不画了，所以这一档键也一并收掉——留着就是一个拨不动任何东西的开关。
+/// 关掉的这一档带高度会一起收掉，不留空白。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct BadgeEnable {
     pub left: bool,
-    pub right: bool,
 }
 
-/// 默认值照原插件：左边开、右边关（`BiliConfig.kt:187-189`）
+/// 默认值照原插件那一档的左边：开（`BiliConfig.kt:187-189`）
 impl Default for BadgeEnable {
     fn default() -> Self {
-        BadgeEnable {
-            left: true,
-            right: false,
-        }
+        BadgeEnable { left: true }
     }
 }
 
@@ -986,11 +980,9 @@ mod tests {
         let appearance = ImageConfig::default();
         assert!(appearance.draw_enable);
         assert!(appearance.badge_enable.left);
-        assert!(!appearance.badge_enable.right);
-        // 这三条键都得在配置模板里有注释，否则用户看不见有这个东西
+        // 这两条键都得在配置模板里有注释，否则用户看不见有这个东西
         assert!(ImageConfig::comment("drawEnable").is_some());
         assert!(ImageConfig::comment("badgeEnable.left").is_some());
-        assert!(ImageConfig::comment("badgeEnable.right").is_some());
     }
 
     /// 序列化回来的键名必须是 camelCase，否则老用户的配置抄不过来

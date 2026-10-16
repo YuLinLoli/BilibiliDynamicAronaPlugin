@@ -36,17 +36,15 @@ md5 = "0.7"
 # 动态链接二维码：只要点阵，画成像素由本插件的 draw::qr 负责
 qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-fontdue = "0.8"
+# 字形栅格化：只把字体文件的字节留在内存，画到哪个字才解析哪个字（见 draw/text.rs 的模块说明）。
+# 换掉的是 fontdue 那种全量预解析——同一份雅黑它常驻 160.6 MB、思源宋体 253.5 MB。
+ab_glyph = "0.2.32"
 rand = "0.8"
 once_cell = "1"
 log = "0.4"
-ab_glyph = { version = "0.2.32", optional = true }
 
 [dev-dependencies]
 # 联网用例需要直连一次 B 站（#[ignore]，默认不跑），走的是框架的 http 出口，不必额外依赖
 
 [profile.release]
 opt-level = 2
-
-[features]
-ab_glyph = ["dep:ab_glyph"]

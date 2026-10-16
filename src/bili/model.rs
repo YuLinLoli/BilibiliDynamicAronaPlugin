@@ -142,11 +142,6 @@ pub struct Attached {
     /// 不是插件自己那套六词判类表——两者常常不同词（这条 UP 的视频动态：
     /// 站方「投稿视频」，我们的判类表只有「视频」）。
     pub badge: String,
-    /// 附属卡**右上角**那一格：站方那串动态号。参考实现每张内卡都画它
-    /// （`DynamicMajorDraw.kt`：视频 `av$aid  |  $bvid`、小卡 `av$aid`、专栏 `cv$id`、
-    /// 番剧 `ep$epid`、音乐 `au$id`），配色 `theme.subRightBadge`、受 `badgeEnable.right` 管。
-    /// 没有号的那一族（分享卡、装扮、投票）留空，右格就不画
-    pub badge_right: String,
 }
 
 /// 直播间信息
@@ -434,14 +429,8 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 (None, Some(a)) => format!("https://www.bilibili.com/video/av{a}"),
                 (None, None) => String::new(),
             };
-            // 右那一格原插件大卡写的是 `av$aid  |  $bvid`（中间两个空格，
-            // `DynamicMajorDraw.kt:265`），只给得出一个就写一个，两个都没有就不画
-            let badge_right = match (aid, bvid) {
-                (Some(a), Some(b)) => format!("av{a}  |  {b}"),
-                (Some(a), None) => format!("av{a}"),
-                (None, Some(b)) => b,
-                (None, None) => String::new(),
-            };
+            // 右上角那一格（`av…  |  …bvid`）2026-10-17 按用户意见整条不画了，
+            // 所以 aid/bvid 只用来拼链接，不再另存一份显示串
             return Some(Attached {
                 kind: "视频".into(),
                 title: text(major, &[slot, "title"]).unwrap_or_default(),
@@ -452,7 +441,6 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 play: text(major, &[slot, "stat", "view"]).unwrap_or_default(),
                 desc: text(major, &[slot, "desc"]).unwrap_or_default(),
                 badge: badge_text(major.get(slot)?),
-                badge_right,
                 url,
                 // 视频只有一张封面，`covers` 是专栏那一支才用的列表
                 covers: Vec::new(),
@@ -475,7 +463,6 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 _ => "专栏".into(),
             },
             url: format!("https://www.bilibili.com/read/cv{id}"),
-            badge_right: format!("cv{id}"),
             ..Default::default()
         });
     }
@@ -491,9 +478,6 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
             title: text(pgc, &["title"]).unwrap_or_default(),
             cover: text(pgc, &["cover"]).unwrap_or_default(),
             badge: badge_text(pgc),
-            badge_right: number(pgc, &["ep_id"])
-                .map(|id| format!("ep{id}"))
-                .unwrap_or_default(),
             url,
             ..Default::default()
         });
@@ -508,9 +492,6 @@ fn parse_attached(major: &Value, dynamic: &Value, type_str: &str) -> Option<Atta
                 .unwrap_or_default(),
             duration: text(music, &["duration_text"]).unwrap_or_default(),
             badge: badge_text(music),
-            badge_right: number(music, &["id"])
-                .map(|id| format!("au{id}"))
-                .unwrap_or_default(),
             ..Default::default()
         });
     }
@@ -1100,10 +1081,6 @@ mod tests {
         assert_eq!(attached.desc, "欢迎连接【什亭之箱】，老师。");
         assert_eq!(attached.cover, "https://i0.hdslb.com/cover-a.png");
         assert_eq!(
-            attached.badge_right, "cv53416297",
-            "右上角那一格原插件写的是 cv 号（DynamicMajorDraw.kt:748-757）"
-        );
-        assert_eq!(
             attached.covers,
             vec![
                 "https://i0.hdslb.com/cover-a.png",
@@ -1165,8 +1142,6 @@ mod tests {
         assert_eq!(attached.url, "https://www.bilibili.com/video/BV1xx411c7mD");
         assert_eq!(attached.duration, "03:12");
         assert_eq!(attached.play, "1.2万");
-        // 右上角那一格：只有 bvid 时就写 bvid（原插件两个都有才写 `av… | BV…`）
-        assert_eq!(attached.badge_right, "BV1xx411c7mD");
         // 封面只归附属卡：并进 images 的话，卡片上会出现"同一张封面画两遍"
         assert!(
             parsed.images.is_empty(),
@@ -1193,22 +1168,6 @@ mod tests {
         assert_eq!(
             parsed.attached.as_ref().unwrap().url,
             "https://www.bilibili.com/video/av12345"
-        );
-        assert_eq!(parsed.attached.unwrap().badge_right, "av12345");
-    }
-
-    /// 两个号都有时，右上角那一格照原插件写成 `av$aid  |  $bvid`（中间两个空格）
-    #[test]
-    fn archive_with_both_ids_shows_av_and_bvid() {
-        let mut item = draw_item();
-        item["modules"]["module_dynamic"]["major"] = json!({
-            "type": "MAJOR_TYPE_ARCHIVE",
-            "archive": {"title": "新视频", "aid": 53416297, "bvid": "BV1xx411c7mD"}
-        });
-        let parsed = parse_item(&item).unwrap();
-        assert_eq!(
-            parsed.attached.unwrap().badge_right,
-            "av53416297  |  BV1xx411c7mD"
         );
     }
 

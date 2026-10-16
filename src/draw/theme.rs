@@ -8,7 +8,9 @@
 
 use super::canvas::Color;
 
-/// 卡片会用到的整套颜色
+/// 卡片会用到的整套颜色。原插件这张表里还有 `mainRightBadge` / `subRightBadge` 两档，
+/// 它们指着的那格 2026-10-17 整条不画了（README 第 54 条），字段跟着删——
+/// 对着 `DynamicImageTheme.kt` 核差异时不要把它补回来。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     pub id: &'static str,
@@ -28,9 +30,7 @@ pub struct Theme {
     pub card_shadow: Color,
     pub small_card_shadow: Color,
     pub main_left_badge: (Color, Color),
-    pub main_right_badge: (Color, Color),
     pub sub_left_badge: (Color, Color),
-    pub sub_right_badge: (Color, Color),
 }
 
 fn c(hex: &str) -> Color {
@@ -79,9 +79,7 @@ fn v3() -> Theme {
         card_shadow: c("#46000000"),
         small_card_shadow: c("#1e000000"),
         main_left_badge: (c("#00cbff"), c("#b4ffffff")),
-        main_right_badge: (c("#ffffff"), c("#48c7f0")),
         sub_left_badge: (c("#ffffff"), c("#fb7299")),
-        sub_right_badge: (c("#ffffff"), c("#48c7f0")),
     }
 }
 
@@ -102,9 +100,7 @@ fn v2() -> Theme {
         card_shadow: c("#00000000"),
         small_card_shadow: c("#00000000"),
         main_left_badge: (c("#00cbff"), c("#c8ffffff")),
-        main_right_badge: (c("#ffffff"), c("#48c7f0")),
         sub_left_badge: (c("#ffffff"), c("#fb7299")),
-        sub_right_badge: (c("#ffffff"), c("#48c7f0")),
     }
 }
 

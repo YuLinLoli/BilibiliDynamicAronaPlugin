@@ -263,14 +263,9 @@ pub(crate) fn overview(call: &Call) -> Vec<String> {
             if bili.account.signed() { "有" } else { "无" }
         ),
         format!(
-            "绘图 {}（标签 左{} 右{}）画质={} 主题={} 默认配色={} 页脚={}",
+            "绘图 {}（标签 左{}）画质={} 主题={} 默认配色={} 页脚={}",
             if appearance.draw_enable { "开" } else { "关" },
             if appearance.badge_enable.left {
-                "开"
-            } else {
-                "关"
-            },
-            if appearance.badge_enable.right {
                 "开"
             } else {
                 "关"

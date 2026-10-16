@@ -8,7 +8,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 `/bili` 那一整棵子命令树。
 
 一句话差别：**本插件不依赖任何前置插件**。原插件要 `chat-command` 才能解析命令、要 `mirai-skia-plugin`
-才能绘图；这里命令走框架的分发器（自带中英别名与用法串），绘图用纯 Rust 的 `image` + `fontdue` 在插件里
+才能绘图；这里命令走框架的分发器（自带中英别名与用法串），绘图用纯 Rust 的 `image` + `ab_glyph` 在插件里
 画完，再把成品图交给框架发出去。配置里也没有「前置插件」这一栏——只有默认值，想改就改 yml。
 
 ## 安装
@@ -23,7 +23,13 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
      config/bilibili/arona.yml                      ← 首次启动自动生成，改完保存即热重载
      data/bilibili/store.yml                        ← 订阅与水位（插件自己写）
      data/bilibili/image/<类别>/                     ← 图片缓存
+     fonts/SourceHanSerifCN-Regular.otf              ← 字面：框架安装包释出的思源宋体（Regular+Bold 两档）
+     fonts/LICENSE-SourceHanSerif.txt                ← 它的 OFL 许可，随包一起
    ```
+
+   字面那一级由**框架的安装包**释出，本插件不带字体文件；出图与框架 GUI 读的是同一个出口
+   （`arona::runtime::assets::cjk_font()`）。这一目录不存在时（比如手工摆 dll、没用安装包）插件退回系统字体候选，
+   观感跟着这台机器装了什么字走——`bili-image.font` 指了具体文件时覆盖以上两者。
 
 4. 启动框架。日志里能看到装配行与四个定时任务（动态检测、直播检测、低频重排、缓存清理）。
 
@@ -152,15 +158,15 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | --- | --- | --- |
 | `quality` | `1000w` | 宽度档位：`800w` / `1000w` / `1200w` / `1500w` |
 | `theme` | `v3` | 绘图主题：`v3` / `v3RainbowOutline` / `v2` |
-| `font` | `""` | 字体文件**绝对路径**，或放在 `config/bilibili/font/` 下的**文件名**（后缀 `.ttf/.otf/.ttc` 可省）；留空自动找系统中文字体。后可跟 `;` 指定粗体 |
+| `font` | `""` | 字体文件**绝对路径**，或放在 `config/bilibili/font/` 下的**文件名**（后缀 `.ttf/.otf/.ttc` 可省）；留空先用框架安装包释出的思源宋体，再退回系统候选。后可跟 `;` 指定粗体 |
 | `defaultColor` | `#d3edfa` | 默认主题色，多个用 `;` 分隔构成渐变；单个值按 colorGenerator 自动生成 |
 | `cardColor` | `""` | 卡片底色，写 `#AARRGGBB` 或 `#RRGGBB`——**alpha 那两位就是透明度**（原插件 v3 是 `#B4FFFFFF`，约 71% 不透明；内卡透出来的是外卡那一层，不是背景）。留空跟随 `theme` |
 | `cardOutlineColor` | `""` | 卡片描边色，支持多个值自定义渐变、中间用分号分隔（`v3RainbowOutline` 那档彩虹描边本身就是七个色）；单个值就是普通单色描边。留空跟随 `theme` |
 | `drawOutlineColor` | `""` | 图片描边与角标那圈白包边的颜色。留空跟随 `theme`（v3 是 `#FFFFFF`） |
 | `cardOrnament` | `None` | 卡片装饰：`QrCode` / `None`；`FanCard` 这一档当前不出效果（见「已知差别」第 29 条） |
 | `drawEnable` | `true` | 绘图总开关：关掉之后卡片不画，模板里的 `{draw}` 落文字占位 |
-| `badgeEnable.left` | `true` | 卡片顶部左标签：外层是「动态」那枚、直播卡是「直播」，转发里那张原卡是「转发动态」，附属卡是站方那格类型词。**外层与内卡都归它管** |
-| `badgeEnable.right` | `false` | 卡片顶部右标签：外层是动态 id（直播卡是房间号），附属卡是那串号（视频 `av… \| BV…`、专栏 `cv…`、番剧 `ep…`）。两档都关掉时整条标签带的高度一起收掉 |
+| `badgeEnable.left` | `true` | 卡片顶部左标签：外层是「动态」那枚、直播卡是「直播」，转发里那张原卡是「转发动态」，附属卡是站方那格类型词。**外层与内卡都归它管**；关掉时整条标签带的高度一起收掉 |
+| ~~`badgeEnable.right`~~ | — | 右标签（外层动态 id / 直播房间号、附属卡那串 `av… \| BV…`·`cv…`·`ep…`）2026-10-17 按用户意见**整条不画**，这把键随之删掉，见已知差别第 54 条。老 `arona.yml` 里留着这一行不用手删，会被忽略 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
 | `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度。全篇只有这一个键带连续大写——原插件自己就写成 `lockSB`（`BiliConfig.kt:181`），字段上单独 `rename` 点名，不让 `rename_all` 把它改成 `lockSb` |
 | `colorGenerator.saturation` | `0.25` | 锁定的饱和度 0.0-1.0 |
@@ -281,7 +287,9 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     `OTHER` 这一路本插件没有对应素材（番剧封面、直播封面都归 `IMAGES`），配置项留着只为键名对齐，
     清不到东西也不报错。
 24. **字体两种写法都认**（`bili-image.font`）：绝对路径直接打开；只写文件名（后缀可省）则到
-    `config/bilibili/font/` 下找。这一目录不存在时会自动按系统候选字体走。
+    `config/bilibili/font/` 下找。留空时按三级往下退：**框架随包那份**（安装目录 `fonts/` 下的思源宋体，
+    与 GUI 同一个出口）→ **系统候选**（雅黑/黑体/思源黑体那串路径）。这一目录不存在也不报错，退回下一档；
+    三档全空才报错并退回纯文本推送。
 25. **分组名可以带空格**：`create` / `listgroup` / `delgroup` 把剩余参数整体当分组名，
     与原插件 `chat-command` 的单个 `String` 参数行为一致。
 26. **不解析「互动数 / 置顶 / 仅粉丝可见」这三族字段**：原插件的模板与绘图里都没有它们的功能面，
@@ -542,6 +550,21 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
     原插件不需要这条排序——它 `getUserNewDynamic(hasTop=false)` 打的是**不含置顶的关注流**
     （`feed/all`，天然最新在前）；我们不打那个接口，因为匿名时它给空包（见第 36 条那一段），
     改成"含置顶的 `feed/space` + 按时间倒序"，效果与它一致。判据 `latest_means_newest_not_first_on_the_page`。
+
+54. **右上角那一格整条不画了——第 50 条补上来的东西按用户意见删掉**（2026-10-17，用户看了出图说「太丑了」）。
+    删的是**右边那一档的全部内容**，两处一起：外层主卡右上角那串动态 id（直播卡是房间号）、
+    内卡右上角那格 `av$aid  |  $bvid` / `cv$id` / `ep$epid` / `au$id`。
+    左档（类型词「动态」「直播」「专栏」那枚，含小电视图标与包边、压顶直角）一个字没动。
+    连带收掉的还有 `badgeEnable.right` 这把键：留着它就是一把拨不动任何东西的开关，
+    `BadgeEnable` 现在只剩 `left`，注释表里那一行也一起删。老 `arona.yml` 里已经写过这一行的**不用手删**——
+    结构体没有 `deny_unknown_fields`（全仓 grep 无），多出来的键会被 serde 静默忽略，
+    下次重写模板时那一行自然消失。取数侧那四处 `Attached.badge_right`（视频大/小卡、专栏、番剧/音乐）
+    一并删字段，三条判据跟着删：`the_id_pill_sits_on_the_right_edge` 与
+    `the_right_switch_alone_decides_whether_the_id_shows`（摆位）、`archive_with_both_ids_shows_av_and_bvid`（取数）——
+    它们断言的是"这格怎么摆、这串号取哪个"，格都没了，留着就是假绿。
+    仍留着的行为差别：卡顶那条带的高度只看左档（`badge_height_for(style.badge_left)`），
+    判据从 `turning_both_badges_off_shrinks_the_card` 换成 `turning_the_badge_off_shrinks_the_card`。
+    这条与第 50 条是**同一处版式的往返**，不是遗漏——原插件有这一格，用户不要这一格。
 
 ## 预留问题
 
@@ -1109,7 +1132,8 @@ JPEG 原件直发之后「全是 PNG」这句不再成立（那一轮的链接�
   `run-translate.sh` 重新压过一遍：画卡的三轮有 27/22/23 段 1000 宽，不画卡那一轮一段都没有。别数条数，那条照旧。
 - `badgeEnable` 拆成 `left` / `right` 两档之后按卡片高度判定：两档都关掉时 13 张卡每张**恰好矮 45 px**
   （那 45 px 就是这一档的 `badge_height`），只关一档时高度不变——右档顶到标签带起点，带子该多高还多高。
-  单测 `turning_both_badges_off_shrinks_the_card` 钉的是同一件事。
+  单测 `turning_both_badges_off_shrinks_the_card` 钉的是同一件事。这一档 2026-10-17 只剩左标签了
+  （见已知差别第 54 条），同一件事现在叫 `turning_the_badge_off_shrinks_the_card`。
 - `cookies.json` 走的是**文件优先**，正反各压一轮（判据不用 `/bili config` 的「登录态」那格——它打的是
   `BiliConfig.account.signed()`，看的是配置串，文件里的 cookie 根本不经它）：
   配置里 `account.cookie` 留空，`subs` 加上通配档 `0`（`wants_all()` 为真）。2026-10-03 之后
@@ -1825,6 +1849,67 @@ NotoSansSC-VF 16.9 MB→170 MB、msyhl 11.6 MB→160 MB。常驻只跟**字形�
 要他先点头；② 模板里根本不出现 `{draw}` 的目标其实不需要卡，现在本轮仍会按配色各画一张；
 ③ 框架侧那几笔不在本插件手里（GUI 的 wgpu 约 150~300 MB、每个插件各自静态链接的那份 arona/tokio/reqwest）。
 
+### 2026-10-17 一轮：生产切惰性栅格化，字面换成框架随包的思源宋体
+
+上一轮「没做的三件」里的 ① 这一轮做了——用户点头的原话是「顺便把所有插件的生产都切惰性后端，用框架提供的思源宋体」，
+另外还捎带把右上角那格删了（已知差别第 54 条）。
+
+**依赖换掉了**。`Cargo.toml` 删 `fontdue`，`ab_glyph` 从 optional feature 转成唯一后端，`[features]` 那一段随之删——
+生产只剩一条路径，不再有 `ARONA_BILI_ENGINE` 挑档。`Face` 从后端枚举变成一个结构体：`ab_glyph::FontArc` 只拿原始字节，
+画到哪个字才解析哪个字，栅格结果进一层按 (字符, 字号) 计的字形 LRU（`GLYPH_CACHE_MAX = 4096`，`Glyphs::touch` / `put`，
+口径与 petpet 那份素材缓存一致；判据 `glyph_cache_stays_bounded_and_drops_the_stalest` 钉的是"到顶丢最久没用的那条"）。
+文本层原本只用到 fontdue 的 `metrics().advance_width` 与 `rasterize()` 两个方法，所以 `GlyphMetrics` 照它的字段口径
+复刻了一份——`ymin` 仍是 y-up（相对基线向下为负），而 ab_glyph 的 `px_bounds()` 是 y-down，取的是 `-(bottom)`。
+
+**数字**（同一枚探针 `memprobe_reports_font_material_and_card_footprint`，`--ignored --test-threads=1`；
+这枚探针现在也认 `ARONA_BILI_FONT`，留空＝走生产那三级解析，所以"系统候选"与"思源宋体"两档能在同一条命令里各读一遍）：
+
+| | fontdue（上一轮） | 惰性 ab_glyph（这一轮） |
+|---|---|---|
+| 字面常驻·雅黑常规+粗体 | 307.6 MB | **34.9 MB** |
+| 字面常驻·思源宋体常规+粗体 | 253.5 MB | **22.6 MB**（＝两份文件字节之和） |
+| 装载 | 0.62 s | **0.01 s** |
+| 探针进程峰值工作集 | 405.6 MB | **118.1 MB** |
+| 累计分配流量 | 1354.7 MB | **116.8 MB** |
+| drop 之后常驻 | 0.0 MB | 0.0 MB（上一轮那条「回落不进 8 MB 以内就红」的闸原样留着） |
+
+渲染代价 spike 那一轮量过（五个字号 × 68 字 = 340 次栅格 + 340 次取宽，跑两遍）：冷的一遍 1.7 → 3.8 ms、
+热的 1.1 → **0.1** ms，端到端六张预览卡 1.53 → **0.72** s。**一张卡多付两三毫秒**，而同一轮里第二张起是热的、反而更快。
+
+**几何对齐是这条改动敢做的前提**：雅黑（TrueType）与思源/NotoSerifSC（CFF）两类轮廓都逐字比过包围盒与 advance，
+两档后端**最大偏差 0 格、0.0 px**（advance 那一档差 3.8e-6 px），只有抗锯齿核不同。那两条对照用例这一轮随
+`fontdue` 依赖一起删了——它们断言的是"两档一致"，现在只有一档，留着就是给不存在的第二档当陪练。
+
+**一条必须记的坑**：ab_glyph 的 `PxScale` 基准不是 em，而是 `height_unscaled() = ascent - descent`
+（雅黑那一档 1320，`unitsPerEm` 是 1000），不换算整张卡的文字会**整体小 24%**、版式全乱。
+`Face::scale` 就是这道换算（`px * height_unscaled / units_per_em`），`units_per_em` 读出 0 的坏字体才退回按 px 直接用。
+
+**字面从哪来**（框架侧同轮改动）。三级解析收在 [`draw/text.rs`](src/draw/text.rs) 的 `resolve()`：
+`bili-image.font` > **框架随包的安装目录 `fonts/`** > 系统候选。中间那级是新出口
+`arona::runtime::assets::cjk_font()`（`crates/arona/src/runtime/assets.rs`），它只认 `<运行目录>/fonts/` 下的
+思源宋体简中、按 Regular/Bold 分档；框架 GUI 的 `load_cjk_font()` 改成先问它，**所以窗口和卡片是同一套字**。
+安装包 `installer/arona-rs.iss` 新增三行 `[Files]`，把 `SourceHanSerifCN-Regular.otf`（11,626,108 B）、
+`-Bold.otf`（12,094,680 B）连同 OFL 许可释到 `{app}\fonts`，插件仓本身不带字体文件。
+选思源宋体而不是沿用雅黑的理由是**许可**：SIL OFL 1.1 允许随包再分发，msyh / simhei 不允许；
+它另有真粗体档位，所以「粗体」这一档不用合成假粗。
+
+**观感**：思源宋体是衬线体，跟雅黑那一档黑体差得很明显——这是**换字面**的效果，不是换后端的副作用（后端那一边几何上逐格相同）。
+版式类改动仍然只能肉眼验收；这一批预览图（去掉了右上角那格）本轮末重出，编号 21。
+
+**`ABI_LAYOUT` 固定到 9**：框架侧早就抬到 9 但那一版从没装过，这一轮三个插件全部对齐 9 重编。
+本插件侧不需要为 ABI 改任何源码——那个数是 arona crate 里的常量，插件只跟着重编（与 2026-10-08 抬到 6 那一轮同一形状）。
+
+**门禁**：`cargo test --release --lib` **232 passed / 0 failed / 5 ignored**。删掉的用例都是"断言对象已经不存在"那一类：
+右档三条（`the_id_pill_sits_on_the_right_edge`、`the_right_switch_alone_decides_whether_the_id_shows`、
+`archive_with_both_ids_shows_av_and_bvid`）随功能走，`lazy_backend_lands_where_fontdue_does`、
+`bench_render_cost_by_backend`、`memprobe_font_knobs` 三条随 `fontdue` 依赖走——前两条断言"两档后端一致"，
+现在只有一档；新增一条 `glyph_cache_stays_bounded_and_drops_the_stalest`。`cargo clippy --all-targets` 0 警告、
+改动文件 rustfmt 干净、`cargo build --release` 出 dll 正常。
+
+**还欠着的**：① 另两个插件（BlueArchive、petpet）的生产仍走 fontdue，这一轮只换掉了本插件；② 部署机要**重装**才拿得到
+`fonts/`，只换 dll 时字面退回系统候选（观感不变差，但"全家同一套字"这条不成立）；③ 上一轮列的 ②③ 两件（不需要卡的
+目标仍按配色各画一张、框架侧 wgpu 与各插件各自静态链接的那份依赖）没有动。
+
 ## 功能面差集收口
 
 判"改完了"用的是三面差集，每一面都比到具体条目，不是比总数：
@@ -1885,7 +1970,7 @@ NotoSansSC-VF 16.9 MB→170 MB、msyhl 11.6 MB→160 MB。常驻只跟**字形�
 ```
 cargo fmt
 cargo clippy --all-targets     # 目标：0 警告
-cargo test --lib               # 3 项标了 #[ignore]：两条要联网、一条离线绘图；通过条数不在这里写死，它每轮都变
+cargo test --lib               # 5 项标了 #[ignore]：两条要联网、一条离线绘图出图、一条内存探针、一条要仓库外的超大夹具；通过条数不在这里写死，它每轮都变
 cargo build --release          # 加了 --target 三元组时产物在 target/<三元组>/release/，不是 target/release/——
                                # 那边留的是上一轮的旧 dll，拷错目录会拿旧产物当新结果用（2026-10-03 真踩过）
 ```

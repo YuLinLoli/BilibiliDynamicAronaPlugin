@@ -1601,7 +1601,6 @@ fn style_for(
         face: Arc::clone(face),
         background: stops,
         badge_left: appearance.badge_enable.left,
-        badge_right: appearance.badge_enable.right,
         footer: footer.to_string(),
         qr: if appearance.card_ornament.eq_ignore_ascii_case("qrcode") {
             Some(link.to_string())
