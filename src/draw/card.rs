@@ -550,7 +550,8 @@ impl<'a> Board<'a> {
         let pad = q.card_padding as f32;
         let fx = x as f32;
         // 站方那格徽章垫在卡上面：下面所有落点都按抬高后的 y 算，块高再把它加回去
-        let badge_h = card_badge_height(style, item);
+        let badges = badge_sides(style, item);
+        let badge_h = card_badge_height(style, badges);
         let y = y + badge_h;
         let cover = art.picture(&item.cover);
         // 专栏那一支从头到尾是另一套版式：封面按站方定死的比例裁、多张时排三宫格，
@@ -613,36 +614,46 @@ impl<'a> Board<'a> {
         let duration = item.duration.clone();
         let play = item.play.clone();
         if let Some(canvas) = &mut self.canvas {
+            let card = Block {
+                x,
+                y: y.round() as u32,
+                width,
+                height: (height - badge_h).round() as u32,
+                radius: inner_radius(q, badges),
+            };
             // 底板先落，封面与文字再往上压：原插件这一族也是同一个 drawCard
             paint_inner_board(
                 canvas,
                 style,
-                x,
-                y.round() as u32,
-                width,
-                (height - badge_h).round() as u32,
-                inner_radius(q, badge_h > 0.0),
+                card.x,
+                card.y,
+                card.width,
+                card.height,
+                card.radius,
             );
-            if badge_h > 0.0 {
+            if badges[0] {
                 paint_card_badge(
                     canvas,
                     style,
                     art,
-                    Block {
-                        x,
-                        y: y.round() as u32,
-                        width,
-                        height: (height - badge_h).round() as u32,
-                        radius: inner_radius(q, true),
-                    },
-                    &item.badge,
-                    style.theme.sub_left_badge,
-                    None,
+                    card,
+                    &PillSpec::left(&item.badge, style.theme.sub_left_badge),
                 );
             }
-            // 封面的四角必须与卡同一套：徽章压着左上角时这里也得是直角，
+            // 右上角那一格是站方那串动态号（视频 `av…  |  BV…`、专栏 `cv…`、番剧 `ep…`），
+            // 原插件每张内卡都画（`DynamicMajorDraw.kt:263-272`、`748-757`）
+            if badges[1] {
+                paint_card_badge(
+                    canvas,
+                    style,
+                    art,
+                    card,
+                    &PillSpec::right(&item.badge_right, style.theme.sub_right_badge),
+                );
+            }
+            // 封面的四角必须与卡同一套：徽章压着哪个上角这里就得是直角，
             // 否则圆掉的封面角会把下面那层卡体白底露出来（用户圈的缺口）
-            let radius = inner_radius(q, badge_h > 0.0);
+            let radius = card.radius;
             // 封面往里缩 COVER_INSET，四周就露出一圈卡体白边。原插件缩的是 1 像素
             // （`videoCardRect.inflate(-1)`），2026-10-16 用户要看 10 像素的观感——
             // 只改 [`COVER_INSET`] 这一个数，下面那几处都以画出来的这块为准，别各自算
@@ -824,37 +835,46 @@ impl<'a> Board<'a> {
             } else {
                 q.line_space as f32 + style.face.height(&desc_flow, desc_leading)
             };
-        let badge_h = card_badge_height(style, item);
+        let badges = badge_sides(style, item);
+        let badge_h = card_badge_height(style, badges);
         let y = y + badge_h;
         let height = (q.additional_card_height as f32).max(used + pad * 2.0);
         let cover = art.picture(&item.cover).cloned();
         let duration = item.duration.clone();
         if let Some(canvas) = &mut self.canvas {
-            let radius = inner_radius(q, badge_h > 0.0);
+            let radius = inner_radius(q, badges);
+            let card = Block {
+                x,
+                y: y.round() as u32,
+                width,
+                height: height.round() as u32,
+                radius,
+            };
             paint_inner_board(
                 canvas,
                 style,
-                x,
-                y.round() as u32,
-                width,
-                height.round() as u32,
-                radius,
+                card.x,
+                card.y,
+                card.width,
+                card.height,
+                card.radius,
             );
-            if badge_h > 0.0 {
+            if badges[0] {
                 paint_card_badge(
                     canvas,
                     style,
                     art,
-                    Block {
-                        x,
-                        y: y.round() as u32,
-                        width,
-                        height: height.round() as u32,
-                        radius,
-                    },
-                    &item.badge,
-                    style.theme.sub_left_badge,
-                    None,
+                    card,
+                    &PillSpec::left(&item.badge, style.theme.sub_left_badge),
+                );
+            }
+            if badges[1] {
+                paint_card_badge(
+                    canvas,
+                    style,
+                    art,
+                    card,
+                    &PillSpec::right(&item.badge_right, style.theme.sub_right_badge),
                 );
             }
             canvas.fill_round_rect(
@@ -992,7 +1012,7 @@ impl<'a> Board<'a> {
                 y.round() as u32,
                 width,
                 height.round() as u32,
-                inner_radius(q, false),
+                inner_radius(q, [false, false]),
             );
             let first = y + pad * 0.8 + q.title_font;
             style.face.draw(
@@ -1064,7 +1084,7 @@ impl<'a> Board<'a> {
         // 转发里那张原卡自己也要有一格角标：原插件走的是同一个 `assembleCard`，
         // 只是 `isForward=true`（`DynamicDraw.kt:266-279`），词固定是「转发动态」、
         // 图标换成 FORWARD、配色仍是 mainLeftBadge。这一格同样带那圈白包边，仍贴着卡顶。
-        let badge_h = if self.style.badge_left {
+        let badge_h = if self.style.badge_left || self.style.badge_right {
             q.badge_height as f32 + COVER_INSET as f32
         } else {
             0.0
@@ -1078,7 +1098,7 @@ impl<'a> Board<'a> {
                 y: top.round() as u32,
                 width,
                 height: (height - badge_h).round() as u32,
-                radius: inner_radius(q, badge_h > 0.0),
+                radius: inner_radius(q, [self.style.badge_left, self.style.badge_right]),
             };
             paint_inner_board(
                 canvas,
@@ -1089,15 +1109,26 @@ impl<'a> Board<'a> {
                 card.height,
                 card.radius,
             );
-            if badge_h > 0.0 {
+            if self.style.badge_left {
                 paint_card_badge(
                     canvas,
                     self.style,
                     self.art,
                     card,
-                    "转发动态",
-                    self.style.theme.main_left_badge,
-                    Some(paint_forward_glyph),
+                    &PillSpec::left("转发动态", self.style.theme.main_left_badge)
+                        .with_glyph(paint_forward_glyph),
+                );
+            }
+            // 外层那格动态号在转发卡上同样要有：它走的就是同一个 `assembleCard`，
+            // 右上角那一格取的是**被转发那条**的号（`DynamicDraw.kt:278`）
+            if self.style.badge_right {
+                let code = source.id.to_string();
+                paint_card_badge(
+                    canvas,
+                    self.style,
+                    self.art,
+                    card,
+                    &PillSpec::right(&code, self.style.theme.main_right_badge),
                 );
             }
         }
@@ -1188,19 +1219,33 @@ const ARTICLE_COVER_SLOTS: usize = 3;
 /// 附属卡上方那一格徽章占多高：站方 `badge.text` 有词、且左徽章整档开着才留这一格。
 /// 留的是「药丸本身 + 它外面那圈白包边」，药丸底边照旧压在卡顶。
 /// 原插件无条件留 `badgeHeight`（text 为空时会画出一个空药丸），我们不留——见 README 已知差别。
-fn card_badge_height(style: &Style, item: &Attached) -> f32 {
-    if style.badge_left && !item.badge.is_empty() {
+/// 内卡上面那一格留不留：左右两档任何一格有东西就整行抬高
+fn card_badge_height(style: &Style, badges: [bool; 2]) -> f32 {
+    if badges.into_iter().any(|on| on) {
         style.quality.badge_height as f32 + COVER_INSET as f32
     } else {
         0.0
     }
 }
 
-/// 卡中卡的四角：压着徽章的那个左上角必须直角（同 `cardBadgeArc` 的语义）。
+/// 内卡顶上那两格各开没开：`(左, 右)`。词是空的就不算开——这一条是我们对原插件的
+/// 有意偏离（它无条件留 `badgeHeight`，text 为空会画出一个空药丸），见 README 第 46 条
+fn badge_sides(style: &Style, item: &Attached) -> [bool; 2] {
+    [
+        style.badge_left && !item.badge.is_empty(),
+        style.badge_right && !item.badge_right.is_empty(),
+    ]
+}
+
+/// 卡中卡的四角：压着徽章的那个上角必须直角（同 `cardBadgeArc` 的语义——
+/// 它是 `[badgeEnable.left ? 0 : arc, badgeEnable.right ? 0 : arc, arc, arc]`，
+/// `DynamicDraw.kt:164-168`，左右各压各的角）。
 /// 徽章外面那圈白包边会盖住这个角，但形状仍要照原插件置直角，见 [`paint_card_badge`]。
-fn inner_radius(q: Quality, badge_on_top: bool) -> Corners {
+fn inner_radius(q: Quality, pressed: [bool; 2]) -> Corners {
+    let [left, right] = pressed;
     Corners {
-        top_left: if badge_on_top { 0.0 } else { q.card_arc as f32 },
+        top_left: if left { 0.0 } else { q.card_arc as f32 },
+        top_right: if right { 0.0 } else { q.card_arc as f32 },
         ..Corners::all(q.card_arc as f32)
     }
 }
@@ -1208,6 +1253,38 @@ fn inner_radius(q: Quality, badge_on_top: bool) -> Corners {
 /// 徽章里那一格图标的描法。原插件是 `loadSVG("icon/…")` 直接栅格化，我们没有 SVG
 /// 光栅器，一律用线段描（[`paint_tv_glyph`]、[`paint_forward_glyph`]）。
 type GlyphPainter = fn(&mut Canvas, f32, f32, f32, Color);
+
+/// 压在卡顶那一格的徽章：文字、配色、落在卡的哪一角，外加文字前面要不要领一个自描图标。
+/// 收成一处是因为调用点上那串 `None, false` 读不出"哪一格、带不带图标"
+struct PillSpec<'a> {
+    text: &'a str,
+    palette: (Color, Color),
+    at_right: bool,
+    glyph: Option<GlyphPainter>,
+}
+
+impl<'a> PillSpec<'a> {
+    fn left(text: &'a str, palette: (Color, Color)) -> PillSpec<'a> {
+        PillSpec {
+            text,
+            palette,
+            at_right: false,
+            glyph: None,
+        }
+    }
+    fn right(text: &'a str, palette: (Color, Color)) -> PillSpec<'a> {
+        PillSpec {
+            text,
+            palette,
+            at_right: true,
+            glyph: None,
+        }
+    }
+    fn with_glyph(mut self, paint: GlyphPainter) -> PillSpec<'a> {
+        self.glyph = Some(paint);
+        self
+    }
+}
 
 /// 一格药丸徽章的底座：先按包边之外铺阴影，再包一圈白，最后落药丸本体。
 /// 外层左、外层右、内卡那格三档共用，包边宽度都是 [`COVER_INSET`]。
@@ -1240,15 +1317,11 @@ fn paint_pill(canvas: &mut Canvas, style: &Style, pill: Block, bg: Color) {
 /// * 转发里那张原卡：固定「转发动态」，`mainLeftBadge` + [`paint_forward_glyph`]
 ///   （`DynamicDraw.kt:266-279`，主卡那一格是同一段代码换了图标，走 [`paint_badges`]）；
 /// * 附属卡：站方 `badge.text`，`subLeftBadge`，**没有图标**（`badge.icon_url` 实测一直是空的）。
-fn paint_card_badge(
-    canvas: &mut Canvas,
-    style: &Style,
-    art: &Art,
-    card: Block,
-    text: &str,
-    palette: (Color, Color),
-    glyph: Option<GlyphPainter>,
-) {
+fn paint_card_badge(canvas: &mut Canvas, style: &Style, art: &Art, card: Block, spec: &PillSpec) {
+    let text = spec.text;
+    let palette = spec.palette;
+    let glyph = spec.glyph;
+    let at_right = spec.at_right;
     let q = style.quality;
     let font = q.sub_title_font;
     let pad = q.badge_padding as f32;
@@ -1259,14 +1332,19 @@ fn paint_card_badge(
     let width = (style.face.measure(text, font, false, &art.emojis) + pad * 8.0 + icon)
         .round()
         .max(1.0) as u32;
-    // 药丸底边压在卡片顶边上（原插件 `drawBadge` 的 TOP_LEFT 配方：下两角直角），
+    // 药丸底边压在卡片顶边上（原插件 `drawBadge` 的配方：不管落在哪一角，下两角都是直角），
     // 外面再包一圈 `COVER_INSET` 白——那圈白向下也压进卡顶那一格，这就是用户圈的"包边"。
     // 徽章本身不分离，只是被白边裹住；阴影按原插件打在包边之外（`rrect.inflate(1f)`）。
-    // 往右让开一格包边：这样白边左沿正好落在卡的左边缘上（不往卡外突出），
-    // 药丸本体又与里面那张封面的左边缘同一条竖线（用户 2026-10-16 圈的"对齐一点"）。
+    // 往内让开一格包边：这样白边沿正好落在卡的边缘上（不往卡外突出），
+    // 药丸本体又与里面那张封面的边同一条竖线（用户 2026-10-16 圈的"对齐一点"）。
     let top = card.y.saturating_sub(height);
+    let x = if at_right {
+        card.x + card.width - width - COVER_INSET
+    } else {
+        card.x + COVER_INSET
+    };
     let pill = Block {
-        x: card.x + COVER_INSET,
+        x,
         y: top,
         width,
         height,
@@ -1970,6 +2048,7 @@ mod tests {
             play: String::new(),
             desc: String::new(),
             badge: "投稿视频".to_string(),
+            badge_right: String::new(),
             covers: Vec::new(),
         });
         let mut art = Art::default();
@@ -2097,7 +2176,7 @@ mod tests {
         let q = Quality::find("1000w");
         let mut canvas = Canvas::new(200, 200, Color::rgb(255, 255, 255));
         let (x, y, w, h) = (20u32, 20u32, 160u32, 160u32);
-        let radius = inner_radius(q, false);
+        let radius = inner_radius(q, [false, false]);
         canvas.fill_round_rect(x, y, w, h, radius, Color::rgb(0x18, 0x1A, 0x1C));
         let band = (h as f32 * 0.2).round() as u32;
         canvas.fill_vertical_gradient(
@@ -2140,16 +2219,14 @@ mod tests {
             y: 120,
             width: 300,
             height: 120,
-            radius: inner_radius(q, true),
+            radius: inner_radius(q, [true, false]),
         };
         paint_card_badge(
             &mut canvas,
             &card_style,
             &Art::default(),
             card,
-            "专栏",
-            card_style.theme.sub_left_badge,
-            None,
+            &PillSpec::left("专栏", card_style.theme.sub_left_badge),
         );
         let same = |x: u32, y: u32, want: Color| canvas.pixel(x, y).0[..3] == want.0[..3];
         let white = Color::rgb(255, 255, 255);
@@ -2173,6 +2250,60 @@ mod tests {
         assert!(
             same(card.x + 40, card.y - 1, card_style.theme.sub_left_badge.1),
             "药丸与卡顶之间被留出了缝：那一行该是药丸底色"
+        );
+    }
+
+    /// 内卡右上角那一格（站方那串动态号）：与左那格同一套配方，只是镜像过来——
+    /// 包边落在卡右边缘上不外突、药丸右沿与封面右沿同一条竖线、底边仍压在卡顶。
+    /// 判据取自参考实现每张内卡都画的那一笔（`DynamicMajorDraw.kt:263-272`、`748-757`）
+    #[test]
+    fn the_id_pill_sits_on_the_right_edge() {
+        let card_style = style("1000w");
+        let q = card_style.quality;
+        let bg = Color::rgb(0x80, 0x90, 0xA0);
+        let mut canvas = Canvas::new(400, 300, bg);
+        let card = Block {
+            x: 60,
+            y: 120,
+            width: 300,
+            height: 120,
+            radius: inner_radius(q, [false, true]),
+        };
+        let ink = card_style.theme.sub_right_badge.1;
+        paint_card_badge(
+            &mut canvas,
+            &card_style,
+            &Art::default(),
+            card,
+            &PillSpec::right("cv53416297", card_style.theme.sub_right_badge),
+        );
+        let right = card.x + card.width - 1;
+        let same = |x: u32, y: u32, want: Color| canvas.pixel(x, y).0[..3] == want.0[..3];
+        let white = Color::rgb(255, 255, 255);
+        let mid = card.y - q.badge_height / 2;
+        assert!(
+            !same(right + 1, mid, white),
+            "包边往卡外突出了：卡右边缘外那一格不该是白的"
+        );
+        assert!(
+            same(right, mid, white),
+            "包边没落在卡右边缘上：那一格该是白的"
+        );
+        assert!(
+            same(right - COVER_INSET, mid, ink),
+            "药丸没让开那一格包边：它该与封面右边缘同一条竖线"
+        );
+        assert!(
+            same(right - 40, card.y - 1, ink),
+            "药丸与卡顶之间被留出了缝：那一行该是药丸底色"
+        );
+        // 只开右档时压的是右上那个角，左上那个角该圆回去（同 `cardBadgeArc` 左右各管各的）
+        let corners = inner_radius(q, [false, true]);
+        let round = q.card_arc as f32;
+        assert_eq!(corners.top_right, 0.0, "右徽章该把右上那个角压成直角");
+        assert_eq!(
+            corners.top_left, round,
+            "左档关着时左上那个角该圆回去，别跟着一起方"
         );
     }
 
@@ -2407,6 +2538,7 @@ mod tests {
             play: "1.2万播放".to_string(),
             desc: "简介文字".to_string(),
             badge: "投稿视频".to_string(),
+            badge_right: String::new(),
             covers: Vec::new(),
         };
         let mut board = Board {
@@ -2456,6 +2588,8 @@ mod tests {
     #[ignore = "只出图给人看版式，没有断言"]
     fn card_preview_writes_every_board_to_temp() {
         let mut style = style("1000w");
+        // 这一版要看的正是右上角那一格，所以把右档打开（配置默认是关的，照原插件）
+        style.badge_right = true;
         // 背景换成调试配置那一档：defaultColor 单值 #d3edfa 自动扩成三段渐变。
         // 纯白底上根本看不出阴影，人眼验收阴影与徽章融合必须带渐变。
         style.background = crate::draw::theme::background("#d3edfa", 30.0, true, 0.25, 1.0);
@@ -2515,6 +2649,7 @@ mod tests {
             play: "1.2万播放".to_string(),
             desc: "ばんばん".to_string(),
             badge: "投稿视频".to_string(),
+            badge_right: "av53416297  |  BV1GJ411x7h9".to_string(),
             covers: Vec::new(),
         });
 
@@ -2534,6 +2669,7 @@ mod tests {
             play: String::new(),
             desc: "动态卡片".to_string(),
             badge: "装扮".to_string(),
+            badge_right: String::new(),
             covers: Vec::new(),
         });
 
@@ -2551,6 +2687,7 @@ mod tests {
                    开始进行维护更新，预计持续 4 小时。"
                 .to_string(),
             badge: "专栏".to_string(),
+            badge_right: "cv53416297".to_string(),
             covers: vec!["https://i/cover.png".to_string()],
         });
 
@@ -2568,6 +2705,7 @@ mod tests {
             play: String::new(),
             desc: "站方的专栏封面本来就是列表，两张以上一律排三宫格。".to_string(),
             badge: "专栏".to_string(),
+            badge_right: "cv53416298".to_string(),
         });
 
         let out = std::env::temp_dir().join("arona-bili-cards");

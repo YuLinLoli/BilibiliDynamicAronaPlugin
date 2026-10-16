@@ -159,8 +159,8 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `drawOutlineColor` | `""` | 图片描边与角标那圈白包边的颜色。留空跟随 `theme`（v3 是 `#FFFFFF`） |
 | `cardOrnament` | `None` | 卡片装饰：`QrCode` / `None`；`FanCard` 这一档当前不出效果（见「已知差别」第 29 条） |
 | `drawEnable` | `true` | 绘图总开关：关掉之后卡片不画，模板里的 `{draw}` 落文字占位 |
-| `badgeEnable.left` | `true` | 卡片顶部左标签：动态卡是「动态」那枚、直播卡是「直播」，转发里那张原卡是「转发动态」 |
-| `badgeEnable.right` | `false` | 卡片顶部右标签（配色条那枚）；两档都关掉时整条标签带的高度一起收掉 |
+| `badgeEnable.left` | `true` | 卡片顶部左标签：外层是「动态」那枚、直播卡是「直播」，转发里那张原卡是「转发动态」，附属卡是站方那格类型词。**外层与内卡都归它管** |
+| `badgeEnable.right` | `false` | 卡片顶部右标签：外层是动态 id（直播卡是房间号），附属卡是那串号（视频 `av… \| BV…`、专栏 `cv…`、番剧 `ep…`）。两档都关掉时整条标签带的高度一起收掉 |
 | `colorGenerator.hueStep` | `30` | 渐变色生成（仅当主题色只给一个值时生效） |
 | `colorGenerator.lockSB` | `true` | 锁定饱和度与亮度。全篇只有这一个键带连续大写——原插件自己就写成 `lockSB`（`BiliConfig.kt:181`），字段上单独 `rename` 点名，不让 `rename_all` 把它改成 `lockSb` |
 | `colorGenerator.saturation` | `0.25` | 锁定的饱和度 0.0-1.0 |
@@ -501,6 +501,18 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 49. **播放数前面那个三角自己描，不拼进字符串**（2026-10-16）。`▶`（U+25B6）在当前选的
     中文字体里没有字形，拼进文案就画成一块豆腐。改成 `paint_play_glyph` 按逐行加宽再收窄
     描一个向右三角，与 `FORWARD` 图标、小电视那两个同一个路子（这里没有 SVG 光栅器）。
+
+50. **附属卡右上角那一格补上了**（2026-10-16，用户点头做的）。原插件每张内卡都有左右两格：
+    左格是类型词，右格是**站方那串号**——视频大卡 `av$aid  |  $bvid`（两个空格，
+    `DynamicMajorDraw.kt:263-272`）、小卡 `av$aid`、专栏 `cv$id`（`748-757`）、番剧小卡
+    `ep$epid`、音乐 `au$id`，配色取 `theme.subRightBadge`，整格受 `badgeEnable.right` 管。
+    我们此前只画左那一格。转发里那张原卡同理会带一格**被转发那条**的号（它走的就是
+    外层那个 `assembleCard`，配色仍是 `mainRightBadge`）。
+    两档开关现在**外层与内卡一起管**（原插件就是同一对开关，`cardBadgeArc` 按它把
+    左上／右上两个角分别压成直角，`DynamicDraw.kt:164-168`）。默认右档关着，
+    所以默认观感与上一版逐字节相同。判据：`the_id_pill_sits_on_the_right_edge`
+    （包边落在卡右边缘不外突、药丸右沿与封面右沿同一条竖线、底边仍压在卡顶、
+    只开右档时只有右上角变直角）＋取数那三条（`cv` / `av` / `av | BV`）。
 
 ## 预留问题
 
