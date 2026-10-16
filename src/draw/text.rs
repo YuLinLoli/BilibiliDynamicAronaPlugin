@@ -862,6 +862,10 @@ mod tests {
             r"C:\Windows\Fonts\simhei.ttf",
             r"C:\Windows\Fonts\simsun.ttc",
             r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
+            r"C:\Windows\Fonts\NotoSerifSC-VF.ttf",
+            r"C:\Windows\Fonts\simkai.ttf",
+            r"C:\Windows\Fonts\simfang.ttf",
+            r"C:\Windows\Fonts\SIMYOU.TTF",
             r"C:\Windows\Fonts\msyhl.ttc",
         ];
         for path in files {

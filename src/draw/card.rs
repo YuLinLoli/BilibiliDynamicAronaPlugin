@@ -1709,10 +1709,12 @@ mod tests {
     use crate::bili::model::LiveInfo;
 
     fn style(quality: &str) -> Style {
+        // 想拿别的字面看观感：设 `ARONA_BILI_FONT=<字体文件或 "常规;粗体">`（只影响测试出图）
+        let configured = std::env::var("ARONA_BILI_FONT").unwrap_or_default();
         Style {
             quality: Quality::find(quality),
             theme: Theme::find("v3"),
-            face: Typeface::discover("").unwrap(),
+            face: Typeface::discover(&configured).unwrap(),
             background: vec![Color::rgb(211, 237, 250)],
             badge_left: true,
             badge_right: false,
