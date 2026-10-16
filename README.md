@@ -1917,9 +1917,39 @@ debug 跑出来会显示 `profile/debug`，而握手是按 profile 一致才放�
 现在只有一档；新增一条 `glyph_cache_stays_bounded_and_drops_the_stalest`。`cargo clippy --all-targets` 0 警告、
 改动文件 rustfmt 干净、`cargo build --release` 出 dll 正常。
 
-**还欠着的**：① 另两个插件（BlueArchive、petpet）的生产仍走 fontdue，这一轮只换掉了本插件；② 部署机要**重装**才拿得到
-`fonts/`，只换 dll 时字面退回系统候选（观感不变差，但"全家同一套字"这条不成立）；③ 上一轮列的 ②③ 两件（不需要卡的
-目标仍按配色各画一张、框架侧 wgpu 与各插件各自静态链接的那份依赖）没有动。
+**还欠着的**：① 部署机要**重装**才拿得到 `fonts/`，只换 dll 时字面退回系统候选（观感不变差，
+但"全家同一套字"这条不成立）；② 上一轮列的 ②③ 两件（不需要卡的目标仍按配色各画一张、框架侧 wgpu
+与各插件各自静态链接的那份依赖）没有动。
+
+### 同日第二轮：三份重复的惰性实现并成框架那一份
+
+上面那一轮把三个插件都换成了惰性后端，但**每个插件各自抄了一份一模一样的字面层**
+（`FontArc` + 字形 LRU + `PxScale` 换算 + `px_bounds` 的 y-down 转 y-up + Weak 缓存）。
+用户指出"动框架"本来就是授权范围内的（原话里就写着），这一轮把它收进
+`arona::runtime::text`（`Face`/`Metrics`/`LineMetrics`/`Typeface`/`resolve`/`locate`），
+三个插件各留一个 newtype 挂自己的排版：
+
+| 插件 | 留下什么 | 删掉什么 |
+|---|---|---|
+| 本插件 | `Typeface` newtype + Span/Token/Flow 排版、表情、贴图 | 自带 Face/LRU/resolve/locate/load/open 与 `ab_glyph` 依赖 |
+| BlueArchive | `Fonts` newtype + `measure`/`line_metrics`/`draw_line`/`draw_centered`；**递归扫系统字体目录**那一级兜底是它特有的，留在插件侧 | 同上；另加一条：它没有粗体，改成只取常规那一档（`discover` 会连 `msyhbd.ttc` 一起装，白占 11 MB） |
+| petpet | `FontSet` newtype + 折行/描边/斜体；**十分钟字面宽限期整条删掉**（`FontSlot`/`sweep_font` 没了，回收 tick 只管素材） | 同上 |
+
+**收的是代码，不是那份常驻字节**：每个 dll 各自静态链接一份 arona，三张图同时在画时进程里仍是三份
+字体字节。要真收成一份得让宿主代发栅格（`HostBridge` 加通道 = 抬符号布局），这一档没做，
+框架那层的模块头注释里写明了。
+
+顺带把 petpet 的**假粗换成真粗**：`TextStyleKind::Bold` 以前是四个亚像素偏移叠画，现在换面用
+`SourceHanSerifCN-Bold.otf`，叠画只当字面里没有粗体那一档时的兜底。量宽与折行跟着换面
+（`advance`/`text_width`/`wrap_lines`/`line_metrics` 都加了 `bold` 一档）——拿常规去量、用粗体去画
+会溢出模板里那个框。本插件这一侧本来就在两处（作者昵称、直播标题）传 `bold=true`，随包那份有
+真 Bold 就直接生效，不需要改。
+
+判据：随实现迁到框架的四条（裸文件名命中、`;` 分两档、字形缓存有界且丢最久没用的、同一组文件共用一份）
+不再在插件里重复；petpet 新增 `the_bold_style_draws_heavier_than_regular` 与
+`stroke_and_slant_still_change_the_picture`，探针从"宽限期内不被回收 + 过期回收"换成
+"放手即归零 + 归零后再拿还长得回来"。三仓门禁：本插件 230 passed、BlueArchive 18、petpet 33，
+clippy 全 0 警告；框架 `cargo test -p arona-rs --lib` 267 passed（新增 7 条字面判据）。
 
 ## 功能面差集收口
 
