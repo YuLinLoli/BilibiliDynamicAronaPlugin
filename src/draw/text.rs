@@ -958,14 +958,19 @@ mod tests {
     /// 两条后端的字形落点必须对得上。`ab_glyph` 的 `px_bounds` 是 y 向下的像素包围盒，
     /// 而画布那一路沿用 fontdue 的 y 向上口径，换算错一位整张卡的文字就会上下跳。
     /// 只比"对得上"，不比"逐像素相同"：两家的抗锯齿核不一样，这本来就不是同一件事。
+    /// 换字体文件验另一类轮廓（如 CFF 的思源宋体）：`ARONA_BILI_FONT=<路径>`。
     #[cfg(feature = "ab_glyph")]
     #[test]
     fn lazy_backend_lands_where_fontdue_does() {
-        let path = std::path::Path::new(r"C:\Windows\Fonts\msyh.ttc");
-        let Ok(bytes) = std::fs::read(path) else {
-            println!("（没有 {path:?}，这一条验不了）");
+        let path = std::path::PathBuf::from(
+            std::env::var("ARONA_BILI_FONT")
+                .unwrap_or_else(|_| r"C:\Windows\Fonts\msyh.ttc".to_string()),
+        );
+        let Ok(bytes) = std::fs::read(&path) else {
+            println!("（读不到 {path:?}，这一条验不了）");
             return;
         };
+        println!("验的是 {path:?}");
         let eager = Face::Eager(
             Font::from_bytes(
                 bytes.clone(),
@@ -1031,11 +1036,15 @@ mod tests {
         use crate::memprobe::{mark, mb};
         use std::time::Instant;
 
-        let path = std::path::Path::new(r"C:\Windows\Fonts\msyh.ttc");
-        let Ok(bytes) = std::fs::read(path) else {
-            println!("（没有 {path:?}）");
+        let path = std::path::PathBuf::from(
+            std::env::var("ARONA_BILI_FONT")
+                .unwrap_or_else(|_| r"C:\Windows\Fonts\msyh.ttc".to_string()),
+        );
+        let Ok(bytes) = std::fs::read(&path) else {
+            println!("（读不到 {path:?}）");
             return;
         };
+        println!("字面文件：{path:?}");
         let lazy_mode =
             std::env::var("ARONA_BILI_ENGINE").is_ok_and(|raw| raw.eq_ignore_ascii_case("lazy"));
         let settings = FontSettings {
