@@ -16,6 +16,7 @@ use regex::Regex;
 
 use arona::runtime::message::{ForwardMessage, MessageSegment, OutgoingMessage};
 
+use super::Ready;
 use crate::bili::model::{Dynamic, LiveInfo, format_duration, format_time};
 use crate::config::ForwardCard;
 
@@ -147,21 +148,23 @@ impl Vals {
 }
 
 /// 图片类占位符的供给。绘图与下载都在调用方做完，这里只把成品交出来。
+/// 三份字节都是 [`Ready`]（已过出门前的编码归一），所以渲染一个目标只是引用计数加一，
+/// 不再按目标各拷一份卡片、各编一遍附件。
 #[derive(Default)]
 pub struct Supply {
     /// `{draw}`：卡片 PNG。None 表示没出图，发 [`Supply::draw_missing`] 那句
-    pub draw: Option<Vec<u8>>,
+    pub draw: Option<Ready>,
     /// 没出图时给用户的说明，照抄原插件的两条文案
     pub draw_missing: String,
     /// `{images}`：正文图，一张一个图片段
-    pub images: Vec<Vec<u8>>,
+    pub images: Vec<Ready>,
     /// `{cover}`：直播封面。缺了按原插件那样替换成空串
-    pub cover: Option<Vec<u8>>,
+    pub cover: Option<Ready>,
 }
 
 impl Supply {
     /// 动态卡片的供给（没有封面这一说）
-    pub fn for_dynamic(draw: Option<Vec<u8>>, images: Vec<Vec<u8>>) -> Supply {
+    pub fn for_dynamic(draw: Option<Ready>, images: Vec<Ready>) -> Supply {
         Supply {
             draw_missing: if draw.is_none() {
                 "[绘制动态失败]".to_string()
@@ -175,7 +178,7 @@ impl Supply {
     }
 
     /// 直播卡片的供给
-    pub fn for_live(draw: Option<Vec<u8>>, cover: Option<Vec<u8>>) -> Supply {
+    pub fn for_live(draw: Option<Ready>, cover: Option<Ready>) -> Supply {
         Supply {
             draw_missing: if draw.is_none() {
                 "[绘制直播图片失败]".to_string()
@@ -290,20 +293,20 @@ fn expand(run: &str, vals: &Vals, supply: &Supply) -> Vec<MessageSegment> {
             "draw" => match &supply.draw {
                 Some(bytes) => {
                     flush(&mut segments, &mut pending);
-                    segments.push(image(bytes.clone()));
+                    segments.push(image(bytes));
                 }
                 None => pending.push_str(&supply.draw_missing),
             },
             "images" => {
                 flush(&mut segments, &mut pending);
                 for bytes in &supply.images {
-                    segments.push(image(bytes.clone()));
+                    segments.push(image(bytes));
                 }
             }
             "cover" => {
                 if let Some(bytes) = &supply.cover {
                     flush(&mut segments, &mut pending);
-                    segments.push(image(bytes.clone()));
+                    segments.push(image(bytes));
                 }
             }
             _ => match vals.get(key) {
@@ -330,11 +333,12 @@ fn flush(segments: &mut Vec<MessageSegment>, pending: &mut String) {
     pending.clear();
 }
 
-fn image(bytes: Vec<u8>) -> MessageSegment {
+fn image(bytes: &Ready) -> MessageSegment {
     MessageSegment::Image {
         url: None,
         file: None,
-        data: Some(super::attachment(bytes)),
+        // 框架的出口要的是自有字节，所以这里拷一次；除此之外全程共享
+        data: Some(bytes.to_vec()),
         file_id: None,
     }
 }
@@ -356,8 +360,10 @@ mod tests {
         ForwardCard::default()
     }
 
-    fn bytes() -> Vec<u8> {
-        vec![0u8; 12]
+    /// 出门用的字节：夹具给的是原始编码，这里过一道 [`Ready`] 那道门（12 个 0 谁都解不开，
+    /// 归一那一步会原样交回来）
+    fn bytes() -> Ready {
+        Ready::of(vec![0u8; 12], None)
     }
 
     fn text_of(message: &OutgoingMessage) -> String {
@@ -408,7 +414,7 @@ mod tests {
         let got = render(
             "{images}",
             &vals(),
-            &Supply::for_dynamic(None, vec![jpeg.clone()]),
+            &Supply::for_dynamic(None, vec![Ready::of(jpeg.clone(), None)]),
             &card(),
         );
         assert_eq!(
@@ -421,7 +427,7 @@ mod tests {
         let got = render(
             "{images}",
             &vals(),
-            &Supply::for_dynamic(None, vec![webp]),
+            &Supply::for_dynamic(None, vec![Ready::of(webp, None)]),
             &card(),
         );
         assert!(

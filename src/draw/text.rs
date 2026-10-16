@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use fontdue::{Font, FontSettings};
 use image::RgbaImage;
@@ -27,8 +27,18 @@ pub struct Typeface {
     bold: Option<Font>,
 }
 
-/// 按配置路径缓存字面：热重载不该每次绘图都读一遍十几 MB 的字体
-static CACHE: OnceLock<Mutex<HashMap<String, Arc<Typeface>>>> = OnceLock::new();
+/// 缓存的键：`bili-image.font` 解析出来的（常规, 可选粗体）两把路径
+type FaceKey = (PathBuf, Option<PathBuf>);
+
+/// 按解析出的字体文件组合缓存字面。这里**只存 Weak**，不是疏忽，是收口内存的口径：
+/// fontdue 会把字体文件里每个码位的字形轮廓全量预算好常驻着，实测雅黑「常规+粗体」这一档
+/// 就是 307 MB（换成 simhei、simsun、Noto 都一样在 120～190 MB 这个量级，跟文件本身多大无关）。
+/// 而这一份只有在真要画卡的那一会儿用得上，所以缓存不该替进程长期持有它：
+/// 谁在画谁拿着 Arc，最后一个 Arc 落下后轮廓整个还给分配器，下一轮真要画时重解析一次
+/// （实测 0.62 s，只在有东西要画的那一轮付；一轮内多次出卡复用同一份）。
+/// 键用解析后的文件路径而不是配置原文：`bili-image.font` 换了写法但指的是同一组文件时，
+/// 不该再存第二份。
+static CACHE: OnceLock<Mutex<HashMap<FaceKey, Weak<Typeface>>>> = OnceLock::new();
 
 /// 一小段同色文字。正文里话题、链接、@ 各占一段，所以排版收 Span 而不是整串文本。
 #[derive(Clone, Copy, Debug)]
@@ -88,22 +98,22 @@ impl Typeface {
     /// `configured` 是 `bili-image.font` 的值：字体文件路径，或放在
     /// `config/bilibili/font/` 下的文件名（后缀可省），可用 `;` 再跟一个粗体。
     /// 留空则按系统候选路径找。找不到任何中文字体就报错，由调用方退回纯文本推送。
+    ///
+    /// 返回的一直是强引用：拿着它的那一段就保证字面不被换掉。同一档文件组合并发进来时只解析一次，
+    /// 后到的排在锁上等同一份——307 MB 的轮廓不该被解析两遍。
     pub fn discover(configured: &str) -> Result<Arc<Typeface>, String> {
-        let key = configured.trim().to_string();
+        let key = resolve(configured.trim())?;
         let cache = CACHE.get_or_init(Default::default);
-        if let Some(found) = cache.lock().ok().and_then(|map| map.get(&key).cloned()) {
-            return Ok(found);
+        let mut map = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(alive) = map.get(&key).and_then(Weak::upgrade) {
+            return Ok(alive);
         }
-        let (regular_path, bold_path) = resolve(&key)?;
-        let regular = open(&regular_path)?;
-        let bold = bold_path
-            .filter(|path| path.is_file())
-            .map(|path| open(&path))
-            .transpose()?;
-        let face = Arc::new(Typeface { regular, bold });
-        if let Ok(mut map) = cache.lock() {
-            map.insert(key, Arc::clone(&face));
-        }
+        let face = Arc::new(load(&key)?);
+        // 已经没人用的高级键就地清掉：这张表只留「现在正被拿着的」那几档
+        map.retain(|_, weak| weak.strong_count() > 0);
+        map.insert(key, Arc::downgrade(&face));
         Ok(face)
     }
 
@@ -601,6 +611,19 @@ fn locate_in(name: &str, folder: &Path) -> Option<PathBuf> {
     None
 }
 
+/// 按解析好的两把路径把字面读进内存。全量预解析字形轮廓要 0.3~0.6 秒，
+/// 所以这条只在 [`CACHE`] 里那档没人拿着时才走（口径见那张表的说明）。
+fn load(paths: &FaceKey) -> Result<Typeface, String> {
+    let (regular, bold) = &paths;
+    let regular = open(regular)?;
+    let bold = bold
+        .as_ref()
+        .filter(|path| path.is_file())
+        .map(|path| open(path))
+        .transpose()?;
+    Ok(Typeface { regular, bold })
+}
+
 /// 读一个字体文件。`.ttc` 是字体集合，第 0 个 face 就是常规字重。
 fn open(path: &Path) -> Result<Font, String> {
     let bytes =
@@ -822,5 +845,57 @@ mod tests {
         // 收窄到放不下才断，断点是宽度而不是换色
         let tight = face.layout(&spans, 32.0, false, 300.0, None, &EmojiSet::default());
         assert!(tight.rows() > 1, "300 宽的框没断行：{}", tight.rows());
+    }
+
+    /// 字体常驻的旋钮探针：同一份字体文件，`scale` 与 gsub 各管掉多少字节；不同字体文件之间
+    /// 差多少。这是「能不能把字体那份常驻压下去」的取数口，不参与断言。
+    /// `cargo test --release --lib -- --ignored --test-threads=1 --nocapture memprobe_font`
+    #[test]
+    #[ignore = "要读系统字体，且得独占进程才读得准"]
+    fn memprobe_font_knobs() {
+        use crate::memprobe::{mark, mb};
+        use std::time::Instant;
+
+        let files = [
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\msyhbd.ttc",
+            r"C:\Windows\Fonts\simhei.ttf",
+            r"C:\Windows\Fonts\simsun.ttc",
+            r"C:\Windows\Fonts\NotoSansSC-VF.ttf",
+            r"C:\Windows\Fonts\msyhl.ttc",
+        ];
+        for path in files {
+            let Ok(bytes) = std::fs::read(path) else {
+                println!("（没有 {path}）");
+                continue;
+            };
+            println!("{path} 文件本身 {}", mb(bytes.len()));
+            for (scale, gsub) in [(40.0, true), (20.0, true), (80.0, true), (40.0, false)] {
+                let before = mark().live;
+                let start = Instant::now();
+                let settings = FontSettings {
+                    collection_index: 0,
+                    scale,
+                    load_substitutions: gsub,
+                };
+                let Ok(done) = Font::from_bytes(bytes.as_slice(), settings) else {
+                    println!("  scale={scale} gsub={gsub} 解析失败");
+                    continue;
+                };
+                let cost = mark().live - before;
+                let glyphs = done.chars().len();
+                let painted = Instant::now();
+                for ch in "蔚蓝档案10月15日维护更新说明BiliBili".chars() {
+                    let (_, coverage) = done.rasterize(ch, 32.0);
+                    std::hint::black_box(coverage);
+                }
+                let cost = mb(cost);
+                let secs = start.elapsed().as_secs_f64();
+                let ms = painted.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "  scale={scale:>4} gsub={gsub:<5} 常驻={cost:>9} 码位={glyphs:>6} 解析={secs:>4.1}s 栅格={ms:>5.1}ms"
+                );
+            }
+        }
     }
 }

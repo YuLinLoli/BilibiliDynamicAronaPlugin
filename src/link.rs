@@ -347,7 +347,7 @@ async fn text_card(
             Ok(raw) => MessageSegment::Image {
                 url: None,
                 file: None,
-                data: Some(attachment(raw)),
+                data: Some(attachment(raw, None)),
                 file_id: None,
             },
             Err(_) => MessageSegment::Image {

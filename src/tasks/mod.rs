@@ -33,7 +33,7 @@ use crate::draw::quality::Quality;
 use crate::draw::text::{EmojiSet, Typeface};
 use crate::draw::theme::{Theme, background};
 use crate::push::template::{Supply, Vals};
-use crate::push::{self, Kind, Post};
+use crate::push::{self, Kind, Post, Ready};
 use crate::store::{LiveState, TargetState};
 use crate::translate::{self, Rendered};
 use crate::{CACHE_JOB, DYNAMIC_JOB, LIVE_JOB, RESCHEDULE_JOB};
@@ -59,8 +59,43 @@ static UNFOLLOW_PROBED: OnceLock<Mutex<BTreeSet<i64>>> = OnceLock::new();
 static SELFTEST_DONE: AtomicBool = AtomicBool::new(false);
 /// 接口失败的汇报节流点（unix 秒）
 static LAST_REPORT: AtomicU64 = AtomicU64::new(0);
-/// 字体发现要读盘，配置串 → 那一份
-static FONT: OnceLock<Mutex<(String, Option<Arc<Typeface>>)>> = OnceLock::new();
+
+/// 一轮里字面的持有者。
+///
+/// 第一次真要画卡时才去解析，之后整轮复用同一份；本轮跑出作用域就把这一份还掉——
+/// 绘图缓存只存 Weak（见 [`Typeface::discover`] 的说明），所以最后一个持有者离开后
+/// 那 307 MB 字形轮廓就整个还给分配器。两头的白付都不付：没有新动态的一轮不解析，
+/// 一轮里多次出卡也只解析一次。
+struct Faces {
+    configured: String,
+    held: Option<Arc<Typeface>>,
+    /// 解析失败本轮只报一次：字体文件不在是配置问题，每张卡各报一遍只会刷日志
+    complained: bool,
+}
+
+impl Faces {
+    fn for_round(appearance: &ImageConfig) -> Faces {
+        Faces {
+            configured: appearance.font.clone(),
+            held: None,
+            complained: false,
+        }
+    }
+
+    /// 画这张卡要用的字面；解析不出来（配置写错、系统里没有中文字体）回 None，按无卡推
+    fn need(&mut self) -> Option<&Arc<Typeface>> {
+        if self.held.is_none() && !self.complained {
+            self.complained = true;
+            match Typeface::discover(&self.configured) {
+                Ok(face) => self.held = Some(face),
+                Err(reason) => arona::runtime::log::warning(format!(
+                    "bilibili：卡画不出来（{reason}），这一轮只发文本"
+                )),
+            }
+        }
+        self.held.as_ref()
+    }
+}
 
 /// 任务不重入的守卫：拿到就占住，离开（含被取消）自动放行
 struct Busy(&'static AtomicBool);
@@ -215,12 +250,14 @@ async fn run_dynamic(ctx: PluginContext) {
         return;
     }
     let appearance = image_of(&ctx);
+    // 字面在这轮里第一次真要画卡时才解析，轮次结束就还掉（口径见 [`Faces`]）
+    let mut faces = Faces::for_round(&appearance);
     let bili = api::client(conf.account.clone(), conf.check.timeout.max(5));
     if bili.signed() {
         // 关注流读不出来的两种退法见 [`Firehose`]：登录失效是定论，立刻退回逐 UP；
         // 单次故障先计数，连着三轮都读不出来才退——一份坏 Cookie 不该把整个检测弄停，
         // 可也正因如此，被风控那一轮不该再补 N 次签名接口把情况弄得更糟。
-        let fails = match firehose_round(&ctx, &conf, &bili, &appearance).await {
+        let fails = match firehose_round(&ctx, &conf, &bili, &appearance, &mut faces).await {
             Firehose::Done => {
                 FIREHOSE_FAILS.store(0, Ordering::SeqCst);
                 0
@@ -229,10 +266,10 @@ async fn run_dynamic(ctx: PluginContext) {
             Firehose::Failed => FIREHOSE_FAILS.fetch_add(1, Ordering::SeqCst) + 1,
         };
         if fails >= FALLBACK_AFTER {
-            per_up_round(&ctx, &conf, &bili, &appearance).await;
+            per_up_round(&ctx, &conf, &bili, &appearance, &mut faces).await;
         }
     } else {
-        per_up_round(&ctx, &conf, &bili, &appearance).await;
+        per_up_round(&ctx, &conf, &bili, &appearance, &mut faces).await;
     }
 }
 
@@ -253,6 +290,7 @@ async fn firehose_round(
     conf: &BiliConfig,
     bili: &Arc<Bili>,
     appearance: &ImageConfig,
+    faces: &mut Faces,
 ) -> Firehose {
     let uids = crate::store().read(|data| data.subscribed_uids());
     let wants_all = crate::store().read(|data| data.wants_all());
@@ -325,7 +363,7 @@ async fn firehose_round(
             continue;
         }
         for dynamic in dynamics {
-            push_one(ctx, conf, bili, appearance, *slot, dynamic, &targets).await;
+            push_one(ctx, conf, bili, appearance, faces, *slot, dynamic, &targets).await;
         }
     }
     Firehose::Done
@@ -409,6 +447,7 @@ async fn per_up_round(
     conf: &BiliConfig,
     bili: &Arc<Bili>,
     appearance: &ImageConfig,
+    faces: &mut Faces,
 ) {
     for uid in crate::store().read(|data| data.subscribed_uids()) {
         let targets = states_of(uid);
@@ -457,7 +496,7 @@ async fn per_up_round(
             );
         }
         for dynamic in &fresh {
-            push_one(ctx, conf, bili, appearance, uid, dynamic, &targets).await;
+            push_one(ctx, conf, bili, appearance, faces, uid, dynamic, &targets).await;
         }
     }
 }
@@ -608,22 +647,26 @@ fn live_of(dynamic: &Dynamic) -> Option<LiveInfo> {
     Some(live)
 }
 
-/// 一条新动态推给一批目标：先按目标筛，再取素材，卡片按配色缓存，最后逐个发。
+/// 一条新动态推给一批目标：先按目标筛，再出卡（全部命中盘上那张 DRAW 就不解码素材），
+/// 画完立刻把位图还掉，最后逐个发——发送那一整段只带着出门的字节走。
 /// `slot` 是水位所在的那一档——按 UP 主订阅时就是那个 uid，走关注时间线时传 `0`。
+// 本轮的四样上下文（配置、客户端、外观、字面）与这一条的三样坐标（档位、动态、目标）本来就该一次说全，
+// 包成结构体只是把拆包搬到函数体里
+#[allow(clippy::too_many_arguments)]
 async fn push_one(
     ctx: &PluginContext,
     conf: &BiliConfig,
     bili: &Arc<Bili>,
     appearance: &ImageConfig,
+    faces: &mut Faces,
     slot: i64,
     dynamic: &Dynamic,
     targets: &[(String, TargetState)],
 ) {
     let kind = kind_of(dynamic);
-    let chosen: Vec<(String, TargetState)> = targets
+    let chosen: Vec<&(String, TargetState)> = targets
         .iter()
         .filter(|(_, state)| wants(state, dynamic.uid, &kind, &dynamic.text))
-        .map(|(key, state)| (key.clone(), state.clone()))
         .collect();
     if chosen.is_empty() {
         crate::store().edit_only(|data| data.advance_watermark(slot, dynamic.id));
@@ -654,68 +697,103 @@ async fn push_one(
     } else {
         translate::translate(&conf.translate, &dynamic.text).await
     };
+    let link = link_of(bili, conf.push.to_short_link, dynamic).await;
+    let vals = match &live {
+        Some(info) => Vals::live(info, link.clone(), &format_time(now())),
+        None => Vals::dynamic(dynamic, link.clone()),
+    };
+    // 一、出卡。`drawEnable=false` 时这两条推送路径都不画卡（原插件 gate 的也正是这两处：
+    // DynamicMessageTasker.kt:217 与 LiveMessageTasker.kt:48），命令的「先看一眼」照旧出图。
+    // 同一档配色只画一张：一个群一个色，二十个群别画二十遍。
+    let bucket = if living { "live" } else { "dynamic" };
+    // 先把这一批目标用到的配色去重，再按配色各算一个卡片键
+    let mut colors: Vec<String> = Vec::new();
+    for (_, state) in &chosen {
+        let color = state.color.clone().unwrap_or_default();
+        if !colors.contains(&color) {
+            colors.push(color);
+        }
+    }
+    let keys: HashMap<String, String> = colors
+        .into_iter()
+        .map(|color| {
+            let key = card_key(
+                bucket,
+                &dynamic.id.to_string(),
+                &color,
+                &link,
+                translation.as_ref(),
+                appearance,
+            );
+            (color, key)
+        })
+        .collect();
+    // 盘上那张 DRAW 先读一遍：全部命中的这一条，素材一张也不用解码（`{images}` 的原件字节仍要下）。
+    // 直播卡带着在线人数与标题，不落盘、也不在这一步复用。
+    let mut drawn: HashMap<String, Option<Ready>> = HashMap::new();
+    if appearance.draw_enable && !living {
+        for key in keys.values() {
+            if let Some(raw) = cache::read(cache::DRAW, key) {
+                drawn.insert(key.clone(), Some(Ready::of(raw, None)));
+            }
+        }
+    }
+    let paints =
+        appearance.draw_enable && keys.values().any(|key| !drawn.contains_key(key.as_str()));
     let material = gather(
         bili,
         &face_urls(dynamic),
         &picture_urls(dynamic),
         &emoji_pairs(dynamic),
         conf.cache.download_original,
+        if paints { Want::Both } else { Want::Bytes },
     )
     .await;
-    let link = link_of(bili, conf.push.to_short_link, dynamic).await;
-    let vals = match &live {
-        Some(info) => Vals::live(info, link.clone(), &format_time(now())),
-        None => Vals::dynamic(dynamic, link.clone()),
-    };
-    let images: Vec<Vec<u8>> = dynamic
+    let Material { art, bytes } = material;
+    if paints {
+        for (color, key) in &keys {
+            if drawn.contains_key(key) {
+                continue;
+            }
+            painted(&mut drawn, key.clone(), !living, || match &live {
+                Some(info) => paint_live(appearance, color, info, &art, &link, faces),
+                None => paint_dynamic(
+                    appearance,
+                    color,
+                    dynamic,
+                    &art,
+                    &link,
+                    translation.as_ref(),
+                    faces,
+                ),
+            });
+        }
+    }
+    // 解码位图到此为止。发送那一段每条消息之间还要歇 `messageInterval`，
+    // 不该由它替进程按着这几十 MB 的位图不放。
+    drop(art);
+    let images: Vec<Ready> = dynamic
         .images
         .iter()
-        .filter_map(|url| material.bytes.get(url).cloned())
+        .filter_map(|url| bytes.get(url).cloned())
         .collect();
     let cover = live
         .as_ref()
-        .and_then(|info| material.bytes.get(&info.cover).cloned());
-    // 同一档配色只画一张卡：一个群一个色，二十个群别画二十遍
-    let mut drawn: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+        .and_then(|info| bytes.get(&info.cover).cloned());
+    drop(bytes);
+    // 二、发送。卡片与附件都是引用计数加一，不再按目标各拷一份、各编一遍
     for (key, state) in chosen {
-        let color = state.color.clone().unwrap_or_default();
-        let bucket = if living { "live" } else { "dynamic" };
-        // `drawEnable=false` 时这两条推送路径都不画卡（原插件 gate 的也正是这两处：
-        // DynamicMessageTasker.kt:217 与 LiveMessageTasker.kt:48），命令的「先看一眼」照旧出图
-        let card = if appearance.draw_enable {
-            painted(
-                &mut drawn,
-                card_key(
-                    bucket,
-                    &dynamic.id.to_string(),
-                    &color,
-                    &link,
-                    translation.as_ref(),
-                    appearance,
-                ),
-                // 动态内容不会再变，画好的卡值得落到盘上；直播卡带着在线人数与标题，只在这一轮里复用
-                !living,
-                || match &live {
-                    Some(info) => paint_live(appearance, &color, info, &material, &link),
-                    None => paint_dynamic(
-                        appearance,
-                        &color,
-                        dynamic,
-                        &material,
-                        &link,
-                        translation.as_ref(),
-                    ),
-                },
-            )
-        } else {
-            None
-        };
+        let card = keys
+            .get(state.color.as_deref().unwrap_or_default())
+            .and_then(|key| drawn.get(key.as_str()))
+            .cloned()
+            .flatten();
         let post = if living {
             Post::live(vals.clone(), card, cover.clone())
         } else {
             Post::dynamic(vals.clone(), card, images.clone())
         };
-        push::push_state(ctx, &key, &state, &post).await;
+        push::push_state(ctx, key, state, &post).await;
         crate::store().edit_only(|data| data.advance_watermark(slot, dynamic.id));
         save(&conf.check);
     }
@@ -752,6 +830,7 @@ async fn run_live(ctx: PluginContext) {
     };
     let found: HashMap<i64, LiveInfo> = infos.into_iter().map(|live| (live.uid, live)).collect();
     let appearance = image_of(&ctx);
+    let mut faces = Faces::for_round(&appearance);
     for uid in uids {
         // 这一轮接口没给这个 uid 就不判定。拿默认值顶上去会把「读不到」当成数据用：
         // 于是「在播」被判成「下播」（乱发一条结束通知），「换了标题」也被判成立（空标题不等于换标题）。
@@ -791,7 +870,7 @@ async fn run_live(ctx: PluginContext) {
                 crate::store().write(|data| {
                     data.live.insert(uid.to_string(), state);
                 });
-                broadcast_live(&ctx, &conf, &bili, &appearance, &info, &targets).await;
+                broadcast_live(&ctx, &conf, &bili, &appearance, &mut faces, &info, &targets).await;
             }
             (true, false) => {
                 let Some(previous) = prev else { continue };
@@ -837,7 +916,8 @@ async fn run_live(ctx: PluginContext) {
                     && previous.title != info.title
                     && !targets.is_empty()
                 {
-                    broadcast_live(&ctx, &conf, &bili, &appearance, &info, &targets).await;
+                    broadcast_live(&ctx, &conf, &bili, &appearance, &mut faces, &info, &targets)
+                        .await;
                 }
             }
             (false, false) => {}
@@ -863,52 +943,77 @@ async fn broadcast_live(
     conf: &BiliConfig,
     bili: &Arc<Bili>,
     appearance: &ImageConfig,
+    faces: &mut Faces,
     info: &LiveInfo,
     targets: &[(String, TargetState)],
 ) {
-    let mut faces: Vec<String> = Vec::new();
+    let mut avatars: Vec<String> = Vec::new();
     if !info.face.is_empty() {
-        faces.push(info.face.clone());
+        avatars.push(info.face.clone());
     } else {
         // batch 接口有时不给头像，补一次直播用户资料——名片那条要 WBI 签名，连打会被判风控
         if let Ok(anchor) = bili.master(info.uid).await {
-            faces.push(anchor.face);
+            avatars.push(anchor.face);
         }
     }
-    let material = gather(
+    let drawing = appearance.draw_enable;
+    let Material { art, bytes } = gather(
         bili,
-        &faces,
+        &avatars,
         std::slice::from_ref(&info.cover),
         &[],
         conf.cache.download_original,
+        if drawing { Want::Both } else { Want::Bytes },
     )
     .await;
     let link = info.link();
     let vals = Vals::live(info, link.clone(), &format_time(now()));
-    let mut drawn: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    // 直播卡带着实时在线人数与标题，不落到盘上，只在这一轮里按配色复用一张
+    let mut colors: Vec<String> = Vec::new();
+    for (_, state) in targets
+        .iter()
+        .filter(|(_, state)| wants(state, info.uid, "直播", &info.title))
+    {
+        let color = state.color.clone().unwrap_or_default();
+        if !colors.contains(&color) {
+            colors.push(color);
+        }
+    }
+    let keys: HashMap<String, String> = colors
+        .into_iter()
+        .map(|color| {
+            let key = card_key(
+                "live",
+                &info.room_id.to_string(),
+                &color,
+                &link,
+                None,
+                appearance,
+            );
+            (color, key)
+        })
+        .collect();
+    let mut drawn: HashMap<String, Option<Ready>> = HashMap::new();
+    if drawing {
+        for (color, key) in &keys {
+            painted(&mut drawn, key.clone(), false, || {
+                paint_live(appearance, color, info, &art, &link, faces)
+            });
+        }
+    }
+    drop(art);
+    let cover = bytes.get(&info.cover).cloned();
+    drop(bytes);
     for (key, state) in targets {
         if !wants(state, info.uid, "直播", &info.title) {
             continue;
         }
-        let color = state.color.clone().unwrap_or_default();
-        let card = if appearance.draw_enable {
-            painted(
-                &mut drawn,
-                card_key(
-                    "live",
-                    &info.room_id.to_string(),
-                    &color,
-                    &link,
-                    None,
-                    appearance,
-                ),
-                false,
-                || paint_live(appearance, &color, info, &material, &link),
-            )
-        } else {
-            None
-        };
-        let post = Post::live(vals.clone(), card, material.bytes.get(&info.cover).cloned());
+        let card = keys
+            .get(state.color.as_deref().unwrap_or_default())
+            .and_then(|item| drawn.get(item.as_str()))
+            .cloned()
+            .flatten();
+        let post = Post::live(vals.clone(), card, cover.clone());
         push::push_state(ctx, key, state, &post).await;
     }
 }
@@ -1032,6 +1137,8 @@ async fn run_seasons(ctx: PluginContext) {
             std::slice::from_ref(&season.cover),
             &[],
             conf.cache.download_original,
+            // 番剧卡本来就不画，封面只作为 `{images}` 出门：一张都不解
+            Want::Bytes,
         )
         .await;
         let link = format!("https://www.bilibili.com/bangumi/play/ss{id}");
@@ -1101,10 +1208,31 @@ fn kind_of(dynamic: &Dynamic) -> String {
     }
 }
 
-/// 绘图用的素材包：解码后的图给画卡，原始字节给 `{images}` 直接发
+/// 绘图用的素材包：解码后的图给画卡，归一过的字节给 `{images}` 直接发
 struct Material {
     art: Art,
-    bytes: HashMap<String, Vec<u8>>,
+    bytes: HashMap<String, Ready>,
+}
+
+/// 画进卡片的位图最多留这么多像素。卡片里图片的落点最宽也不过整幅卡宽（1500w 那一档 1400），
+/// 400 万像素足够盖住任何一格；但解码是按源图大小付钱的：一张 1440x9000 的长图原样留在素材包里
+/// 就是 52 MB，一条动态九张就是半 GB。超预算的等比缩到预算内——贴图路径本来就要按框再裁一次。
+const ART_PIXELS: u64 = 4_000_000;
+
+/// 解码闸：源图超过这么多像素就根本不解。一张 8192x32768 解开是 1 GB 当量，站方给不到，
+/// 但图床返回奇怪东西、或盘上那份缓存被人手放过这种图时，不能让它把进程顶爆。
+/// 不解不等于不发：附件仍按原件交，卡片按缺图的样子画。
+const MAX_DECODE_PIXELS: u64 = 32_000_000;
+
+/// 一张图这一轮要取到哪一步
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Want {
+    /// 只要出门的字节（全部命中盘上那张 DRAW 的这一条动态，素材不必解码）
+    Bytes,
+    /// 字节与位图都要：画卡用位图，`{images}` 用字节，一次解码两边复用
+    Both,
+    /// 只要位图：表情不单独发出去，归一附件是白烧
+    Art,
 }
 
 /// 一条动态涉及哪些头像
@@ -1175,62 +1303,138 @@ fn emoji_pairs(dynamic: &Dynamic) -> Vec<(String, String)> {
     out
 }
 
-/// 逐个下素材：单张失败只跳过那张，不拖垮整条推送（缺图的样子画卡里自会体现）
+/// 逐个下素材：单张失败只跳过那张，不拖垮整条推送（缺图的样子画卡里自会体现）。
+/// `want` 决定这一轮取到哪一步——全部命中盘上那张 DRAW 时按 [`Want::Bytes`]，一张都不解。
 async fn gather(
     bili: &Arc<Bili>,
     faces: &[String],
     pictures: &[String],
     emojis: &[(String, String)],
     original: bool,
+    want: Want,
 ) -> Material {
     let mut art = Art::default();
-    let mut bytes: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut bytes: HashMap<String, Ready> = HashMap::new();
     for url in faces {
-        if let Some((raw, image)) = fetch(bili, url, cache::USER, original).await {
-            bytes.insert(url.clone(), raw);
-            art.faces.insert(url.clone(), image);
+        if let Some((done, image)) = fetch(bili, url, cache::USER, original, want).await {
+            bytes.insert(url.clone(), done);
+            if let Some(found) = image {
+                art.faces.insert(url.clone(), found);
+            }
         }
     }
     for url in pictures {
-        if let Some((raw, image)) = fetch(bili, url, cache::IMAGES, original).await {
-            bytes.insert(url.clone(), raw);
-            art.pictures.insert(url.clone(), image);
+        if let Some((done, image)) = fetch(bili, url, cache::IMAGES, original, want).await {
+            bytes.insert(url.clone(), done);
+            if let Some(found) = image {
+                art.pictures.insert(url.clone(), found);
+            }
         }
     }
-    // 表情只画进卡片，不作为附件发出去，所以只要解码后的那一份
-    let mut set = HashMap::new();
-    for (name, url) in emojis {
-        if let Some((_, image)) = fetch(bili, url, cache::EMOJI, true).await {
-            set.insert(name.clone(), image);
+    // 表情只画进卡片，不作为附件发出去，所以只取解码后的那一份
+    if want != Want::Bytes {
+        let mut set = HashMap::new();
+        for (name, url) in emojis {
+            if let Some((_, Some(image))) = fetch(bili, url, cache::EMOJI, true, Want::Art).await {
+                set.insert(name.clone(), image);
+            }
         }
+        art.emojis = EmojiSet::new(set);
     }
-    art.emojis = EmojiSet::new(set);
     Material { art, bytes }
 }
 
-/// 取一张图。`downloadOriginal=false` 时先问图床要缩放过的 webp，拿不到再回退原图。
+/// 取一张图，返回「可以直接出门的字节」与（要画进卡片时）限幅后的位图。
+/// `downloadOriginal=false` 时先问图床要缩放过的 webp，拿不到再回退原图。
 /// 盘上那份缓存在最前面：一条动态九张图、几十个目标，每轮都从图床重拉一遍既慢又容易撞限流。
 async fn fetch(
     bili: &Arc<Bili>,
     url: &str,
     kind: &str,
     original: bool,
-) -> Option<(Vec<u8>, image::RgbaImage)> {
-    if let Some(raw) = cache::read(kind, url)
-        && let Ok(decoded) = image::load_from_memory(&raw)
-    {
-        return Some((raw, decoded.to_rgba8()));
+    want: Want,
+) -> Option<(Ready, Option<image::RgbaImage>)> {
+    let raw = match raw_of(bili, url, kind, original).await {
+        Some(bytes) => bytes,
+        None => return None,
+    };
+    // 只取字节、而这份字节本来就是 PNG/JPEG 时一次都不解——那是最常见的路径
+    let needs_image = want != Want::Bytes
+        || !(raw.starts_with(push::PNG_MAGIC) || raw.starts_with(push::JPEG_MAGIC));
+    let decoded = if needs_image {
+        decode(raw.as_slice())
+    } else {
+        None
+    };
+    // 解码可能是为了归一 WebP（`needs_image`），不一定是为了画卡：只要字节的这一档，
+    // 解出来的那份全分辨率位图绝不能进素材包，否则这一档省下的内存又原样留着了
+    let painted = if want == Want::Bytes {
+        None
+    } else {
+        decoded.as_ref().and_then(art_of)
+    };
+    // 出门字节要的是**原件**（缩放那份只是给卡片用的），且一张图一轮只归一一次：
+    // 归一里 WebP 转 PNG 最贵，现在复用上面这一次解码，不再为每个目标各解各编一遍。
+    let done = match want {
+        Want::Art => Ready::of(Vec::new(), None),
+        _ => Ready::of(raw, decoded.as_ref()),
+    };
+    Some((done, painted))
+}
+
+/// 一张图的原件：先问盘上缓存，再问图床（带两个地址的尝试顺序见 [`fetch_attempts`]）
+async fn raw_of(bili: &Arc<Bili>, url: &str, kind: &str, original: bool) -> Option<Vec<u8>> {
+    if let Some(raw) = cache::read(kind, url) {
+        return Some(raw);
     }
-    let attempts = fetch_attempts(url, original);
-    for attempt in attempts {
-        if let Ok(raw) = bili.bytes(&attempt, "https://www.bilibili.com/").await
-            && let Ok(decoded) = image::load_from_memory(&raw)
-        {
+    for attempt in fetch_attempts(url, original) {
+        if let Ok(raw) = bili.bytes(&attempt, "https://www.bilibili.com/").await {
             cache::write(kind, url, &raw);
-            return Some((raw, decoded.to_rgba8()));
+            return Some(raw);
         }
     }
     None
+}
+
+/// 解码闸：源图超过 [`MAX_DECODE_PIXELS`] 就不解。判的是头里的声明尺寸，所以真解之前就把关。
+fn within_decode_gate(width: u32, height: u32) -> bool {
+    (width as u64) * (height as u64) <= MAX_DECODE_PIXELS
+}
+
+/// 按源图头里的尺寸决定解不解：闸不过就回 None（口径见 [`MAX_DECODE_PIXELS`] 那条说明）。
+fn decode(raw: &[u8]) -> Option<image::DynamicImage> {
+    let reader = match image::ImageReader::new(std::io::Cursor::new(raw)).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(_) => return None,
+    };
+    let (w, h) = reader.into_dimensions().ok()?;
+    if !within_decode_gate(w, h) {
+        arona::runtime::log::debug(format!(
+            "bilibili：一张 {w}x{h} 的图超出解码闸（{MAX_DECODE_PIXELS} 像素），卡片按缺图画，附件照发"
+        ));
+        return None;
+    }
+    image::load_from_memory(raw).ok()
+}
+
+/// 把解出来的图收成画卡用的位图，并按 [`ART_PIXELS`] 限幅。
+fn art_of(any: &image::DynamicImage) -> Option<image::RgbaImage> {
+    let (w, h) = (any.width(), any.height());
+    let pixels = (w as u64) * (h as u64);
+    if pixels <= ART_PIXELS {
+        return Some(any.to_rgba8());
+    }
+    let k = (ART_PIXELS as f64 / pixels as f64).sqrt();
+    let (tw, th) = (
+        ((w as f64 * k).round() as u32).max(1),
+        ((h as f64 * k).round() as u32).max(1),
+    );
+    Some(image::imageops::resize(
+        &any.to_rgba8(),
+        tw,
+        th,
+        image::imageops::FilterType::Triangle,
+    ))
 }
 
 /// 取一张图要试哪几个地址：要原图、URL 自带尺寸档、或图床不认那套缩放语法时只走原件，
@@ -1288,20 +1492,20 @@ async fn link_of(bili: &Arc<Bili>, to_short: bool, dynamic: &Dynamic) -> String 
 /// 带着实时数字的（直播卡）只在这一轮里省一省。
 /// 画不出来是 `None`（字体找不到之类），那种失败不往盘上写，否则一次抖动就永久没卡。
 fn painted(
-    drawn: &mut HashMap<String, Option<Vec<u8>>>,
+    drawn: &mut HashMap<String, Option<Ready>>,
     key: String,
     sticky: bool,
-    paint: impl FnOnce() -> Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
+    paint: impl FnOnce() -> Option<Ready>,
+) -> Option<Ready> {
     if let Some(hit) = drawn.get(&key) {
         return hit.clone();
     }
     let found = match cache::read(cache::DRAW, &key) {
-        Some(raw) if sticky => Some(raw),
+        Some(raw) if sticky => Some(Ready::of(raw, None)),
         _ => {
             let made = paint();
-            if sticky && let Some(png) = &made {
-                cache::write(cache::DRAW, &key, png);
+            if sticky && let Some(card) = &made {
+                cache::write(cache::DRAW, &key, card.bytes());
             }
             made
         }
@@ -1331,25 +1535,28 @@ fn card_key(
     format!("{bucket}/{id}/{color}#{stamp}")
 }
 
-/// 画一张动态卡。外观坏了（字体找不到之类）记一条日志然后按无卡推。
+/// 画一张动态卡。字面拿不到（字体找不到之类）就按无卡推——那句日志由 [`Faces::need`] 一轮报一次。
 fn paint_dynamic(
     appearance: &ImageConfig,
     color: &str,
     dynamic: &Dynamic,
-    material: &Material,
+    art: &Art,
     link: &str,
     translation: Option<&Rendered>,
-) -> Option<Vec<u8>> {
-    let style = match style_for(appearance, color, link, &appearance.footer.dynamic_footer) {
-        Ok(style) => style,
-        Err(reason) => {
-            arona::runtime::log::warning(format!(
-                "bilibili：动态卡画不出来（{reason}），这条只发文本"
-            ));
-            return None;
-        }
-    };
-    Some(dynamic_card(dynamic, &material.art, &style, translation))
+    faces: &mut Faces,
+) -> Option<Ready> {
+    let face = faces.need()?;
+    let style = style_for(
+        appearance,
+        color,
+        link,
+        &appearance.footer.dynamic_footer,
+        face,
+    );
+    Some(Ready::of(
+        dynamic_card(dynamic, art, &style, translation),
+        None,
+    ))
 }
 
 /// 画一张直播卡
@@ -1357,19 +1564,19 @@ fn paint_live(
     appearance: &ImageConfig,
     color: &str,
     live: &LiveInfo,
-    material: &Material,
+    art: &Art,
     link: &str,
-) -> Option<Vec<u8>> {
-    let style = match style_for(appearance, color, link, &appearance.footer.live_footer) {
-        Ok(style) => style,
-        Err(reason) => {
-            arona::runtime::log::warning(format!(
-                "bilibili：直播卡画不出来（{reason}），这条只发文本"
-            ));
-            return None;
-        }
-    };
-    Some(live_card(live, &material.art, &style))
+    faces: &mut Faces,
+) -> Option<Ready> {
+    let face = faces.need()?;
+    let style = style_for(
+        appearance,
+        color,
+        link,
+        &appearance.footer.live_footer,
+        face,
+    );
+    Some(Ready::of(live_card(live, art, &style), None))
 }
 
 /// 一份外观参数 → 画卡要的全部东西
@@ -1378,7 +1585,8 @@ fn style_for(
     color: &str,
     link: &str,
     footer: &str,
-) -> Result<Style, String> {
+    face: &Arc<Typeface>,
+) -> Style {
     let generator = &appearance.color_generator;
     let stops = background(
         color,
@@ -1387,10 +1595,10 @@ fn style_for(
         generator.saturation as f32,
         generator.brightness as f32,
     );
-    Ok(Style {
+    Style {
         quality: Quality::find(&appearance.quality),
         theme: themed(appearance),
-        face: typeface(&appearance.font)?,
+        face: Arc::clone(face),
         background: stops,
         badge_left: appearance.badge_enable.left,
         badge_right: appearance.badge_enable.right,
@@ -1400,7 +1608,7 @@ fn style_for(
         } else {
             None
         },
-    })
+    }
 }
 
 /// 主题给的是整套内置配色，`image` 区那三个颜色键是**覆盖**：留空就跟随 `image.theme`。
@@ -1464,20 +1672,6 @@ fn miscolored(key: &str, raw: &str) {
     ));
 }
 
-/// 字体只发现一次，配置串换了才重新找
-fn typeface(configured: &str) -> Result<Arc<Typeface>, String> {
-    let slot = FONT.get_or_init(|| Mutex::new((String::new(), None)));
-    let mut cache = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cache.1.is_none() || cache.0 != configured {
-        cache.1 = Some(Typeface::discover(configured)?);
-        cache.0 = configured.to_string();
-    }
-    cache
-        .1
-        .clone()
-        .ok_or_else(|| "字体还没找到，检查 bili-image.font".to_string())
-}
-
 /// 绘图配置现取（热重载之后下一次检测就用新值）
 fn image_of(ctx: &PluginContext) -> ImageConfig {
     ctx.config::<ImageConfig>(IMAGE_SECTION).get()
@@ -1493,50 +1687,67 @@ pub(crate) async fn preview(
 ) -> Post {
     let conf = ctx.config::<BiliConfig>(SECTION).get();
     let appearance = image_of(ctx);
-    let material = gather(
+    let mut faces = Faces::for_round(&appearance);
+    let link = link_of(bili, conf.push.to_short_link, dynamic).await;
+    // 只有真带着房间信息才走直播版式：没有 live 还按直播画就推出一张空名空题的卡
+    if let Some(live) = live_of(dynamic).filter(|_| kind_of(dynamic) == "直播") {
+        let Material { art, bytes } = gather(
+            bili,
+            &face_urls(dynamic),
+            &picture_urls(dynamic),
+            &emoji_pairs(dynamic),
+            conf.cache.download_original,
+            Want::Both,
+        )
+        .await;
+        let vals = Vals::live(&live, link.clone(), &format_time(now()));
+        let card = paint_live(&appearance, color, &live, &art, &link, &mut faces);
+        return Post::live(vals, card, bytes.get(&live.cover).cloned());
+    }
+    let vals = Vals::dynamic(dynamic, link.clone());
+    let translation = translate::translate(&conf.translate, &dynamic.text).await;
+    let key = card_key(
+        "dynamic",
+        &dynamic.id.to_string(),
+        color,
+        &link,
+        translation.as_ref(),
+        &appearance,
+    );
+    // 先看一眼也认盘上那张 DRAW：命中的那一次一张素材都不用解
+    let cached = cache::read(cache::DRAW, &key).map(|raw| Ready::of(raw, None));
+    let Material { art, bytes } = gather(
         bili,
         &face_urls(dynamic),
         &picture_urls(dynamic),
         &emoji_pairs(dynamic),
         conf.cache.download_original,
+        if cached.is_some() {
+            Want::Bytes
+        } else {
+            Want::Both
+        },
     )
     .await;
-    let link = link_of(bili, conf.push.to_short_link, dynamic).await;
-    // 只有真带着房间信息才走直播版式：没有 live 还按直播画就推出一张空名空题的卡
-    if let Some(live) = live_of(dynamic).filter(|_| kind_of(dynamic) == "直播") {
-        let vals = Vals::live(&live, link.clone(), &format_time(now()));
-        let card = paint_live(&appearance, color, &live, &material, &link);
-        return Post::live(vals, card, material.bytes.get(&live.cover).cloned());
+    let mut drawn: HashMap<String, Option<Ready>> = HashMap::new();
+    if let Some(card) = &cached {
+        drawn.insert(key.clone(), Some(card.clone()));
     }
-    let vals = Vals::dynamic(dynamic, link.clone());
-    let translation = translate::translate(&conf.translate, &dynamic.text).await;
-    let mut drawn: HashMap<String, Option<Vec<u8>>> = HashMap::new();
-    let card = painted(
-        &mut drawn,
-        card_key(
-            "dynamic",
-            &dynamic.id.to_string(),
+    let card = painted(&mut drawn, key, true, || {
+        paint_dynamic(
+            &appearance,
             color,
+            dynamic,
+            &art,
             &link,
             translation.as_ref(),
-            &appearance,
-        ),
-        true,
-        || {
-            paint_dynamic(
-                &appearance,
-                color,
-                dynamic,
-                &material,
-                &link,
-                translation.as_ref(),
-            )
-        },
-    );
-    let images: Vec<Vec<u8>> = dynamic
+            &mut faces,
+        )
+    });
+    let images: Vec<Ready> = dynamic
         .images
         .iter()
-        .filter_map(|url| material.bytes.get(url).cloned())
+        .filter_map(|url| bytes.get(url).cloned())
         .collect();
     Post::dynamic(vals, card, images)
 }
@@ -1550,27 +1761,29 @@ pub(crate) async fn preview_live(
 ) -> Post {
     let conf = ctx.config::<BiliConfig>(SECTION).get();
     let appearance = image_of(ctx);
-    let mut faces: Vec<String> = Vec::new();
+    let mut faces = Faces::for_round(&appearance);
+    let mut avatars: Vec<String> = Vec::new();
     if info.face.is_empty() {
         // batch 接口有时不给头像，补一次直播用户资料——名片那条要 WBI 签名，连打会被判风控
         if let Ok(anchor) = bili.master(info.uid).await {
-            faces.push(anchor.face);
+            avatars.push(anchor.face);
         }
     } else {
-        faces.push(info.face.clone());
+        avatars.push(info.face.clone());
     }
-    let material = gather(
+    let Material { art, bytes } = gather(
         bili,
-        &faces,
+        &avatars,
         std::slice::from_ref(&info.cover),
         &[],
         conf.cache.download_original,
+        Want::Both,
     )
     .await;
     let link = info.link();
     let vals = Vals::live(info, link.clone(), &format_time(now()));
-    let card = paint_live(&appearance, color, info, &material, &link);
-    Post::live(vals, card, material.bytes.get(&info.cover).cloned())
+    let card = paint_live(&appearance, color, info, &art, &link, &mut faces);
+    Post::live(vals, card, bytes.get(&info.cover).cloned())
 }
 
 /// 北京时间口径下的当前秒级时间戳（模板与状态都用它）
@@ -1807,6 +2020,45 @@ mod tests {
                 "{url} 的两次尝试顺序不对：{attempts:?}"
             );
         }
+    }
+
+    /// 素材那两道闸的口径：画卡用的位图超预算就等比缩到预算内，声明尺寸过了解码闸的根本不解。
+    #[test]
+    fn oversized_material_is_clamped_to_the_drawing_budget() {
+        let big = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2000,
+            3000,
+            image::Rgba([9, 9, 9, 255]),
+        ));
+        let cut = art_of(&big).unwrap();
+        assert!(
+            (cut.width() as u64) * (cut.height() as u64) <= ART_PIXELS + 4000,
+            "没缩进预算：{}x{}",
+            cut.width(),
+            cut.height()
+        );
+        let ratio = cut.width() as f64 / cut.height() as f64;
+        assert!(
+            (ratio - 2000.0 / 3000.0).abs() < 0.01,
+            "等比缩出来的比例不对：{ratio}"
+        );
+        // 预算内的原样留，不该被无谓地过一次缩放
+        let fits = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1080,
+            1440,
+            image::Rgba([9, 9, 9, 255]),
+        ));
+        let kept = art_of(&fits).unwrap();
+        assert_eq!((kept.width(), kept.height()), (1080, 1440));
+    }
+
+    /// 解码闸只看头里声明的尺寸：站方真给到两万像素的长图要能画，
+    /// 而一张 1 GB 当量的怪东西不能把进程顶爆。
+    #[test]
+    fn the_decode_gate_reads_only_the_declared_size() {
+        assert!(within_decode_gate(1440, 20000), "长图被闸住了");
+        assert!(within_decode_gate(4000, 4000));
+        assert!(!within_decode_gate(8192, 32768), "1 GB 当量的不该解");
     }
 
     /// 只走原件的那三种：真要原图、URL 自带尺寸档、图床不认这套语法。
@@ -2128,7 +2380,7 @@ mod tests {
     fn a_missing_font_reports_a_readable_reason() {
         // 指向一个肯定不存在的路径：报错文案要人能看懂，不能是裸 panic
         // （Typeface 没有 Debug，所以用 match 而不是 unwrap_err）
-        match typeface("C:/does-not-exist/none.ttf") {
+        match Typeface::discover("C:/does-not-exist/none.ttf") {
             Ok(_) => panic!("不存在的路径居然找到了字体"),
             Err(reason) => {
                 assert!(

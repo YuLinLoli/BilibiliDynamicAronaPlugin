@@ -457,15 +457,19 @@ impl Canvas {
         let Some((sw, sh)) = fit_cover(src.width(), src.height(), width, height) else {
             return;
         };
-        let scaled = resize(src, sw, sh);
-        let offset_x = (sw - width) / 2;
-        let offset_y = (sh - height) / 2;
+        let (offset_x, offset_y) = ((sw - width) / 2, (sh - height) / 2);
         for row in 0..height {
             for column in 0..width {
                 if !inside_round_area(column, row, width, height, radius) {
                     continue;
                 }
-                let [r, g, b, a] = scaled.get_pixel(offset_x + column, offset_y + row).0;
+                // 老写法是先生成一张 `sw x sh` 的放大图再整数取正中那块：一条长图能先烘出
+                // 880x58666 这种两百 MB 当量的中间图，只为贴进 880x1760 的格子。
+                // 这里把两步合成一步——按同一个取样坐标直接从源图双线性采一刀，
+                // 输出与老写法逐像素相等，那份放大图整个不再存在。
+                let u = ((offset_x + column) as f32 + 0.5) * src.width() as f32 / sw as f32 - 0.5;
+                let v = ((offset_y + row) as f32 + 0.5) * src.height() as f32 / sh as f32 - 0.5;
+                let [r, g, b, a] = sample_bilinear(src, u, v);
                 if a == 0 {
                     continue;
                 }
@@ -502,6 +506,35 @@ pub fn fit_cover(
     ))
 }
 
+/// 按浮点坐标从源图双线性采一个像素。坐标口径与 [`resize`] 完全同一套：
+/// 越界的部分按边上那行/列补，小数部分是权重。贴图路径靠它省去整张中间图。
+fn sample_bilinear(src: &RgbaImage, u: f32, v: f32) -> [u8; 4] {
+    let (sw, sh) = (src.width(), src.height());
+    if sw == 0 || sh == 0 {
+        return [0, 0, 0, 0];
+    }
+    let u = u.clamp(0.0, sw as f32 - 1.0);
+    let v = v.clamp(0.0, sh as f32 - 1.0);
+    let (x0, y0) = (u.floor() as u32, v.floor() as u32);
+    let (x1, y1) = ((x0 + 1).min(sw - 1), (y0 + 1).min(sh - 1));
+    let (fx, fy) = (u - u.floor(), v - v.floor());
+    let p00 = src.get_pixel(x0, y0).0;
+    let p10 = src.get_pixel(x1, y0).0;
+    let p01 = src.get_pixel(x0, y1).0;
+    let p11 = src.get_pixel(x1, y1).0;
+    let lerp = |a: u8, b: u8, c: u8, d: u8| {
+        let top = a as f32 + (b as f32 - a as f32) * fx;
+        let bottom = c as f32 + (d as f32 - c as f32) * fx;
+        (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8
+    };
+    [
+        lerp(p00[0], p10[0], p01[0], p11[0]),
+        lerp(p00[1], p10[1], p01[1], p11[1]),
+        lerp(p00[2], p10[2], p01[2], p11[2]),
+        lerp(p00[3], p10[3], p01[3], p11[3]),
+    ]
+}
+
 /// 双线性缩放。`image` 的 `resize` 走的是 Lanczos3，对头像与封面够用且更慢，
 /// 卡片里同一张图常被贴多次，这里用一次双线性把结果留着复用。
 pub fn resize(src: &RgbaImage, width: u32, height: u32) -> RgbaImage {
@@ -515,29 +548,9 @@ pub fn resize(src: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     let (sw, sh) = (src.width() as f32, src.height() as f32);
     for row in 0..height {
         for column in 0..width {
-            let u = ((column as f32 + 0.5) * sw / width as f32 - 0.5).clamp(0.0, sw - 1.0);
-            let v = ((row as f32 + 0.5) * sh / height as f32 - 0.5).clamp(0.0, sh - 1.0);
-            let (x0, y0) = (u.floor() as u32, v.floor() as u32);
-            let (x1, y1) = (
-                (x0 + 1).min(src.width() - 1),
-                (y0 + 1).min(src.height() - 1),
-            );
-            let (fx, fy) = (u - x0 as f32, v - y0 as f32);
-            let p00 = src.get_pixel(x0, y0).0;
-            let p10 = src.get_pixel(x1, y0).0;
-            let p01 = src.get_pixel(x0, y1).0;
-            let p11 = src.get_pixel(x1, y1).0;
-            let lerp = |a: u8, b: u8, c: u8, d: u8| {
-                let top = a as f32 + (b as f32 - a as f32) * fx;
-                let bottom = c as f32 + (d as f32 - c as f32) * fx;
-                (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8
-            };
-            *out.get_pixel_mut(column, row) = Rgba([
-                lerp(p00[0], p10[0], p01[0], p11[0]),
-                lerp(p00[1], p10[1], p01[1], p11[1]),
-                lerp(p00[2], p10[2], p01[2], p11[2]),
-                lerp(p00[3], p10[3], p01[3], p11[3]),
-            ]);
+            let u = (column as f32 + 0.5) * sw / width as f32 - 0.5;
+            let v = (row as f32 + 0.5) * sh / height as f32 - 0.5;
+            *out.get_pixel_mut(column, row) = Rgba(sample_bilinear(src, u, v));
         }
     }
     out
@@ -648,6 +661,47 @@ mod tests {
         canvas.paste_cover_rounded(0, 0, 50, 50, Corners::none(), &src);
         for (x, y) in [(0u32, 0u32), (49, 0), (0, 49), (49, 49)] {
             assert_eq!(canvas.image.get_pixel(x, y).0[0], 10, "({x},{y}) 没被盖住");
+        }
+    }
+
+    /// 钉住贴图收口的等价性：新写法直接从源图采样，老写法先 `resize` 出放大图再整数取正中那块，
+    /// 两者必须逐像素相等——观感不许因为这次省中间图而变。
+    #[test]
+    fn cover_crop_matches_the_scale_first_formula() {
+        // 有横竖两种长短的源图都要过一遍：盖框时谁是限制边会换
+        for (sw, sh) in [(300u32, 2000u32), (1600, 900), (400, 400), (120, 3000)] {
+            let mut seed = 0x9E37_79B9_u32 ^ (sw * 7919 + sh);
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed >> 11) as u8
+            };
+            let src = ImageBuffer::from_fn(sw, sh, |_, _| Rgba([next(), next(), next(), 255]));
+            let (bw, bh) = (220u32, 300u32);
+
+            // 老写法：整张放大到盖住框，再整数取居中那块
+            let (fw, fh) = fit_cover(sw, sh, bw, bh).unwrap();
+            let scaled = resize(&src, fw, fh);
+            let (ox, oy) = ((fw - bw) / 2, (fh - bh) / 2);
+            let mut old = Canvas::new(bw, bh, Color::rgb(0, 0, 0));
+            for row in 0..bh {
+                for column in 0..bw {
+                    let [r, g, b, a] = scaled.get_pixel(ox + column, oy + row).0;
+                    old.blend(column, row, Color::rgba(r, g, b, a), a);
+                }
+            }
+            let mut new = Canvas::new(bw, bh, Color::rgb(0, 0, 0));
+            new.paste_cover_rounded(0, 0, bw, bh, Corners::none(), &src);
+            for row in 0..bh {
+                for column in 0..bw {
+                    assert_eq!(
+                        old.image.get_pixel(column, row).0,
+                        new.image.get_pixel(column, row).0,
+                        "{sw}x{sh} → {bw}x{bh} 的 ({column},{row}) 两处不等"
+                    );
+                }
+            }
         }
     }
 

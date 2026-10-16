@@ -14,7 +14,7 @@ pub(crate) mod template;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arona::bot::Bot;
@@ -79,7 +79,7 @@ pub struct Post {
 }
 
 impl Post {
-    pub fn dynamic(vals: Vals, draw: Option<Vec<u8>>, images: Vec<Vec<u8>>) -> Post {
+    pub fn dynamic(vals: Vals, draw: Option<Ready>, images: Vec<Ready>) -> Post {
         Post {
             kind: Kind::Dynamic,
             vals,
@@ -87,7 +87,7 @@ impl Post {
         }
     }
 
-    pub fn live(vals: Vals, draw: Option<Vec<u8>>, cover: Option<Vec<u8>>) -> Post {
+    pub fn live(vals: Vals, draw: Option<Ready>, cover: Option<Ready>) -> Post {
         Post {
             kind: Kind::Live,
             vals,
@@ -335,13 +335,40 @@ pub async fn selftest(ctx: &PluginContext) {
 }
 
 /// PNG 的文件头，用来认出「已经是 PNG，不必再动它」
-const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+pub(crate) const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 /// JPEG 的文件头。只比这三字节：紧随其后那一段是段标记，各家写法不一样。
-const JPEG_MAGIC: &[u8] = &[0xff, 0xd8, 0xff];
+pub(crate) const JPEG_MAGIC: &[u8] = &[0xff, 0xd8, 0xff];
 
 /// 一张附件最多交出去这么多字节，超了才压质量（2026-10-05 定的这条线）。
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
+
+/// 归一过、可以直接出门的图片字节。
+///
+/// 造它只走 [`Ready::of`] 这一道门，于是两件事在类型上就发生不了：
+/// * 「WebP 忘了转 PNG 就发出去」——每个出口都得先过 [`attachment`]；
+/// * 「同一张图为 20 个目标各编一遍」。以前渲染时每个目标、每条消息都调一次
+///   [`attachment`]，一张 WebP 就解 20 遍、编 20 遍 PNG（一次就是几十 MB 的临时位图）；
+///   现在一张图一轮只归一一次，之后是引用计数加一。
+#[derive(Clone)]
+pub(crate) struct Ready(Arc<[u8]>);
+
+impl Ready {
+    /// `decoded` 是这张图已经解出来的那一份（画进卡片时必然解过），传进来就不再重解第二遍。
+    pub(crate) fn of(bytes: Vec<u8>, decoded: Option<&image::DynamicImage>) -> Ready {
+        Ready(Arc::from(attachment(bytes, decoded).into_boxed_slice()))
+    }
+
+    /// 交给框架那一份要求的是自有字节：出口处拷一次，之前全程共享
+    pub(crate) fn to_vec(&self) -> Vec<u8> {
+        self.0.to_vec()
+    }
+
+    /// 借出去看：落盘、判格式用，不复制
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
 
 /// 交出去的附件按编码分四支（2026-10-05 从「一律先转 PNG」收窄）：
 /// * PNG 原样交——自己画的卡片都在这一支，重编一遍只是白烧 CPU。
@@ -353,19 +380,26 @@ const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 ///   而解不开也就压不动，所以超大的 GIF 仍然照发——宁可大，也不能让整条推送少一张图。
 ///
 /// 前三支里任何一支只要超过 [`MAX_ATTACHMENT_BYTES`] 都再走一次 [`cap_to`]。
-pub(crate) fn attachment(bytes: Vec<u8>) -> Vec<u8> {
+/// `decoded` 是调用方已经解出来的那一份，有它就不再解第二遍（超线压缩也复用）。
+pub(crate) fn attachment(bytes: Vec<u8>, decoded: Option<&image::DynamicImage>) -> Vec<u8> {
     if bytes.starts_with(PNG_MAGIC) || bytes.starts_with(JPEG_MAGIC) {
-        return cap_to(bytes, MAX_ATTACHMENT_BYTES);
+        return cap_to(bytes, MAX_ATTACHMENT_BYTES, decoded);
     }
-    match image::load_from_memory(&bytes) {
-        Ok(decoded) => {
-            let mut out = Cursor::new(Vec::new());
-            if decoded.write_to(&mut out, ImageFormat::Png).is_err() {
-                return cap_to(bytes, MAX_ATTACHMENT_BYTES);
-            }
-            cap_to(out.into_inner(), MAX_ATTACHMENT_BYTES)
-        }
-        Err(_) => bytes,
+    let repainted = |source: &image::DynamicImage| {
+        let mut out = Cursor::new(Vec::new());
+        source
+            .write_to(&mut out, ImageFormat::Png)
+            .ok()
+            .map(|_| out.into_inner())
+    };
+    let from_memory = || {
+        image::load_from_memory(&bytes)
+            .ok()
+            .and_then(|decoded| repainted(&decoded))
+    };
+    match decoded.and_then(repainted).or_else(from_memory) {
+        Some(done) => cap_to(done, MAX_ATTACHMENT_BYTES, decoded),
+        None => bytes,
     }
 }
 
@@ -373,15 +407,25 @@ pub(crate) fn attachment(bytes: Vec<u8>) -> Vec<u8> {
 ///
 /// 压不住就原样交回去，绝不把图弄丢；也绝不让它比进来时更大。转 JPEG 会去掉透明通道——
 /// 那是一张 10MB 以上的图能不能发出去的取舍，不在常规路径上。
-/// `limit` 收参数是为了让单测拿一个小阈值真把这一支触发到（造一份 10MB 的图当夹具太贵）。
-fn cap_to(bytes: Vec<u8>, limit: usize) -> Vec<u8> {
+/// `limit` 收参数是为了让单测拿一个小阈值真把这一支触发到（造一份 10MB 的图当夹具太贵）；
+/// `decoded` 是上游已经解出来的那一份，省掉重解一遍。
+fn cap_to(bytes: Vec<u8>, limit: usize, decoded: Option<&image::DynamicImage>) -> Vec<u8> {
     if bytes.len() <= limit {
         return bytes;
     }
-    let Ok(decoded) = image::load_from_memory(&bytes) else {
-        return bytes;
+    let loaded;
+    let source = match decoded {
+        Some(found) => found,
+        None => match image::load_from_memory(&bytes) {
+            Ok(any) => {
+                loaded = any;
+                &loaded
+            }
+            // 解不开也就压不动，原样交
+            Err(_) => return bytes,
+        },
     };
-    let rgb = decoded.to_rgb8();
+    let rgb = source.to_rgb8();
     for quality in [80, 60] {
         if let Some(less) = to_jpeg(&rgb, quality)
             && less.len() <= limit
@@ -440,7 +484,7 @@ mod tests {
     fn webp_becomes_png_while_jpeg_leaves_as_it_came() {
         let webp = encoded(ImageFormat::WebP);
         assert!(!webp.starts_with(PNG_MAGIC), "WebP 样例本身就该不是 PNG");
-        let done = attachment(webp);
+        let done = attachment(webp, None);
         assert!(done.starts_with(PNG_MAGIC), "WebP 转完不是 PNG");
         let back = image::load_from_memory(&done).expect("转出来的 PNG 读不回来");
         assert_eq!((back.width(), back.height()), (3, 2), "转完尺寸变了");
@@ -448,7 +492,7 @@ mod tests {
         // A 那一支：JPEG 不再无损重编成 PNG（那能撑到约 2.4 倍，是单条 73MB 的主因之一）
         let jpeg = encoded(ImageFormat::Jpeg);
         assert_eq!(
-            attachment(jpeg.clone()),
+            attachment(jpeg.clone(), None),
             jpeg,
             "JPEG 原件被重编码了，体积那一档又回来了"
         );
@@ -474,7 +518,7 @@ mod tests {
         let big = raw.into_inner();
         assert!(big.len() > limit, "夹具没造够：{} 字节", big.len());
 
-        let done = cap_to(big.clone(), limit);
+        let done = cap_to(big.clone(), limit, None);
         assert!(
             done.starts_with(JPEG_MAGIC),
             "压完不是 JPEG，说明走的是「压不动照原样交」那一支"
@@ -492,7 +536,7 @@ mod tests {
     fn bytes_that_cannot_be_decoded_stay_untouched_even_over_the_cap() {
         let junk = vec![7u8; 40 * 1024];
         assert_eq!(
-            cap_to(junk.clone(), 1024),
+            cap_to(junk.clone(), 1024, None),
             junk,
             "解不开的被改动了——那等于把这张图弄丢"
         );
@@ -513,7 +557,7 @@ mod tests {
             "夹具没过线：{} 字节",
             big.len()
         );
-        let done = attachment(big.clone());
+        let done = attachment(big.clone(), None);
         // 旧口径（一律无损转 PNG）会把它撑到多大——这条是给体积那一档留的对照数，不参与断言
         let mut old_way = Cursor::new(Vec::new());
         image::load_from_memory(&big)
@@ -547,10 +591,14 @@ mod tests {
     #[test]
     fn png_and_undecodable_bytes_pass_through() {
         let png = encoded(ImageFormat::Png);
-        assert_eq!(attachment(png.clone()), png, "已经是 PNG 的被重编码了");
+        assert_eq!(
+            attachment(png.clone(), None),
+            png,
+            "已经是 PNG 的被重编码了"
+        );
         let junk = vec![1, 2, 3, 4, 5];
         assert_eq!(
-            attachment(junk.clone()),
+            attachment(junk.clone(), None),
             junk,
             "解不开的也该交原件，别把图片段清空"
         );
@@ -577,7 +625,7 @@ mod tests {
             "这份 GIF 现在能被解开了——解码器加上了，动图会被压成第一帧，得显式决定"
         );
         assert_eq!(
-            attachment(raw.clone()),
+            attachment(raw.clone(), None),
             raw,
             "动图被改写了，它本该原样交出去"
         );

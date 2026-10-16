@@ -2766,4 +2766,127 @@ mod tests {
             println!("{name} -> {}", file.display());
         }
     }
+
+    /// 内存探针：把「字体常驻多少、素材解码多少、画一张卡峰值多少、drop 之后回落没有」落成数字。
+    /// 要单线程独占进程跑，否则并发用例的存活字节会一起算进常驻：
+    /// `cargo test --release --lib -- --ignored --test-threads=1 --nocapture memprobe`
+    #[test]
+    #[ignore = "要读系统字体，且得独占进程才读得准"]
+    fn memprobe_reports_font_material_and_card_footprint() {
+        use crate::memprobe::{mark, mb, os_footprint, reset_peak};
+        use std::time::Instant;
+
+        let report = |label: &str, bytes: usize| {
+            println!("{label:<26}{:>11}", mb(bytes));
+        };
+        let (ws, peak_ws, private) = os_footprint();
+        println!("---- 常驻与峰值（生产 dll 不含探针，存活字节只统计 Rust 分配器记到的数）----");
+        println!(
+            "开局 工作集 {} / 峰值 {} / 私有 {}",
+            mb(ws),
+            mb(peak_ws),
+            mb(private)
+        );
+
+        let base = mark().live;
+        reset_peak();
+        report("基线常驻", base);
+
+        // 一、字体。bili-image.font 留空时默认候选就是「雅黑常规 + 雅黑粗体」两份一起进内存，
+        // 走的是生产同一条 Typeface::discover("")
+        let start = Instant::now();
+        let face = Typeface::discover("").unwrap();
+        report("字面常驻(常规+粗体)", mark().live - base);
+        println!("字面解析耗时 {:.2} s", start.elapsed().as_secs_f64());
+
+        // 二、素材：一条动态九张正文图，按解码后的位图进素材包
+        let palette = [
+            image::Rgba([214, 96, 96, 255]),
+            image::Rgba([96, 168, 214, 255]),
+            image::Rgba([112, 200, 132, 255]),
+            image::Rgba([224, 176, 88, 255]),
+            image::Rgba([168, 120, 214, 255]),
+            image::Rgba([88, 88, 96, 255]),
+        ];
+        let urls: Vec<String> = (0..9)
+            .map(|index| format!("https://i/{}.png", index))
+            .collect();
+        let before = mark().live;
+        let mut art = Art::default();
+        art.faces.insert(
+            "https://face/1.jpg".to_string(),
+            ImageBuffer::from_pixel(720, 720, image::Rgba([240, 200, 190, 255])),
+        );
+        for (index, url) in urls.iter().enumerate() {
+            art.pictures.insert(
+                url.clone(),
+                ImageBuffer::from_pixel(1080, 1440, palette[index % palette.len()]),
+            );
+        }
+        report("九张 1080x1440 常驻", mark().live - before);
+
+        // 三、画一张九宫格卡：measure 建画布 → 画 → PNG 编码，看这一段压出多高
+        let style = Style {
+            face: face.clone(),
+            ..style("1000w")
+        };
+        let mut grid = sample("这是🧜‍♀️只美人鱼，你敢和她直视10秒吗？❤️");
+        grid.images = urls.clone();
+        reset_peak();
+        let before = mark().live;
+        let png = dynamic_card(&grid, &art, &style, None);
+        report("画九宫格卡峰值增量", mark().peak - before);
+        report("成品 PNG", png.len());
+        drop(png);
+
+        // 四、最坏那张：一条 300x12000 的长图单独成一张卡。
+        // 贴图路径以前要先按「放大到盖住 880x1760 的框」烘一张中间图，
+        // 这一档要 1200x48000，也就是 220 MB 当量；现在直接从源图采样，不再有这一份。
+        let mut long_one = sample("一条长图");
+        long_one.images = vec!["https://i/long.png".to_string()];
+        let before = mark().live;
+        art.pictures.insert(
+            "https://i/long.png".to_string(),
+            ImageBuffer::from_pixel(300u32, 12000u32, image::Rgba([10, 20, 30, 255])),
+        );
+        report("一张长图解码常驻", mark().live - before);
+        reset_peak();
+        let before = mark().live;
+        let png = dynamic_card(&long_one, &art, &style, None);
+        report("画长图卡峰值增量", mark().peak - before);
+        report("成品 PNG", png.len());
+        println!(
+            "老写法这一步还要另烘中间图 {}",
+            mb(880u64 as usize * (12000u64 as usize * 880 / 300) * 4)
+        );
+        drop(png);
+
+        // 五、回落：素材、卡、字面的 Arc 全 drop 后常驻该回到基线。
+        // 回不去的地方就是「用完没释放」——字体那一项在缓存改成立之前一直回不去。
+        drop(art);
+        drop(grid);
+        drop(long_one);
+        drop(style);
+        drop(face);
+        report("drop 之后常驻", mark().live);
+        let (ws, peak_ws, private) = os_footprint();
+        println!(
+            "drop 之后 工作集 {} / 峰值 {} / 私有 {}",
+            mb(ws),
+            mb(peak_ws),
+            mb(private)
+        );
+        println!(
+            "相对基线多出 {}，累计分配流量 {}",
+            mb(mark().live.saturating_sub(base)),
+            mb(mark().cumul)
+        );
+        // 这一条是「用完就释放」的闸：字面、素材、画布全放手之后，存活字节必须回到开局那一档。
+        // 回不去的地方就是有人替进程按着不放（字体缓存长期持有强引用那一阵就是这样）。
+        assert!(
+            mark().live.saturating_sub(base) < 8 * 1024 * 1024,
+            "drop 之后仍常驻 {}，说明有东西没还掉",
+            mb(mark().live.saturating_sub(base))
+        );
+    }
 }

@@ -39,6 +39,15 @@ use crate::store::Store;
 /// `data/bilibili/`），`disabled_plugins` 里也写它。改名等于换一份用户数据，别动。
 pub(crate) const PLUGIN_ID: &str = "bilibili";
 
+/// 内存探针：只在测试构建里编译，用来把"常驻/峰值/用完有没有回落"落成数字，见模块说明
+#[cfg(test)]
+mod memprobe;
+
+/// 探针用的计数分配器。生产 dll 里不存在这一项，所以插件仍然用系统分配器。
+#[cfg(test)]
+#[global_allocator]
+static MEMORY_PROBE: memprobe::Counting = memprobe::Counting;
+
 /// 动态检测任务的登记名（同名任务会被直接替换，配置热重载后照新值重排）
 pub(crate) const DYNAMIC_JOB: &str = "BiliDynamicCheck";
 /// 直播检测任务
