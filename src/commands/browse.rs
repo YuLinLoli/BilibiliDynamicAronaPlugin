@@ -462,10 +462,11 @@ async fn new_body(call: &Call) -> Reply {
         Ok(items) => items,
         Err(reason) => return reply(format!("获取动态失败 {reason}")),
     };
-    if items.is_empty() {
+    let fresh = newest_first(items);
+    if fresh.is_empty() {
         return reply("未找到动态");
     }
-    for dynamic in items.iter().take(count) {
+    for dynamic in fresh.iter().take(count) {
         show(call, &bili, dynamic).await;
     }
     None
@@ -473,7 +474,7 @@ async fn new_body(call: &Call) -> Reply {
 
 /// `/bili video <UID|名字>`：这个 UP 最新一条视频动态。
 /// 原插件走的是 `searchUserVideo`（拿 bvid 画一张视频卡），那个接口现在必须带登录态，
-/// 所以这里改成在动态流里挑第一条"视频"类型的——效果一样，少一次签名依赖。
+/// 所以这里改成在动态流里挑**时间最新**那条"视频"类型的——效果一样，少一次签名依赖。
 pub(crate) async fn video(call: &Call) -> Reply {
     let loading = call.loading().await;
     let answer = video_body(call).await;
@@ -495,7 +496,7 @@ async fn video_body(call: &Call) -> Reply {
         Ok(items) => items,
         Err(reason) => return reply(format!("获取动态失败 {reason}")),
     };
-    match items.iter().find(|item| item.kind == "视频") {
+    match newest_first(items).iter().find(|item| item.kind == "视频") {
         Some(dynamic) => show(call, &bili, dynamic).await,
         None => reply("未找到视频"),
     }
@@ -509,6 +510,19 @@ async fn show(call: &Call, bili: &Arc<Bili>, dynamic: &Dynamic) -> Reply {
         return reply("发送失败，检查这个目标还在不在");
     }
     None
+}
+
+/// 「最新 N 条」的取法：**按时间倒序，不信页序**。
+///
+/// 两个坑叠在一起：`feed/space` 会把**置顶**那条塞在第一格，而这个接口不返回任何置顶标记
+/// （2026-10-16 实测蔚蓝档案官方：第一格 `item_control` 是 null，`id_str` 反而比后面两条小）；
+/// 而 [`parse_feed`](crate::bili::model::parse_feed) 为了检测任务是**按时间升序**排的。
+/// 两头一凑，"取前 N 条"取到的正是整页**最旧**那条——`/bili new 蔚蓝档案` 于是把 9 月的置顶
+/// 抽奖动态当"最新"发了出来，而原插件（`getUserNewDynamic(hasTop=false)`，打的是不含置顶的
+/// 关注流）给的是当天那条。原插件那边不需要这条排序：它拿的列表本身就是最新在前。
+fn newest_first(mut items: Vec<Dynamic>) -> Vec<Dynamic> {
+    items.sort_by(|a, b| b.time.cmp(&a.time).then(b.id.cmp(&a.id)));
+    items
 }
 
 /// `[UP主UID|名字]` 取成一个 uid，取不干净就把原话回出去
@@ -709,5 +723,37 @@ mod tests {
             out.iter().any(|line| line.contains("全部动态")),
             "订了通配档却没在清单里说出来：{out:?}"
         );
+    }
+
+    /// 「最新动态」拿到的必须是**时间最新**那条。真实现场（2026-10-16，蔚蓝档案官方）：
+    /// `feed/space` 把 9 月那条置顶塞在第一格、且不带任何置顶标记（`item_control` 是 null），
+    /// 而 `parse_feed` 为了检测任务是按时间**升序**排的——两头一凑，"取前 N 条"取到的正是最旧那条，
+    /// 用户拿原插件的截图对出来才发现
+    #[test]
+    fn latest_means_newest_not_first_on_the_page() {
+        let item = |id: i64, time: i64| Dynamic {
+            id,
+            uid: 3_493_265_644_980_448,
+            time,
+            ..Default::default()
+        };
+        // 这就是修之前 new_body 拿到的顺序：置顶那条在最前
+        let page = vec![
+            item(1_251_109_903_019_278_338, 1_758_600_000),
+            item(1_259_633_164_731_547_654, 1_760_000_000),
+            item(1_259_648_628_710_965_297, 1_760_003_600),
+        ];
+        let fresh = newest_first(page);
+        assert_eq!(
+            fresh[0].id, 1_259_648_628_710_965_297,
+            "第一条该是当天那条投稿，不是几个月前的置顶"
+        );
+        assert_eq!(
+            fresh.last().unwrap().id,
+            1_251_109_903_019_278_338,
+            "置顶那条该落到末尾"
+        );
+        // 时间相同就按 id 倒序，别把顺序交给随机
+        assert_eq!(newest_first(vec![item(11, 100), item(12, 100)])[0].id, 12);
     }
 }
