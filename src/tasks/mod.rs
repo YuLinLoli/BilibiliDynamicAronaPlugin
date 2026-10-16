@@ -1388,40 +1388,65 @@ fn style_for(
     })
 }
 
-/// 一个「把某个颜色写进主题」的动作——三个覆盖键共用一张表，省掉三段一样的 if
-type ColorSlot = fn(&mut Theme, Color);
-
 /// 主题给的是整套内置配色，`image` 区那三个颜色键是**覆盖**：留空就跟随 `image.theme`。
 /// 认不出的颜色只记一条日志并退回主题值——配色写错不该让这条动态不推。
+///
+/// 照参考实现的键形态（`DynamicImageTheme.kt` + 解析那段 `General.kt:131-150`）：
+/// 透明度**没有独立的键**，它就写在色串自己的八位里（`#B4FFFFFF` 是七成不透明的白）；
+/// 而描边那一键本来就是 `;` 分隔的**颜色串**（`cardOutlineColors: IntArray`），
+/// 彩虹主题那档是七个色——所以覆盖底色与覆盖描边互不牵连，正如参考实现那两个字段本来就是两个。
 fn themed(appearance: &ImageConfig) -> Theme {
     let mut theme = Theme::find(&appearance.theme);
-    let slots: [(&str, &str, ColorSlot); 3] = [
-        ("cardColor", &appearance.card_color, |t, c| t.card_bg = c),
-        (
-            "cardOutlineColor",
-            &appearance.card_outline_color,
-            |t, c| t.card_outline = vec![c],
-        ),
-        (
-            "drawOutlineColor",
-            &appearance.draw_outline_color,
-            |t, c| t.draw_outline = c,
-        ),
-    ];
-    for (key, raw, put) in slots {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        match Color::parse(raw) {
-            Some(found) => put(&mut theme, found),
-            None => arona::runtime::log::warning(format!(
-                "bilibili：image.{key} 认不出来（{raw}），这一项按 {} 主题走",
-                theme.id
-            )),
-        }
+    if let Some(color) = single_color("cardColor", &appearance.card_color) {
+        theme.card_bg = color;
+    }
+    if let Some(stops) = color_stops("cardOutlineColor", &appearance.card_outline_color) {
+        theme.card_outline = stops;
+    }
+    if let Some(color) = single_color("drawOutlineColor", &appearance.draw_outline_color) {
+        theme.draw_outline = color;
     }
     theme
+}
+
+/// 单色键：`#AARRGGBB`／`#RRGGBB`（或三位缩写），留空与写错都返回 `None`＝按主题走
+fn single_color(key: &str, raw: &str) -> Option<Color> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match Color::parse(raw) {
+        Some(color) => Some(color),
+        None => {
+            miscolored(key, raw);
+            None
+        }
+    }
+}
+
+/// 描边键：`;` 分隔的颜色串，任何一段认不出来整键作废。只给一段就是普通单色描边
+fn color_stops(key: &str, raw: &str) -> Option<Vec<Color>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let wanted = raw.split(';').count();
+    let stops: Vec<Color> = raw
+        .split(';')
+        .filter_map(|part| Color::parse(part.trim()))
+        .collect();
+    if stops.len() != wanted {
+        miscolored(key, raw);
+        return None;
+    }
+    Some(stops)
+}
+
+/// 与 [`single_color`]／[`color_stops`] 同一句措辞，免得三个键各报各的
+fn miscolored(key: &str, raw: &str) {
+    arona::runtime::log::warning(format!(
+        "bilibili：image.{key} 认不出来（{raw}），这一项按主题原来的走"
+    ));
 }
 
 /// 字体只发现一次，配置串换了才重新找
@@ -2097,5 +2122,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 三个颜色键各管各的，形态照参考实现：透明度没有独立的键，就写在色串自己的八位里
+    /// （`#AARRGGBB`）；描边那一键本来就是 `;` 分隔的颜色串（`DynamicImageTheme.kt:135`
+    /// 那份 `cardOutlineColors: IntArray`，彩虹主题七个色），所以覆盖底色抹不掉彩虹描边
+    #[test]
+    fn the_color_keys_govern_their_own_slots() {
+        let appearance = ImageConfig {
+            theme: "v3RainbowOutline".into(),
+            card_color: "#80FF0000".into(),
+            card_outline_color: "#FF0000; #00FF00;#0000FF".into(),
+            ..Default::default()
+        };
+        let theme = themed(&appearance);
+        assert_eq!(theme.card_bg, Color::rgba(255, 0, 0, 0x80));
+        assert_eq!(theme.card_outline.len(), 3, "分号串没拆成多色描边");
+        assert_eq!(
+            theme.draw_outline,
+            Theme::find("v3RainbowOutline").draw_outline,
+            "没写的键不该跟着动"
+        );
+    }
+
+    /// 任何一段认不出来就整键作废、只报日志：半条彩虹描边比主题那套更难看
+    #[test]
+    fn an_unreadable_palette_leaves_the_theme_outline_alone() {
+        let expected = Theme::find("v3").card_outline.clone();
+        let appearance = ImageConfig {
+            card_outline_color: "#FF0000;不是颜色".into(),
+            ..Default::default()
+        };
+        assert_eq!(themed(&appearance).card_outline, expected);
     }
 }

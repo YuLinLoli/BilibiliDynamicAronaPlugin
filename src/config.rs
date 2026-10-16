@@ -512,7 +512,7 @@ pub struct ImageConfig {
     pub default_color: String,
     /// 卡片底色（`#AARRGGBB`）：alpha 那两位就是透明度。留空跟随主题
     pub card_color: String,
-    /// 卡片描边色。留空跟随主题
+    /// 卡片描边色：可以是一串 `;` 分隔的颜色（参考实现那档彩虹描边就是七个色）。留空跟随主题
     pub card_outline_color: String,
     /// 图片与角标那圈描边/包边的颜色。留空跟随主题
     pub draw_outline_color: String,
@@ -575,8 +575,8 @@ const IMAGE_COMMENTS: &[(&str, &str)] = &[
     ),
     (
         "cardOutlineColor",
-        "卡片描边色。留空跟随主题；填了会覆盖主题的整条描边，\
-         所以 v3RainbowOutline 那套彩虹描边会退成单色",
+        "卡片描边色，支持多个值自定义渐变，中间用分号分隔（v3RainbowOutline 那档彩虹描边\
+         本身就是七个色）。单个值就是普通单色描边。留空跟随主题",
     ),
     (
         "drawOutlineColor",
