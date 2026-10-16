@@ -58,6 +58,7 @@ dependencies = [
 name = "arona-rs"
 version = "1.1.0"
 dependencies = [
+ "ab_glyph",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -159,7 +160,6 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 name = "bilibili-dynamic-arona-plugin"
 version = "0.1.0"
 dependencies = [
- "ab_glyph",
  "arona-rs",
  "base64 0.22.1",
  "chrono",

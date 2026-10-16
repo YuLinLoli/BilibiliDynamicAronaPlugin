@@ -1,13 +1,9 @@
-//! 字体发现、文本测量与排版。
+//! 文本测量与排版。字面那一层（读字体文件、按 (字符, 字号) 缓存字形、`PxScale` 换算）
+//! 在框架的 [`arona::runtime::text`] 里，本模块只做卡片要的排版：
 //!
-//! 字体优先要框架随包的那一份（`arona::runtime::assets::cjk_font()`，安装目录 `fonts/` 下的
-//! 思源宋体简中），拿不到才退回系统字体目录那串候选，`bili-image.font` 再覆盖两者。
-//! 这样 GUI 与卡片用的是同一套字，观感不随"这台机器装了什么字体"漂；插件也不带字体体积。
-//!
-//! 栅格化走 ab_glyph 的惰性后端：内存里只留字体文件的原始字节（思源宋体常规 11.1 MB、
-//! 粗体 11.5 MB），画到哪个字才解析哪个字，栅格结果进一层有界 LRU。换掉的是 fontdue
-//! 那种"把每个码位的轮廓一次全解析完"的路子——实测同一份雅黑常驻 160.6 MB、思源宋体
-//! 253.5 MB，装载还要 0.3~0.6 s；惰性那一档装载 0.01 s、常驻 48 MB（含文件字节）。
+//! 字体优先要框架随包的那一份（安装目录 `fonts/` 下的思源宋体简中），拿不到才退回系统字体
+//! 目录那串候选，`bili-image.font` 再覆盖两者。这样 GUI 与卡片用的是同一套字，
+//! 观感不随"这台机器装了什么字体"漂；插件也不带字体体积。
 //!
 //! 排版自己算而不用现成的 layout 器：它们按空格断词，中文整段不带空格会被排成一行。
 //! 这里按"中日韩逐字可断、拉丁字母聚成词、`[表情]` 当一个方块"来断行，正好也是 B 站页面的规则。
@@ -15,180 +11,27 @@
 //! 行距由调用方给（原插件是 `字号 + lineSpace` 的固定口径），不取字体自带行高：
 //! 这样四档画质的观感与原插件一致，也不会因为换了字体文件而跳行距。
 
-use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use ab_glyph::{Font as _, Glyph, ScaleFont};
 use image::RgbaImage;
+
+use arona::runtime::text::{self as font, Face};
 
 use super::canvas::{Canvas, Color};
 
 /// B 站表情的写法是 `[名字]`，名字没有超过这个长度的
 const EMOJI_MAX_LEN: usize = 16;
 
-/// 字形缓存的上限。一张卡实际用到的（字符, 字号）组合在几百到一两千这一档，
-/// 4096 条按 1~2 KB 算是几 MB——比全量预解析的 160~250 MB 差两个数量级，
-/// 又足够让一整轮里反复出现的字（标点、数字、"更新维护说明"那类高频词）都命中。
-const GLYPH_CACHE_MAX: usize = 4096;
+/// 卡片要的那一档字面：常规 + 可选粗体，实现全在框架的 [`arona::runtime::text::Typeface`]，
+/// 这一层只是把本插件的排版方法挂上去（`Style.face` 与各处调用都认这个类型）。
+pub struct Typeface(Arc<font::Typeface>);
 
-/// 一次栅格化的位置与大小。字段口径沿用 fontdue 的 `Metrics`：
-/// `xmin`/`ymin` 是相对笔位置（水平笔位、垂直基线）的左边界与**下**边界，y 向上为正。
-/// 画布那一路按这套算落点，换后端时不必动贴图代码。
-#[derive(Clone, Copy, Debug)]
-pub struct GlyphMetrics {
-    pub xmin: i32,
-    pub ymin: i32,
-    pub width: usize,
-    pub height: usize,
-    pub advance_width: f32,
-}
-
-/// 一个栅格好的字形：落点 + 覆盖率位图。缓存里存的就是它，取用只加一次引用
-type Cached = Arc<(GlyphMetrics, Vec<u8>)>;
-
-/// 一份字面：原始字节 + 一层按 (字符, 字号) 计的字形缓存
-pub struct Face {
-    font: ab_glyph::FontArc,
-    glyphs: Mutex<Glyphs>,
-}
-
-/// 有界的字形 LRU。顺序表记"最近用过"，到顶从头上摘最久没用的那一条；
-/// 上限只有几千，线性挪位的开销比栅格化本身低两个数量级
-struct Glyphs {
-    map: HashMap<(char, u32), Cached>,
-    order: VecDeque<(char, u32)>,
-}
-
-impl Glyphs {
-    /// 命中就把这条挪到队尾（口径与 `petpet` 那份素材缓存一致）
-    fn touch(&mut self, key: (char, u32)) {
-        if let Some(at) = self.order.iter().position(|have| *have == key) {
-            self.order.remove(at);
-        }
-        self.order.push_back(key);
-    }
-
-    /// 装满了就先丢最久没被用的那条，再放新的
-    fn put(&mut self, key: (char, u32), done: Cached) {
-        while self.map.len() >= GLYPH_CACHE_MAX && self.map.len() > 1 {
-            match self.order.pop_front() {
-                Some(oldest) => {
-                    self.map.remove(&oldest);
-                }
-                None => break,
-            }
-        }
-        self.map.insert(key, done);
-        self.touch(key);
+impl Typeface {
+    fn face(&self, bold: bool) -> &Face {
+        self.0.face(bold)
     }
 }
-
-impl Face {
-    /// 一个字占多宽（排版只用这一个数，不必解析轮廓）
-    pub fn advance(&self, ch: char, px: f32) -> f32 {
-        let scaled = self.font.as_scaled(self.scale(px));
-        scaled.h_advance(scaled.glyph_id(ch))
-    }
-
-    /// 一个字的覆盖率位图（0~255），加它的落点
-    pub fn rasterize(&self, ch: char, px: f32) -> (GlyphMetrics, Vec<u8>) {
-        let done = self.raster(ch, px);
-        (done.0, done.1.clone())
-    }
-
-    /// 把"字号 = em 的像素数"换成 ab_glyph 要的 `PxScale`。
-    ///
-    /// ab_glyph 的 `PxScale` 基准不是 em，而是 `ascent - descent`（`Font::height_unscaled`），
-    /// 雅黑那一档是 1320 而 unitsPerEm 是 1000——不换算的话所有文字会整体小 24%，
-    /// 卡片版式全乱。换算式两边一约：`scale / height_unscaled == px / units_per_em`。
-    fn scale(&self, px: f32) -> f32 {
-        let em = self.font.units_per_em().unwrap_or(1000.0);
-        if em == 0.0 {
-            return px;
-        }
-        px * self.font.height_unscaled() / em
-    }
-
-    fn raster(&self, ch: char, px: f32) -> Cached {
-        let key = (ch, px.to_bits());
-        let mut cache = self
-            .glyphs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(hit) = cache.map.get(&key) {
-            let hit = Arc::clone(hit);
-            cache.touch(key);
-            return hit;
-        }
-        let done = Arc::new(uncached(&self.font, self.scale(px), ch));
-        cache.put(key, Arc::clone(&done));
-        done
-    }
-}
-
-/// 真正解析一个字的轮廓并铺成覆盖率位图（缓存没命中时才走这里）
-fn uncached(font: &ab_glyph::FontArc, scale: f32, ch: char) -> (GlyphMetrics, Vec<u8>) {
-    let scaled = font.as_scaled(scale);
-    let id = scaled.glyph_id(ch);
-    let advance_width = scaled.h_advance(id);
-    let glyph: Glyph = id.with_scale(scale);
-    let Some(outline) = font.outline_glyph(glyph) else {
-        return (
-            GlyphMetrics {
-                xmin: 0,
-                ymin: 0,
-                width: 0,
-                height: 0,
-                advance_width,
-            },
-            Vec::new(),
-        );
-    };
-    // ab_glyph 的 `px_bounds` 是 **y 向下**的像素包围盒（min.y 是顶边），而画布那一路
-    // 沿用 fontdue 的口径：`ymin` 是相对基线的**下**边界、向上为正。换算就一次取负。
-    let bounds = outline.px_bounds();
-    let (left, right) = (bounds.min.x.floor(), bounds.max.x.ceil());
-    let (top, bottom) = (bounds.min.y.floor(), bounds.max.y.ceil());
-    let width = (right - left).max(0.0) as usize;
-    let height = (bottom - top).max(0.0) as usize;
-    let mut coverage = vec![0u8; width * height];
-    if width > 0 && height > 0 {
-        outline.draw(|x, y, value| {
-            let (x, y) = (x as usize, y as usize);
-            if x < width && y < height {
-                coverage[y * width + x] = (value * 255.0).round().clamp(0.0, 255.0) as u8;
-            }
-        });
-    }
-    (
-        GlyphMetrics {
-            xmin: left as i32,
-            ymin: -(bottom as i32),
-            width,
-            height,
-            advance_width,
-        },
-        coverage,
-    )
-}
-
-/// 一次加载好的常规 + 粗体两份字面
-pub struct Typeface {
-    regular: Face,
-    bold: Option<Face>,
-}
-
-/// 缓存的键：`bili-image.font` 解析出来的（常规, 可选粗体）两把路径
-type FaceKey = (PathBuf, Option<PathBuf>);
-
-/// 按解析出的字体文件组合缓存字面，**只存 Weak**：谁在画谁拿着 Arc，最后一个 Arc 落下后
-/// 这一档字面就整个还给分配器，下一轮真要画时再装载一次（0.01 s 量级，见 [`open`]）。
-/// 惰性后端下这份常驻本来就只是字体文件的字节（思源宋体常规 11.1 MB + 粗体 11.5 MB）
-/// 加一层有界字形缓存，不再是要长期按着的百 MB 轮廓——但"没人用就还"这条口径没变。
-/// 键用解析后的文件路径而不是配置原文：`bili-image.font` 换了写法但指的是同一组文件时，
-/// 不该再存第二份。
-static CACHE: OnceLock<Mutex<HashMap<FaceKey, Weak<Typeface>>>> = OnceLock::new();
 
 /// 一小段同色文字。正文里话题、链接、@ 各占一段，所以排版收 Span 而不是整串文本。
 #[derive(Clone, Copy, Debug)]
@@ -247,37 +90,18 @@ impl EmojiSet {
 impl Typeface {
     /// `configured` 是 `bili-image.font` 的值：字体文件路径，或放在
     /// `config/bilibili/font/` 下的文件名（后缀可省），可用 `;` 再跟一个粗体。
-    /// 留空则按系统候选路径找。找不到任何中文字体就报错，由调用方退回纯文本推送。
+    /// 留空则按三级往下退（随包 `fonts/` → 系统候选）。找不到任何中文字体就报错，
+    /// 由调用方退回纯文本推送。
     ///
-    /// 返回的一直是强引用：拿着它的那一段就保证字面不被换掉。同一档文件组合并发进来时只装载一次，
-    /// 后到的排在锁上等同一份——字体文件那二十来 MB 字节不该在进程里存两份。
+    /// 装载与缓存都在框架那一层：返回的一直是强引用，拿着它的那一段就保证字面不被换掉；
+    /// 同一档文件组合并发进来时只装载一次，后到的排在锁上等同一份。
     pub fn discover(configured: &str) -> Result<Arc<Typeface>, String> {
-        let key = resolve(configured.trim())?;
-        let cache = CACHE.get_or_init(Default::default);
-        let mut map = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(alive) = map.get(&key).and_then(Weak::upgrade) {
-            return Ok(alive);
-        }
-        let face = Arc::new(load(&key)?);
-        // 已经没人用的高级键就地清掉：这张表只留「现在正被拿着的」那几档
-        map.retain(|_, weak| weak.strong_count() > 0);
-        map.insert(key, Arc::downgrade(&face));
-        Ok(face)
-    }
-
-    fn face(&self, bold: bool) -> &Face {
-        if bold {
-            self.bold.as_ref().unwrap_or(&self.regular)
-        } else {
-            &self.regular
-        }
+        let inner = font::Typeface::discover(configured, &[crate::config_dir().join("font")])?;
+        Ok(Arc::new(Typeface(inner)))
     }
 
     fn width_of(&self, text: &str, px: f32, bold: bool) -> f32 {
-        let face = self.face(bold);
-        text.chars().map(|ch| face.advance(ch, px)).sum()
+        self.face(bold).text_width(text, px)
     }
 
     /// 一行文字的宽度（表情按一个方块算）
@@ -670,166 +494,13 @@ fn glyphs(
                 }
             }
         }
-        pen += metrics.advance_width;
-    }
-}
-
-/// 字体候选路径：Windows 上雅黑/黑体，容器里多是 Noto CJK，macOS 用苹方。
-/// 每项是（常规, 可选粗体）；字体文件不打包进 dll，中文字体动辄十几 MB。
-/// 系统里的兜底候选：只在框架随包那份字体也拿不到时才用（安装目录缺 `fonts/`、
-/// 或从源码直接跑）。正常装机路径见 [`resolve`] 里那句 `assets::cjk_font`。
-const CANDIDATES: &[(&str, Option<&str>)] = &[
-    (
-        r"C:\Windows\Fonts\msyh.ttc",
-        Some(r"C:\Windows\Fonts\msyhbd.ttc"),
-    ),
-    (r"C:\Windows\Fonts\simhei.ttf", None),
-    (
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        Some("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
-    ),
-    (
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        None,
-    ),
-    ("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", None),
-    ("/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc", None),
-    ("/System/Library/Fonts/PingFang.ttc", None),
-];
-
-/// 字面取哪一份，三级：`bili-image.font` 指定 > 框架随包那份（安装目录 `fonts/`）> 系统候选。
-/// 粗体用 `;` 或 `,` 跟在后面，同样按这三条规则找。
-///
-/// 中间那级就是 `arona::runtime::assets::cjk_font()`：安装包把思源宋体简中释到运行目录，
-/// GUI 与所有出图插件读的都是同一个出口，观感因此不随"这台机器装了什么字体"漂。
-fn resolve(configured: &str) -> Result<(PathBuf, Option<PathBuf>), String> {
-    let configured = configured.trim();
-    if !configured.is_empty() {
-        let (main, bold) = match configured.split_once([';', ',']) {
-            Some((main, bold)) => (main.trim().to_string(), Some(bold.trim().to_string())),
-            None => (configured.to_string(), None),
-        };
-        let regular = locate(&main).ok_or_else(|| {
-            format!("配置里指定的字体不存在：{main}（写绝对路径，或把字体文件放进 config/bilibili/font/）")
-        })?;
-        let bold = match bold {
-            Some(name) => {
-                Some(locate(&name).ok_or_else(|| format!("配置里指定的粗体字体不存在：{name}"))?)
-            }
-            None => None,
-        };
-        return Ok((regular, bold));
-    }
-    if let Some(bundled) = arona::runtime::assets::cjk_font() {
-        return Ok(bundled);
-    }
-    CANDIDATES
-        .iter()
-        .filter_map(|(regular, bold)| {
-            let path = PathBuf::from(regular);
-            path.is_file().then(|| (path, bold.map(PathBuf::from)))
-        })
-        .next()
-        .ok_or_else(|| {
-            "找不到中文字体：安装目录的 fonts/ 里没有字体文件，系统里也没命中候选。 \
-             可在 config/bilibili/arona.yml 的 bili-image.font 指定字体文件路径"
-                .to_string()
-        })
-}
-
-/// 先当路径试，再当 `config/bilibili/font/` 下的文件名试（`.ttf/.otf/.ttc` 可省）
-fn locate(name: &str) -> Option<PathBuf> {
-    locate_in(name, &crate::config_dir().join("font"))
-}
-
-/// 按配置里那一个词找字体文件：能直接当路径用就用，否则到 `folder` 里按文件名找，
-/// 后缀 `.ttf/.otf/.ttc` 可省（写了路径分隔符的只在 `folder` 内查最后那一段）。
-fn locate_in(name: &str, folder: &Path) -> Option<PathBuf> {
-    let direct = PathBuf::from(name);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let file = Path::new(name).file_name()?;
-    for extension in ["", ".ttf", ".otf", ".ttc"] {
-        let candidate = if extension.is_empty() {
-            folder.join(file)
-        } else {
-            folder.join(format!("{}{extension}", file.to_string_lossy()))
-        };
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// 按解析好的两把路径把字面读进内存。全量预解析字形轮廓要 0.3~0.6 秒，
-/// 所以这条只在 [`CACHE`] 里那档没人拿着时才走（口径见那张表的说明）。
-fn load(paths: &FaceKey) -> Result<Typeface, String> {
-    let (regular, bold) = &paths;
-    let regular = open(regular)?;
-    let bold = bold
-        .as_ref()
-        .filter(|path| path.is_file())
-        .map(|path| open(path))
-        .transpose()?;
-    Ok(Typeface { regular, bold })
-}
-
-/// 读一个字体文件成一份字面。`.ttc` 是字体集合，ab_glyph 取的是第 0 个 face。
-///
-/// 装载只是把文件字节收下来（思源宋体 11.1 MB，实测 0.01 s），字形要等真画到那个字才解析。
-/// 这正是"用完就还"能成立的前提：字面不再是那份要 0.3~0.6 s 才解析得出来、
-/// 一解析就常驻 160~250 MB 的重货，所以缓存换成 Weak 之后，重解析的代价可以忽略。
-fn open(path: &Path) -> Result<Face, String> {
-    let bytes =
-        std::fs::read(path).map_err(|err| format!("读字体 {} 失败：{err}", path.display()))?;
-    match ab_glyph::FontArc::try_from_vec(bytes) {
-        Ok(font) => Ok(Face {
-            font,
-            glyphs: Mutex::new(Glyphs {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-            }),
-        }),
-        Err(err) => Err(format!("字体 {} 解析失败：{err}", path.display())),
+        pen += metrics.advance;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `bili-image.font` 只写文件名时，得能在 `config/bilibili/font/` 下命中（后缀可省）
-    #[test]
-    fn font_name_resolves_inside_the_config_font_folder() {
-        let folder = std::env::temp_dir().join(format!("bili-font-locate-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&folder);
-        std::fs::create_dir_all(&folder).unwrap();
-        let real = folder.join("MyFont.ttf");
-        std::fs::write(&real, b"placeholder").unwrap();
-
-        assert_eq!(
-            locate_in("MyFont", &folder).as_deref(),
-            Some(real.as_path())
-        );
-        assert_eq!(
-            locate_in("MyFont.ttf", &folder).as_deref(),
-            Some(real.as_path())
-        );
-        assert_eq!(
-            locate_in("sub/MyFont", &folder).as_deref(),
-            Some(real.as_path()),
-            "配置里手滑带上目录时，只认最后那一段，不去翻别处"
-        );
-        assert_eq!(locate_in("NoSuchFont", &folder), None);
-        // 给了完整路径就走"当路径试"那一档，跟 folder 无关
-        assert_eq!(
-            locate_in(real.to_string_lossy().as_ref(), &folder).as_deref(),
-            Some(real.as_path())
-        );
-        let _ = std::fs::remove_dir_all(&folder);
-    }
 
     #[test]
     fn emoji_scan_pairs_only_the_nearest_bracket() {
@@ -901,21 +572,24 @@ mod tests {
         );
     }
 
+    /// 配置里那把路径不存在时，报错要走到用户看得见的那句话里（框架那一级给的话术）
     #[test]
     fn missing_font_reports_a_readable_reason() {
-        let error = resolve("Z:\\不存在\\字体.ttf").unwrap_err();
+        let error = match Typeface::discover("Z:\\不存在\\字体.ttf") {
+            Err(error) => error,
+            Ok(_) => panic!("指向一个不存在的字体，该报错而不是默默退回系统候选"),
+        };
         assert!(error.contains("不存在"), "{error}");
     }
 
+    /// 留空时那三级解析归框架，本插件只钉两件事：拿得到一份能画汉字的字面，
+    /// 以及 `config/bilibili/font/` 确实被当成文件名搜索目录传了下去（否则这条会去找系统候选）
     #[test]
-    fn empty_and_plain_paths_both_resolve() {
-        // 本机（Windows）上一定有雅黑；跑在容器里则按候选路径找，两边都不该报"配置指定"的错
-        let (regular, _bold) = resolve("").unwrap();
-        assert!(
-            regular.is_file(),
-            "候选列表里得有一个真存在的字体：{}",
-            regular.display()
-        );
+    fn an_empty_setting_yields_a_face_that_draws_hanzi() {
+        let face = Typeface::discover("").unwrap();
+        assert!(face.face(false).renders('活'), "这份字面必须能画汉字");
+        // 没随包粗体时 face(true) 退回常规，画出来仍该是字而不是 panic
+        assert!(face.face(true).renders('活'));
     }
 
     #[test]
@@ -1004,53 +678,5 @@ mod tests {
         // 收窄到放不下才断，断点是宽度而不是换色
         let tight = face.layout(&spans, 32.0, false, 300.0, None, &EmojiSet::default());
         assert!(tight.rows() > 1, "300 宽的框没断行：{}", tight.rows());
-    }
-
-    /// 字形缓存的两条边界：**不许越过上限**，且越过之后丢的必须是**最久没被用的**那一条。
-    /// 前一版是"到顶整层作废"，多字号的场景会把热字反复清空，这条把它钉死。
-    #[test]
-    fn glyph_cache_stays_bounded_and_drops_the_stalest() {
-        let face = Typeface::discover("").unwrap();
-        let regular = face.face(false);
-        let px = 32.0f32;
-        // 私有区码位当夹具：不会与标点/数字撞上；那些字没有轮廓也没关系，
-        // 缓存记的是"这个字算过了"
-        let pool: Vec<char> = (0..(GLYPH_CACHE_MAX + 40) as u32)
-            .filter_map(|at| char::from_u32(0xE000 + at))
-            .collect();
-        for ch in &pool[..GLYPH_CACHE_MAX] {
-            regular.rasterize(*ch, px);
-        }
-        assert_eq!(
-            regular.glyphs.lock().unwrap().map.len(),
-            GLYPH_CACHE_MAX,
-            "装满时该正好停在上限上"
-        );
-        // 碰一下最早那条，它就该从"最久没用的"变成"最近用过的"
-        regular.rasterize(pool[0], px);
-        for ch in &pool[GLYPH_CACHE_MAX..GLYPH_CACHE_MAX + 10] {
-            regular.rasterize(*ch, px);
-        }
-        let cache = regular.glyphs.lock().unwrap();
-        assert!(
-            cache.map.len() <= GLYPH_CACHE_MAX,
-            "越过了上限：{} > {}",
-            cache.map.len(),
-            GLYPH_CACHE_MAX
-        );
-        assert!(
-            cache.map.contains_key(&(pool[0], px.to_bits())),
-            "刚碰过的那条不该被淘汰"
-        );
-        assert!(
-            !cache.map.contains_key(&(pool[1], px.to_bits())),
-            "最久没用的那条该先走——这条红了就是 LRU 退成了 FIFO"
-        );
-        assert!(
-            cache
-                .map
-                .contains_key(&(pool[GLYPH_CACHE_MAX - 1], px.to_bits())),
-            "最后装进去的那批不该被整层丢掉"
-        );
     }
 }
