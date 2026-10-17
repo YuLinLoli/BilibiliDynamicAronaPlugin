@@ -5,3 +5,7 @@
 /plugins
 *.log
 *.pdb
+
+# 工作流在插件目录根部产出的发布件与发布说明，只在 CI 里有意义
+/NOTES.md
+/*.dll
