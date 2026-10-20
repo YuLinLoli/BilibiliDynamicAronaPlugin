@@ -14,9 +14,13 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 ## 安装
 
 1. 先有 Arona-rs 框架，**符号布局要对上**：这一版插件是布局 10（启动日志里那行
-   `[Arona] 插件 ABI 握手通过: 布局 10，契约 1.0.0` 就是判据）。布局 9 与 10 都还没随任何已发布的标签出去，
-   所以现在只能用框架仓库 HEAD 自己构建的那份宿主；混了版本不会静默出错，装载那一步会直接拒载并说明差在哪。
+   `[Arona] 插件 ABI 握手通过: 布局 10，契约 1.0.0` 就是判据），对应框架 `v1.2.0` 及以上。
+   混了版本不会静默出错，装载那一步会直接拒载并说明差在哪。
 2. 构建：`cargo build --release`，产物 `target/release/bilibili_dynamic_plugin.dll`。
+   Linux 上是 `target/x86_64-unknown-linux-gnu/release/libbilibili_dynamic_plugin.so`
+   ——CI 用 `cargo zigbuild --target x86_64-unknown-linux-gnu.2.17` 把 glibc 钉在 2.17，
+   框架的标准包与 compat 包宿主装的是同一份。两个平台的产物**不能互换**：目标三元组是
+   握手项之一，把 dll 改名叫 `.so` 会被当场拒载。
 3. **框架停着的时候**把 dll 放进框架运行目录的 `plugins/bilibili/`：
 
    ```
