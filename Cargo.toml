@@ -1,6 +1,6 @@
 [package]
 name = "bilibili-dynamic-arona-plugin"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "B 站动态/直播订阅推送插件：插入 Arona-rs 框架运行，命令与配置不依赖任何前置插件"
