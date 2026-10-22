@@ -722,7 +722,7 @@ async fn push_one(
             ));
             continue;
         }
-        let color = state.color.clone().unwrap_or_default();
+        let color = color_of(appearance, state);
         if !colors.contains(&color) {
             colors.push(color);
         }
@@ -797,7 +797,7 @@ async fn push_one(
     // 二、发送。卡片与附件都是引用计数加一，不再按目标各拷一份、各编一遍
     for (key, state) in chosen {
         let card = keys
-            .get(state.color.as_deref().unwrap_or_default())
+            .get(&color_of(appearance, state))
             .and_then(|key| drawn.get(key.as_str()))
             .cloned()
             .flatten();
@@ -981,7 +981,7 @@ async fn broadcast_live(
         if !push::wants_card(ctx, state, push::Kind::Live) {
             continue;
         }
-        let color = state.color.clone().unwrap_or_default();
+        let color = color_of(appearance, state);
         if !colors.contains(&color) {
             colors.push(color);
         }
@@ -1027,7 +1027,7 @@ async fn broadcast_live(
             continue;
         }
         let card = keys
-            .get(state.color.as_deref().unwrap_or_default())
+            .get(&color_of(appearance, state))
             .and_then(|item| drawn.get(item.as_str()))
             .cloned()
             .flatten();
@@ -1694,6 +1694,17 @@ fn image_of(ctx: &PluginContext) -> ImageConfig {
     ctx.config::<ImageConfig>(IMAGE_SECTION).get()
 }
 
+/// 某个目标这一条该用哪套配色。
+///
+/// 唯一规则在 [`ImageConfig::color_for`]：目标自己设过（`/bili color`）就用它，没设过就用
+/// `image.defaultColor`。**画卡、算缓存键、按配色取回画好的卡，三处必须用同一个值**——
+/// 这里返回的是"解析后的实色"而不是 `Option`，正是为了不让空串漏进绘制层：空串在
+/// [`background`](crate::draw::theme::background) 里会走另一套兜底渐变，于是配置写着粉、
+/// 推送却是蓝（手动 `/bili new` 走的是 `color_for`，所以那一路一直是粉的）。
+fn color_of(appearance: &ImageConfig, state: &TargetState) -> String {
+    appearance.color_for(state.color.as_deref())
+}
+
 /// 命令层"先看一眼"：按给定配色把一条动态画成 Post，走的是和真实推送同一条取素材、
 /// 画图、组模板的路径，只是不动水位也不动订阅关系。`color` 给空串就是默认配色。
 pub(crate) async fn preview(
@@ -1856,6 +1867,42 @@ mod tests {
 
     fn marks(rows: &[(i64, i64)]) -> BTreeMap<i64, i64> {
         rows.iter().copied().collect()
+    }
+
+    /// 推送取色必须与 `/bili new` 预览同源。
+    ///
+    /// 现场故障：订阅目标没设过配色，`/bili new` 出的是配置里的粉色，到点推送却是蓝色。
+    /// 原因是推送这边取 `state.color.unwrap_or_default()` 拿到空串，而空串在绘制层
+    /// 另有一套内置渐变。这个用例钉住"空 = 跟随 image.defaultColor"这条规则。
+    #[test]
+    fn push_color_follows_the_configured_default() {
+        let appearance = ImageConfig {
+            default_color: "#fde8ed".to_string(),
+            ..Default::default()
+        };
+        let never_set = TargetState::default();
+        assert_eq!(
+            color_of(&appearance, &never_set),
+            "#fde8ed",
+            "目标没设配色时推送该跟 image.defaultColor 走，不能是空串"
+        );
+
+        let own = TargetState {
+            color: Some("#ff8800".into()),
+            ..Default::default()
+        };
+        assert_eq!(color_of(&appearance, &own), "#ff8800");
+
+        // 全局那一项也空着：落出厂值，仍然不能把空串交给绘制层
+        let blank = ImageConfig {
+            default_color: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            color_of(&blank, &never_set),
+            crate::config::DEFAULT_COLOR,
+            "配置空着时该退到出厂色，而不是让绘制层走另一套兜底渐变"
+        );
     }
 
     #[test]

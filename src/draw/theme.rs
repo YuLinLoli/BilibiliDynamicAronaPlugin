@@ -7,6 +7,7 @@
 //! 给了多个色就逐个原样用（只锁 S/B），不插值。这套规则与原插件一致，用户照老配置迁过来观感不变。
 
 use super::canvas::Color;
+use crate::config::DEFAULT_COLOR;
 
 /// 卡片会用到的整套颜色。原插件这张表里还有 `mainRightBadge` / `subRightBadge` 两档，
 /// 它们指着的那格 2026-10-17 整条不画了（README 第 54 条），字段跟着删——
@@ -132,7 +133,11 @@ pub fn background(
         .collect();
     let parsed: Vec<Color> = parts.iter().filter_map(|part| Color::parse(part)).collect();
     if parsed.is_empty() {
-        return vec![Color::rgb(211, 237, 250), Color::rgb(253, 232, 237)];
+        // 配置空着、或整串一个色都认不出来：退回与 `image.defaultColor` 出厂值**同一档**
+        // 的单色扩三段，不要再手写一套自己的渐变。这里以前是写死的蓝→粉两个停靠点，
+        // 而默认配置走的是 `#d3edfa` 单色扩三段——两套默认值一分家，就出现"配置里写着粉、
+        // 手动预览是粉、推送却是蓝"。
+        return background(DEFAULT_COLOR, hue_step, lock_sb, saturation, brightness);
     }
     if parsed.len() > 1 {
         return parsed
@@ -243,6 +248,22 @@ mod tests {
             assert!(val > 0.99, "明度没锁住：{stop:?}");
         }
         assert_ne!(stops[0], stops[2]);
+    }
+
+    /// 配置空着时必须与"默认配置"给出同一套停靠点：这两套一旦分家，同一个会话
+    /// 手动预览和真推送就会是两种底色（此次修的就是这个）。
+    #[test]
+    fn empty_config_matches_default_color() {
+        assert_eq!(
+            background("", 30.0, true, 0.25, 1.0),
+            background(DEFAULT_COLOR, 30.0, true, 0.25, 1.0),
+            "空配置的兜底又和 defaultColor 的默认值分家了"
+        );
+        // 整串都认不出来时同理：不是"没有颜色"，而是"配置写坏了，按默认色走"
+        assert_eq!(
+            background("不是颜色", 30.0, true, 0.25, 1.0),
+            background(DEFAULT_COLOR, 30.0, true, 0.25, 1.0)
+        );
     }
 
     #[test]

@@ -168,7 +168,7 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 | `quality` | `1000w` | 宽度档位：`800w` / `1000w` / `1200w` / `1500w` |
 | `theme` | `v3` | 绘图主题：`v3` / `v3RainbowOutline` / `v2` |
 | `font` | `""` | 字体文件**绝对路径**，或放在 `config/bilibili/font/` 下的**文件名**（后缀 `.ttf/.otf/.ttc` 可省）；留空先用框架安装包释出的思源宋体，再退回系统候选。后可跟 `;` 指定粗体 |
-| `defaultColor` | `#d3edfa` | 默认主题色，多个用 `;` 分隔构成渐变；单个值按 colorGenerator 自动生成 |
+| `defaultColor` | `#d3edfa` | 默认主题色，多个用 `;` 分隔构成渐变；单个值按 colorGenerator 自动生成。**推送卡片与 `/bili new`、`/bili search`、链接解析预览共用这一项**；某个目标用 `/bili color` 单独设过的，那一份优先 |
 | `cardColor` | `""` | 卡片底色，写 `#AARRGGBB` 或 `#RRGGBB`——**alpha 那两位就是透明度**（原插件 v3 是 `#B4FFFFFF`，约 71% 不透明；内卡透出来的是外卡那一层，不是背景）。留空跟随 `theme` |
 | `cardOutlineColor` | `""` | 卡片描边色，支持多个值自定义渐变、中间用分号分隔（`v3RainbowOutline` 那档彩虹描边本身就是七个色）；单个值就是普通单色描边。留空跟随 `theme` |
 | `drawOutlineColor` | `""` | 图片描边与角标那圈白包边的颜色。留空跟随 `theme`（v3 是 `#FFFFFF`） |
@@ -186,6 +186,8 @@ B 站动态 / 直播 / 番剧订阅推送插件，**Arona-rs 框架**的 dll 插
 
 像素布局内置在 `draw/` 里，这一区只暴露原插件中用户真会改的那几项。
 单个订阅想要别的配色，用 `/bili color` 单独设，不必动这里。
+没单独设过的目标一律跟随 `defaultColor`——**推送与手动预览是同一条规则**，
+不存在"预览一个色、推到群里另一个色"的情况（见文末 2026-10-23 那条）。
 
 ### `bili-template` — 推送模板
 
@@ -1978,6 +1980,42 @@ PNG、各编一遍、各落一次 `DRAW` 缓存，而那张卡谁都收不到。
 `the_draw_verdict_matches_what_render_actually_emits`（判据说要的串，渲染出来必须真带一个图片段；
 说不用的，渲染也不许塞图片段）——两边不一致就是判据在骗人。
 `cargo test --release --lib` 232 passed / 0 failed。
+
+### 2026-10-23：推送与预览的配色终于统一（同一个群不再两张脸色）
+
+现场：`/bili new 蔚蓝档案` 手动画出来的卡是粉色底，到点自动推送的同一类动态却是蓝色底。
+同一个群、同一份配置、同一条动态，手动看一眼和等它自己推过来，底色不一样。
+
+根因是**"目标没设过配色时用哪个"有两条实现**：
+
+| 路径 | 取值 | 实际结果 |
+| --- | --- | --- |
+| `/bili new`、`/bili search`、链接解析 | `state.color` 为空 → `image.defaultColor` | 配置里的粉 |
+| 动态推送（`push_one`）、直播推送（`broadcast_live`） | `state.color.unwrap_or_default()` → **空串** | 蓝 |
+
+空串传到 `draw::theme::background` 会命中它自己的兜底分支——那里写死了一段
+`#d3edfa → #fde8ed` 的蓝→粉两停靠点渐变，而配置项的默认值是 `#d3edfa` **单色扩三段**。
+于是同一个"没配置"的状态在两条路径上落到两套不同的默认值：预览走配置（粉），推送走硬编码（蓝）。
+多出来的代价还有两笔：缓存键里带着配色，所以同一张卡预览画一遍、推送又画一遍，盘上存两份；
+`/bili` 列表把这种目标显示成"配色 默认"，用户改完 `image.defaultColor` 也无从判断到底生效没有。
+
+修法是把取色收成一个入口 `ImageConfig::color_for(own)`：目标自己设过就用它，否则用
+`image.defaultColor`，那一项也空着才退到 `DEFAULT_COLOR`。**五处调用全改走它**——
+预览、搜索/链接解析、`/bili config` 回显，以及推送那两处（含"按配色取回画好的卡"那一步，
+它必须和画卡用的是同一个值，否则会画了却取不到）。同时 `background("")` 的兜底不再另造渐变，
+改为按 `DEFAULT_COLOR` 走单色扩三段；`DEFAULT_COLOR` 也成为 `ImageConfig::default()` 的唯一来源，
+两套默认值在结构上不再有分家的余地。
+
+顺带把两处回显改成能看出实际生效值：`/bili` 列表里没设过的目标显示 `默认(#fde8ed)`，
+`/bili config` 的配色那一格显示 `#fde8ed（跟随全局）` 或 `#ff8800（本目标）`。
+
+守门用例：`push_color_follows_the_configured_default`（推送取色不许再是空串）、
+`color_falls_back_from_target_to_global_to_builtin`（三级回落 + 出厂值与默认配置同源）、
+`empty_config_matches_default_color`（空配置与默认配置必须给出同一组停靠点）、
+`unset_color_shows_the_effective_default`（回显要写出实际色）。
+`cargo test --release` 237 passed / 0 failed。
+
+旧缓存不用手清：缓存键里含配色，键变了自然不再命中，过期清理照旧。
 
 ## 功能面差集收口
 

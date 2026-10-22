@@ -381,9 +381,11 @@ fn target_key(event: &EventContext) -> String {
 
 /// 这个目标的配色（没设过就用全局默认色），跟 `/bili search` 那条路一致
 fn color_of(ctx: &PluginContext, key: &str) -> String {
-    crate::store()
-        .read(|data| data.targets.get(key).and_then(|state| state.color.clone()))
-        .unwrap_or_else(|| ctx.config::<ImageConfig>(IMAGE_SECTION).get().default_color)
+    let own =
+        crate::store().read(|data| data.targets.get(key).and_then(|state| state.color.clone()));
+    ctx.config::<ImageConfig>(IMAGE_SECTION)
+        .get()
+        .color_for(own.as_deref())
 }
 
 /// `at` 档要求消息里 @ 了机器人自己

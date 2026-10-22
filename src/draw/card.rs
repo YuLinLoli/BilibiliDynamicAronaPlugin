@@ -1661,6 +1661,31 @@ mod tests {
         }
     }
 
+    /// 出两张对照图（配置粉 / 出厂蓝）给人眼看"同一张卡只由 defaultColor 决定底色"：
+    /// `cargo test --lib -- --ignored --nocapture color_compare`
+    #[test]
+    #[ignore = "只出图给人眼对比配色，没有断言"]
+    fn color_compare_writes_pink_and_blue() {
+        let dir = std::env::temp_dir().join("bili_color_compare");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, color) in [
+            ("pink", "#fde8ed"),
+            ("blue", crate::config::DEFAULT_COLOR),
+        ] {
+            let mut style = style("1000w");
+            style.background = crate::draw::theme::background(color, 30.0, true, 0.25, 1.0);
+            let mut art = Art::default();
+            art.faces.insert(
+                "https://face/1.jpg".to_string(),
+                RgbaImage::from_pixel(200, 200, image::Rgba([240, 200, 190, 255])),
+            );
+            let item = sample("同一张卡，只换 image.defaultColor：底色应当跟着这一项走。");
+            let bytes = dynamic_card(&item, &art, &style, None);
+            std::fs::write(dir.join(format!("{name}.png")), bytes).unwrap();
+        }
+        println!("{}", dir.display());
+    }
+
     #[test]
     fn a_card_without_any_downloaded_image_still_renders() {
         // 素材一张都没有（下载全失败）也必须出图：不能因为图没下来就不推
@@ -2435,6 +2460,28 @@ mod tests {
         assert!(measure(&item, &Art::default(), &style, None) > 0.0);
     }
 
+    /// 底色真的跟着配置走：只换 `defaultColor`，出图左上角那块像素的冷暖就要翻过来。
+    ///
+    /// 前面几条（`config::color_for`、`theme::background`）测的是取到的**字符串**，
+    /// 这条测的是**画出来的像素**——"手动粉色、推送蓝色"那次故障里，字符串层面两条路
+    /// 各自都自洽，只有把两边都画出来才看得见差别。
+    #[test]
+    fn background_color_comes_from_the_configured_stops() {
+        let corner = |color: &str| {
+            let mut style = style("1000w");
+            style.background = crate::draw::theme::background(color, 30.0, true, 0.25, 1.0);
+            let bytes = dynamic_card(&sample("配色"), &Art::default(), &style, None);
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            // 左上角在卡片以外的留白里，铺的就是整图背景
+            image.get_pixel(2, 2).0
+        };
+        let pink = corner("#fde8ed");
+        let blue = corner(crate::config::DEFAULT_COLOR);
+        assert!(pink[0] > pink[2], "粉色配置的底该偏红，实得 {pink:?}");
+        assert!(blue[2] > blue[0], "出厂蓝配置的底该偏蓝，实得 {blue:?}");
+        assert_ne!(pink, blue, "换配色没换出任何变化，说明背景没跟着配置走");
+    }
+
     /// 给人眼看版式的出图，不做断言：`cargo test --lib -- --ignored --nocapture card_preview`
     /// 三张分别对着原插件 README 的样式预览——九宫格、视频附件、转发嵌套。
     #[test]
@@ -2444,7 +2491,8 @@ mod tests {
         // 右上角那一格 2026-10-17 按用户意见整条不画了（README 第 54 条），这里不再拨右档
         // 背景换成调试配置那一档：defaultColor 单值 #d3edfa 自动扩成三段渐变。
         // 纯白底上根本看不出阴影，人眼验收阴影与徽章融合必须带渐变。
-        style.background = crate::draw::theme::background("#d3edfa", 30.0, true, 0.25, 1.0);
+        style.background =
+            crate::draw::theme::background(crate::config::DEFAULT_COLOR, 30.0, true, 0.25, 1.0);
         let mut art = Art::default();
         art.faces.insert(
             "https://face/1.jpg".to_string(),

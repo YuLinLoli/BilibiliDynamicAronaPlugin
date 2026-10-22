@@ -642,10 +642,11 @@ fn menu(ctx: &PluginContext, session: &Session) -> String {
             ]),
             Item::Color => out.push(format!(
                 "  {head}: 主题色 [{}]",
-                state
-                    .color
-                    .clone()
-                    .unwrap_or_else(|| appearance.default_color.clone())
+                match state.color.as_deref().map(str::trim) {
+                    Some(own) if !own.is_empty() => format!("{own}（本目标）"),
+                    // 跟随全局时把全局那一档写出来，免得"改了 image.defaultColor 却不知道有没有生效"
+                    _ => format!("{}（跟随全局）", appearance.color_for(None)),
+                }
             )),
             Item::Push => out.extend([
                 format!("  {head}: 推送模板"),

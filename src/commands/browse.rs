@@ -288,13 +288,13 @@ pub(crate) fn overview(call: &Call) -> Vec<String> {
         let state = crate::store()
             .read(|data| data.targets.get(key).cloned())
             .unwrap_or_default();
-        out.extend(target_lines(key, uid, &state));
+        out.extend(target_lines(key, uid, &state, &appearance));
     }
     out
 }
 
 /// 一个目标的配置明细。`uid` 为 0 时把所有订阅者的分档都列出来，否则只列那一档。
-fn target_lines(key: &str, uid: i64, state: &TargetState) -> Vec<String> {
+fn target_lines(key: &str, uid: i64, state: &TargetState, appearance: &ImageConfig) -> Vec<String> {
     let mut out = vec![format!(
         "[{key}] {}订阅 {} 个 UP主、{} 部番剧｜配色 {}｜静音 {}",
         if state.name.is_empty() {
@@ -304,7 +304,12 @@ fn target_lines(key: &str, uid: i64, state: &TargetState) -> Vec<String> {
         },
         state.subs.len(),
         state.seasons.len(),
-        state.color.clone().unwrap_or_else(|| "默认".to_string()),
+        match state.color.as_deref().map(str::trim) {
+            Some(own) if !own.is_empty() => own.to_string(),
+            // 没设过就是跟随全局。把实际生效的色一并写出来——只写"默认"的话，用户改了
+            // `image.defaultColor` 也无从判断这个群到底会出哪种底色
+            _ => format!("默认({})", appearance.color_for(None)),
+        },
         if state.muted { "是" } else { "否" }
     )];
     out.push(format!(
@@ -533,14 +538,13 @@ fn one_uid(raw: &str) -> Result<i64, String> {
 /// 当前会话的目标键，以及它自己那一份配色（没设过就用全局默认色）
 fn local_target(call: &Call) -> (String, String) {
     let key = call.current_key();
-    let color = crate::store()
-        .read(|data| data.targets.get(&key).and_then(|state| state.color.clone()))
-        .unwrap_or_else(|| {
-            call.ctx()
-                .config::<ImageConfig>(IMAGE_SECTION)
-                .get()
-                .default_color
-        });
+    let own =
+        crate::store().read(|data| data.targets.get(&key).and_then(|state| state.color.clone()));
+    let color = call
+        .ctx()
+        .config::<ImageConfig>(IMAGE_SECTION)
+        .get()
+        .color_for(own.as_deref());
     (key, color)
 }
 
@@ -703,17 +707,40 @@ mod tests {
         let mut state = TargetState::default();
         state.subs.insert(123);
         state.muted = true;
-        let out = target_lines("g1", 0, &state);
+        let out = target_lines("g1", 0, &state, &ImageConfig::default());
         assert!(out[0].contains("[g1]"));
         assert!(out[0].contains("静音 是"));
         assert!(out.iter().any(|line| line.contains("模板覆盖")));
+    }
+
+    /// 没设过配色的目标要显示"默认(实际生效色)"：只写"默认"的话，用户改完
+    /// `image.defaultColor` 也判断不出这个群的推送到底会不会变
+    #[test]
+    fn unset_color_shows_the_effective_default() {
+        let appearance = ImageConfig {
+            default_color: "#fde8ed".to_string(),
+            ..Default::default()
+        };
+        let state = TargetState::default();
+        let out = target_lines("g1", 0, &state, &appearance);
+        assert!(
+            out[0].contains("默认(#fde8ed)"),
+            "没设配色时该把跟随的全局色写出来：{out:?}"
+        );
+
+        let own = TargetState {
+            color: Some("#ff8800".into()),
+            ..Default::default()
+        };
+        let out = target_lines("g1", 0, &own, &appearance);
+        assert!(out[0].contains("配色 #ff8800"), "{out:?}");
     }
 
     #[test]
     fn a_wildcard_slot_is_spelled_out() {
         let mut state = TargetState::default();
         state.subs.insert(0);
-        let out = target_lines("f1", 0, &state);
+        let out = target_lines("f1", 0, &state, &ImageConfig::default());
         assert!(
             out.iter().any(|line| line.contains("全部动态")),
             "订了通配档却没在清单里说出来：{out:?}"

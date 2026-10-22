@@ -526,6 +526,13 @@ pub struct ImageConfig {
     pub footer: FooterConfig,
 }
 
+/// `image.defaultColor` 的出厂值。
+///
+/// 配置项的默认值、绘图背景在"配置空着"时的兜底、以及 [`ImageConfig::color_for`] 的最后
+/// 一层回落，**都指这一处**。以前绘图那边另写了一份字面量（一段蓝→粉的两停靠点渐变），
+/// 与这里的 `#d3edfa` 单色扩三段分家，于是同一个群能看到两种底色——见 `color_for` 的说明。
+pub const DEFAULT_COLOR: &str = "#d3edfa";
+
 impl Default for ImageConfig {
     fn default() -> Self {
         ImageConfig {
@@ -533,7 +540,7 @@ impl Default for ImageConfig {
             quality: "1000w".into(),
             theme: "v3".into(),
             font: String::new(),
-            default_color: "#d3edfa".into(),
+            default_color: DEFAULT_COLOR.into(),
             card_color: String::new(),
             card_outline_color: String::new(),
             draw_outline_color: String::new(),
@@ -541,6 +548,29 @@ impl Default for ImageConfig {
             badge_enable: BadgeEnable::default(),
             color_generator: ColorGenerator::default(),
             footer: FooterConfig::default(),
+        }
+    }
+}
+
+impl ImageConfig {
+    /// 这个目标该用哪套主题色。
+    ///
+    /// 规则只有一条：目标自己设过（`/bili color`）就用它，没设过就用 `image.defaultColor`，
+    /// 连那一项也空着才退到 [`DEFAULT_COLOR`]。
+    ///
+    /// **凡是"取某个目标/会话的配色"都要走这里**：`/bili new` 预览、`/bili search`、
+    /// 链接解析、`/bili config` 的回显，以及动态与直播两条推送任务。以前推送那两处写的是
+    /// `state.color.unwrap_or_default()`，拿到的是**空串**，而空串在
+    /// [`background`](crate::draw::theme::background) 里另有一套内置渐变——配置里写着粉、
+    /// 手动预览是粉、真推送出去却是蓝，同一条动态两张脸色。取色规则收在这里之后，
+    /// 连缓存键也跟着一致了（以前预览与推送各画一张、各存一份盘）。
+    pub fn color_for(&self, own: Option<&str>) -> String {
+        if let Some(own) = own.map(str::trim).filter(|own| !own.is_empty()) {
+            return own.to_string();
+        }
+        match self.default_color.trim() {
+            "" => DEFAULT_COLOR.to_string(),
+            global => global.to_string(),
         }
     }
 }
@@ -566,7 +596,8 @@ const IMAGE_COMMENTS: &[(&str, &str)] = &[
     ),
     (
         "defaultColor",
-        "默认主题色，支持多个值自定义渐变，中间用分号分隔，例: #fde8ed;#fde8ed；单个值会自动生成渐变色",
+        "默认主题色，支持多个值自定义渐变，中间用分号分隔，例: #fde8ed;#fde8ed；单个值会自动生成渐变色。\
+         推送卡片与 /bili new 预览共用这一项；某个群/好友用 /bili color 单独设过的，以那一份为准",
     ),
     (
         "cardColor",
@@ -983,6 +1014,25 @@ mod tests {
         // 这两条键都得在配置模板里有注释，否则用户看不见有这个东西
         assert!(ImageConfig::comment("drawEnable").is_some());
         assert!(ImageConfig::comment("badgeEnable.left").is_some());
+    }
+
+    /// 取色规则只有一条：自己的优先，没有就用全局，全局空着才落到出厂值。
+    /// 这条规则以前只被命令侧遵守，推送侧拿的是空串，于是同一张动态在 `/bili new`
+    /// 里是粉的、推送出去是蓝的。
+    #[test]
+    fn color_falls_back_from_target_to_global_to_builtin() {
+        let mut appearance = ImageConfig::default();
+        // 目标自己设了：谁的配置都不该盖过它
+        assert_eq!(appearance.color_for(Some("#ff8800")), "#ff8800");
+        // 目标没设：跟全局走
+        appearance.default_color = "#fde8ed".to_string();
+        assert_eq!(appearance.color_for(None), "#fde8ed");
+        assert_eq!(appearance.color_for(Some("   ")), "#fde8ed");
+        // 全局也空着（用户把这一项删了）：落到出厂值，而不是把空串交给绘制层
+        appearance.default_color = String::new();
+        assert_eq!(appearance.color_for(None), DEFAULT_COLOR);
+        // 出厂值本身也得是配置默认值，两套默认值分家就是这次这个毛病
+        assert_eq!(ImageConfig::default().default_color, DEFAULT_COLOR);
     }
 
     /// 序列化回来的键名必须是 camelCase，否则老用户的配置抄不过来
