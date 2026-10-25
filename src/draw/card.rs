@@ -1668,10 +1668,7 @@ mod tests {
     fn color_compare_writes_pink_and_blue() {
         let dir = std::env::temp_dir().join("bili_color_compare");
         std::fs::create_dir_all(&dir).unwrap();
-        for (name, color) in [
-            ("pink", "#fde8ed"),
-            ("blue", crate::config::DEFAULT_COLOR),
-        ] {
+        for (name, color) in [("pink", "#fde8ed"), ("blue", crate::config::DEFAULT_COLOR)] {
             let mut style = style("1000w");
             style.background = crate::draw::theme::background(color, 30.0, true, 0.25, 1.0);
             let mut art = Art::default();
@@ -1694,6 +1691,35 @@ mod tests {
         let back = image::load_from_memory(&bytes).unwrap();
         assert_eq!(back.width(), 1000);
         assert!(back.height() > 200, "总高异常：{}", back.height());
+    }
+
+    /// 正文必须真的进排版：同一张卡多一段正文就得多占高度。
+    ///
+    /// 用户实测的 bug 是图文动态只画出标题（正文在 `major.opus.summary` 里被丢了），
+    /// 解析层已经把两段拼起来（`model::opus_body`），这里钉住"它确实走到了画布上"。
+    #[test]
+    fn an_opus_body_makes_the_card_taller() {
+        let art = Art::default();
+        let style = style("1000w");
+        let title = "关于《蔚蓝档案》国服运营安排的说明";
+        let body =
+            format!("{title}\n\n老师，关于国服后续的运营安排，我们整理了几点说明，详见下方长图。");
+
+        // text 与 nodes 都要改：绘图优先用 nodes，只改 text 是测不出东西的
+        let mut titled = sample("");
+        titled.text = title.to_string();
+        titled.nodes = vec![Node::Text(title.to_string())];
+
+        let mut with_body = sample("");
+        with_body.text = body.clone();
+        with_body.nodes = vec![Node::Text(body)];
+
+        let only_title = measure(&titled, &art, &style, None);
+        let full = measure(&with_body, &art, &style, None);
+        assert!(
+            full > only_title + 40.0,
+            "正文没进排版：只有标题 {only_title}，带正文 {full}"
+        );
     }
 
     #[test]

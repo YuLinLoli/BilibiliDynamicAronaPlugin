@@ -372,6 +372,64 @@ fn major_body(major: &Value) -> String {
     String::new()
 }
 
+/// 图文动态（OPUS）的正文。
+///
+/// B 站把这类动态拆成两段：`opus.title`（标题）和 `opus.summary.text`（正文）。
+/// [`major_body`] 的字段顺序是 title 优先，于是正文整段被丢掉，卡片上只剩标题一行
+/// —— 用户实测到的那张"只有标题"的图就是这么来的（动态 1263124318123982870）。
+///
+/// 所以这里单独处理 OPUS：标题与正文都取，标题在前。
+fn opus_body(major: &Value) -> Option<String> {
+    let opus = at(major, &["opus"])?;
+    let title = text(opus, &["title"]).unwrap_or_default();
+    let summary = text(opus, &["summary", "text"]).unwrap_or_default();
+    join_heading(&title, &summary)
+}
+
+/// 标题 + 正文拼成一段。
+///
+/// 重复时不写两遍：B 站经常让 `summary.text` 以标题开头（甚至整段等于标题），
+/// 直接拼会画成"标题 / 标题正文"两行一样的字。
+fn join_heading(title: &str, body: &str) -> Option<String> {
+    let title = title.trim();
+    let body = body.trim();
+    match (title.is_empty(), body.is_empty()) {
+        (false, false) if body.starts_with(title) => Some(body.to_string()),
+        (false, false) => Some(format!("{title}\n\n{body}")),
+        (false, true) => Some(title.to_string()),
+        (true, false) => Some(body.to_string()),
+        (true, true) => None,
+    }
+}
+
+/// 正文取哪一份。
+///
+/// 两条来源：`module_dynamic.desc.text`（普通动态的正文）与 `major.opus`（图文动态的
+/// 标题 + 摘要）。同一条动态两边都可能有内容，而**图文动态的 `desc` 经常只放标题一句**
+/// —— 只认 desc 就画成"只有标题"，正是用户实测到的那张图（动态 1263124318123982870）。
+///
+/// 两边都有就取字数更多的那份：正文总是内容更长的那一个，不必猜。按字符数比而不是
+/// 字节数——中文一个字三字节，拿字节比会让短的英文正文赢过长的中文正文。
+fn body_text(dynamic: &Value, major: &Value, nodes: &[Node]) -> String {
+    let desc = text(dynamic, &["desc", "text"]).unwrap_or_default();
+    let opus = opus_body(major).unwrap_or_default();
+    let picked = if opus.chars().count() >= desc.chars().count() {
+        opus
+    } else {
+        desc
+    };
+    if !picked.trim().is_empty() {
+        return picked;
+    }
+    // 两个来源都空：退回分段拼接，最后才是 major 里那些附属字段
+    let joined = nodes.iter().map(Node::text).collect::<Vec<_>>().join("");
+    if joined.is_empty() {
+        major_body(major)
+    } else {
+        joined
+    }
+}
+
 /// 解析 major 里的直播卡片。LIVE_RCMD 的 content 是一段被字符串化的 JSON，要二次解析。
 ///
 /// 2026-09-30 抓的真实包：`live_play_info` 的键是 `room_id/uid/title/area_name/parent_area_name/
@@ -660,16 +718,7 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
     let origin = item.get("orig").and_then(parse_item).map(Box::new);
     let nodes = parse_nodes(dynamic);
     let extra = parse_additional(dynamic);
-    let body = text(dynamic, &["desc", "text"])
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            let joined = nodes.iter().map(Node::text).collect::<Vec<_>>().join("");
-            if joined.is_empty() {
-                major_body(&major)
-            } else {
-                joined
-            }
-        });
+    let body = body_text(dynamic, &major, &nodes);
     let label = text(author, &["label"]).unwrap_or_default();
     // 内容看不到时 B 站只给一句话：屏蔽挂在 blocked.hint_text，已删除挂在 none.tips
     let blocked =
@@ -1053,8 +1102,70 @@ mod tests {
             parsed.images,
             vec!["https://i0.hdslb.com/opus.png".to_string()]
         );
-        // desc 没了就从 opus 的标题/摘要兜底，正文不能是空的
-        assert!(!parsed.text.is_empty());
+        // 正文在 opus 里是「标题 + 摘要」两段：只取标题会画成"只有标题"（用户实测过）
+        assert_eq!(parsed.text, "♡立绘公开♡\n\n看看！我很可爱");
+    }
+
+    /// 摘要本身就以标题开头时，不许画成两行一样的字
+    #[test]
+    fn opus_does_not_repeat_the_heading() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["major"] = json!({
+            "type": "MAJOR_TYPE_OPUS",
+            "opus": {"title": "维护公告", "summary": {"text": "维护公告：今晚 23 点停机"}}
+        });
+        item["modules"]["module_dynamic"]["desc"] = Value::Null;
+        let parsed = parse_item(&item).unwrap();
+        assert_eq!(parsed.text, "维护公告：今晚 23 点停机");
+    }
+
+    /// 只有摘要没有标题时，正文就是摘要
+    #[test]
+    fn opus_without_a_title_still_has_its_body() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["major"] = json!({
+            "type": "MAJOR_TYPE_OPUS",
+            "opus": {"title": "", "summary": {"text": "只有正文的一段话"}}
+        });
+        item["modules"]["module_dynamic"]["desc"] = Value::Null;
+        let parsed = parse_item(&item).unwrap();
+        assert_eq!(parsed.text, "只有正文的一段话");
+    }
+
+    /// 普通文字动态走 desc，别被 major 里那些附属字段抢走
+    #[test]
+    fn desc_wins_when_it_is_the_longer_one() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["desc"] =
+            json!({"text": "普通动态的正文，这一句明显比 major 里那几个字段都长，应当以它为准。"});
+        item["modules"]["module_dynamic"]["major"] = json!({"type": "MAJOR_TYPE_OPUS", "opus": {"title": "短标题", "summary": {"text": "短摘要"}}});
+        let parsed = parse_item(&item).unwrap();
+        assert_eq!(
+            parsed.text,
+            "普通动态的正文，这一句明显比 major 里那几个字段都长，应当以它为准。"
+        );
+    }
+
+    /// 图文动态的 `desc` 常常只放标题一句，正文在 `opus.summary` 里。
+    /// 只认 desc 就会画成"只有标题"——这就是用户报的那张图。
+    #[test]
+    fn a_short_desc_does_not_hide_the_opus_body() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["desc"] =
+            json!({"text": "关于《蔚蓝档案》国服运营安排的说明"});
+        item["modules"]["module_dynamic"]["major"] = json!({
+            "type": "MAJOR_TYPE_OPUS",
+            "opus": {
+                "title": "关于《蔚蓝档案》国服运营安排的说明",
+                "summary": {"text": "关于《蔚蓝档案》国服运营安排的说明\n\n老师，我们整理了几点说明，详见长图。"}
+            }
+        });
+        let parsed = parse_item(&item).unwrap();
+        assert!(
+            parsed.text.contains("老师，我们整理了几点说明"),
+            "正文被 desc 里那行标题顶掉了：{}",
+            parsed.text
+        );
     }
 
     /// 专栏要落成一张附属卡 + 卡上方那一格「专栏」，封面不许再往正文里塞一份。
