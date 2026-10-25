@@ -1545,9 +1545,15 @@ fn card_key(
     appearance: &ImageConfig,
 ) -> String {
     let seen = translation.map_or(String::new(), |done| done.text.clone());
+    // 插件版本**必须**参与 digest：卡片是按内容算键的，而内容怎么解析、怎么画是版本决定的。
+    // 少了这一项，升级后同一条动态还会命中上一版画好的图（正文丢失那种 bug 改完也看不出来），
+    // 用户只能手动去删 data/bilibili/image/DRAW/ 或者等 7 天过期。
     let digest = format!(
         "{:x}",
-        md5::compute(format!("{appearance:?}|{link}|{seen}"))
+        md5::compute(format!(
+            "{version}|{appearance:?}|{link}|{seen}",
+            version = env!("CARGO_PKG_VERSION")
+        ))
     );
     let stamp = &digest[..8];
     format!("{bucket}/{id}/{color}#{stamp}")
@@ -1863,6 +1869,29 @@ mod tests {
             id,
             ..Default::default()
         }
+    }
+
+    /// 卡片缓存键必须带上插件版本。
+    ///
+    /// 键是内容的指纹：同样的动态、同样的配色就算同一个键。而"同样的内容画成什么样"
+    /// 是版本决定的——正文丢了这种 bug 修完，若键里没有版本，升级后照样命中上一版
+    /// 画好的旧图，用户只能手动删 DRAW 缓存或者干等过期。
+    #[test]
+    fn card_cache_key_carries_the_plugin_version() {
+        let appearance = crate::config::ImageConfig::default();
+        let link = "https://t.bilibili.com/123";
+        let key = card_key("dyn", "123", "#ffffff", link, None, &appearance);
+        let expected = format!(
+            "{:x}",
+            md5::compute(format!(
+                "{}|{appearance:?}|{link}|",
+                env!("CARGO_PKG_VERSION")
+            ))
+        );
+        assert!(
+            key.ends_with(&expected[..8]),
+            "缓存键里没有版本号（升级后会继续用旧卡）：{key}"
+        );
     }
 
     fn marks(rows: &[(i64, i64)]) -> BTreeMap<i64, i64> {
