@@ -356,6 +356,9 @@ pub(crate) const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 
 /// JPEG 的文件头。只比这三字节：紧随其后那一段是段标记，各家写法不一样。
 pub(crate) const JPEG_MAGIC: &[u8] = &[0xff, 0xd8, 0xff];
 
+/// GIF 的文件头（`GIF87a` / `GIF89a` 都以这四字节开头）
+pub(crate) const GIF_MAGIC: &[u8] = b"GIF8";
+
 /// 一张附件最多交出去这么多字节，超了才压质量（2026-10-05 定的线，2026-10-26 按用户要求抬到 20 MB）。
 ///
 /// 这条线是「多大就不再压」的界线，不是「多大就发不出去」：真正的对端上限由 OneBot 实现决定，
@@ -395,12 +398,19 @@ impl Ready {
 ///   打崩对端那一轮的主因之一，而对端本来就认 JPEG。
 /// * WebP 这类实现端不认的才转成 PNG（`cache.downloadOriginal=false` 时先要 `…@720w.webp`，
 ///   编码不能跟着运气走）。
-/// * 解不开的原样交：动图保住（见 `a_gif_stays_untouched_because_there_is_no_gif_decoder`），
-///   而解不开也就压不动，所以超大的 GIF 仍然照发——宁可大，也不能让整条推送少一张图。
+/// * 解不开的原样交（附件照发，不能因为解不动就少一张图）；
+/// * **GIF 原样交**：动图保住动画，见 `a_gif_stays_untouched_even_though_the_decoder_is_now_present`。
 ///
 /// 前三支里任何一支只要超过 [`MAX_ATTACHMENT_BYTES`] 都再走一次 [`cap_to`]。
 /// `decoded` 是调用方已经解出来的那一份，有它就不再解第二遍（超线压缩也复用）。
 pub(crate) fn attachment(bytes: Vec<u8>, decoded: Option<&image::DynamicImage>) -> Vec<u8> {
+    // GIF **原样交**：解码只拿得到第一帧，一转 PNG 动图就变成一张静态图。
+    // 这里必须显式短路——`image` 的 `gif` feature 是后来为了"卡片里能画出第一帧"加上的，
+    // 加之前 GIF 碰巧走"解不开交原件"那一支，动画是蒙对的；加上之后若不挡这一下，
+    // 它就会落进下面那条 `repainted`，动图全变静态。
+    if bytes.starts_with(GIF_MAGIC) {
+        return bytes;
+    }
     if bytes.starts_with(PNG_MAGIC) || bytes.starts_with(JPEG_MAGIC) {
         return cap_to(bytes, MAX_ATTACHMENT_BYTES, decoded);
     }
@@ -624,24 +634,42 @@ mod tests {
     }
 
     /// 一份最小的真 GIF：魔数 + 逻辑屏幕描述符 + 一个图像块 + trailer
+    /// 造一张**真** GIF（两帧：红 / 蓝）。
+    ///
+    /// 之前那份是手写魔数拼的最小块，解码器并不认——它适合当"解不开"的负样本，
+    /// 不适合验"解码器在不在"。要用编码器出一份合法的。
     fn gif() -> Vec<u8> {
-        let mut v = b"GIF89a".to_vec();
-        v.extend_from_slice(&[3, 0, 2, 0, 0, 0, 0]);
-        v.extend_from_slice(&[0x2C, 0, 0, 0, 0, 3, 0, 2, 0, 0x00]);
-        v.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00]);
-        v.push(0x3B);
-        v
+        let mut out = Cursor::new(Vec::new());
+        let frames = [
+            image::Frame::new(image::RgbaImage::from_pixel(
+                4,
+                4,
+                image::Rgba([255, 0, 0, 255]),
+            )),
+            image::Frame::new(image::RgbaImage::from_pixel(
+                4,
+                4,
+                image::Rgba([0, 0, 255, 255]),
+            )),
+        ];
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames(frames)
+            .expect("造一张合法 GIF 不该失败");
+        out.into_inner()
     }
 
-    /// 动图原样交这条钉子。前半先确言「这份样例现在解不开」——`Cargo.toml` 没给 `image` 装 gif 解码器，
-    /// 所以 GIF 走的是「解不开交原件」那一支，动画保住。哪天有人把 `gif` feature 加上，
-    /// 前半会红，逼着他显式决定「要不要把动图压成第一帧」，而不是让转码悄悄吃掉动画。
+    /// 动图原样交这条钉子。
+    ///
+    /// `image` 的 `gif` feature 是后来为了「卡片里能画出第一帧」加上的：
+    /// 加之前 GIF 碰巧走"解不开交原件"那一支，动画是蒙对的；加上之后若不显式短路，
+    /// 它就会落进 `repainted`，动图全变静态 PNG。所以这条现在钉两件事：
+    /// 解码器在（画板能用），出口仍是原件（动画不丢）。
     #[test]
-    fn a_gif_stays_untouched_because_there_is_no_gif_decoder() {
+    fn a_gif_stays_untouched_even_though_the_decoder_is_now_present() {
         let raw = gif();
         assert!(
-            image::load_from_memory(&raw).is_err(),
-            "这份 GIF 现在能被解开了——解码器加上了，动图会被压成第一帧，得显式决定"
+            image::load_from_memory(&raw).is_ok(),
+            "GIF 解不开了——卡片又会退回那个 32x18 的占位框"
         );
         assert_eq!(
             attachment(raw.clone(), None),

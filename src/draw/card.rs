@@ -1722,6 +1722,40 @@ mod tests {
         );
     }
 
+    /// GIF 要按**真实尺寸**排版，不能退回那个 32x18 的占位框。
+    ///
+    /// 用户实测：卡片里动图只剩左下角一个小小的「动图」标。原因是 `image` 没开 gif
+    /// feature，`decode()` 的 `into_dimensions()` 失败，`Art::picture` 拿不到图，
+    /// 于是按默认 16:9 算出 32x18 一格。这条断言能把"退回占位"直接抓出来：
+    /// 800x600 的动图，铺满后图区有几百像素高，而占位框只有 18。
+    #[test]
+    fn a_gif_is_laid_out_at_its_real_size_not_the_placeholder() {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::codecs::gif::GifEncoder::new(&mut out)
+            .encode_frames([image::Frame::new(image::RgbaImage::from_pixel(
+                800,
+                600,
+                image::Rgba([10, 20, 30, 255]),
+            ))])
+            .expect("造一张合法 GIF 不该失败");
+        let raw = out.into_inner();
+        // 与生产同一解码口（`tasks::decode` 最后也是 `load_from_memory`）
+        let decoded = image::load_from_memory(&raw).expect("GIF 应当能解码");
+
+        let mut art = Art::default();
+        art.pictures
+            .insert("https://x/1.gif".to_string(), decoded.to_rgba8());
+        let mut dynamic = sample("一段正文");
+        dynamic.images = vec!["https://x/1.gif".to_string()];
+
+        let style = style("1000w");
+        let height = measure(&dynamic, &art, &style, None);
+        assert!(
+            height > 500.0,
+            "GIF 被画成占位小框了（卡片总高只有 {height}，图区应有几百像素）"
+        );
+    }
+
     #[test]
     fn higher_quality_makes_a_taller_image() {
         let small = measure(

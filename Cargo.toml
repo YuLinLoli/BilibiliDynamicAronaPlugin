@@ -1,6 +1,6 @@
 [package]
 name = "bilibili-dynamic-arona-plugin"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "B 站动态/直播订阅推送插件：插入 Arona-rs 框架运行，命令与配置不依赖任何前置插件"
@@ -35,7 +35,7 @@ percent-encoding = "2"
 md5 = "0.7"
 # 动态链接二维码：只要点阵，画成像素由本插件的 draw::qr 负责
 qrcode = { version = "0.14", default-features = false }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # 字形栅格化不在这里：字面那一层（ab_glyph + 有界字形缓存）收在框架的 arona::runtime::text，
 # 三个出图插件共用那一份实现，见 PLUGIN_DEVELOPMENT.md §7
 rand = "0.8"
