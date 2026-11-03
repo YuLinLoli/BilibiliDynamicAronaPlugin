@@ -73,40 +73,20 @@ jobs:
           ref: ${{ vars.ARONA_REF || 'main' }}
           path: Arona-rs
 
-      # Linux 腿有两项外部前提，都由 runner 现装；Windows 腿两项都不需要
-      # （MSVC 工具链自带，系统里本来就有 SimHei/微软雅黑）。
-      #
-      # ① C 编译器：arona 依赖的 rusqlite 开了 `bundled`，会把 sqlite3.c 现场编出来。
-      # ② 中文字体：出图插件的用例要真画汉字，而**裸 runner 一份 CJK 字都没有**——
-      #    缺了会以「找不到中文字体：安装目录的 fonts/ 里没有字体文件」当场 panic
-      #    （bilibili 33 条、petpet 2 条）。装 fonts-noto-cjk 后正好命中框架
-      #    arona::runtime::text::CANDIDATES 的第一条系统候选
-      #    /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc；同一个包里还带
-      #    NotoSansCJK-Bold.ttc，粗体那一档用例才有真粗体面可走（否则只能走叠画兜底）。
-      #
-      # 两项都在缺失时才装：镜像一旦自带就跳过 apt，省掉一次 update 的等待与抖动。
+      # Linux 腿的一项外部前提，由 runner 现装；Windows 腿不需要（MSVC 工具链自带）。
+      # C 编译器：arona 依赖的 rusqlite 开了 `bundled`，会把 sqlite3.c 现场编出来。
+      # （中文字体原本也在这里装——那是给云端测试用的；测试已全部移到本地 CI
+      #   scripts/local-ci.sh，云端只构建发版，这一步不再需要字体。）
       - name: Prepare Linux build prerequisites
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          need=0
-          command -v cc >/dev/null 2>&1 || need=1
-          [ -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc ] || need=1
-          if [ "$need" -eq 1 ]; then
+          if ! command -v cc >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y build-essential pkg-config fonts-noto-cjk
+            sudo apt-get install -y build-essential pkg-config
           fi
           cc --version | head -1
-          # 字体这一条要真的点名核对：装没装上直接决定那批出图用例是过还是 panic，
-          # 与其在 Test 步里看 33 条一样的 panic，不如在这里一次说清
-          if [ ! -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc ]; then
-            echo "::error::中文字体没到位，出图用例会以「找不到中文字体」失败"
-            find /usr/share/fonts -name 'NotoSansCJK*' -o -name '*wqy*' | head -20
-            exit 1
-          fi
-          ls -l /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
-                /usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc
 
       # Linux 交付件要按 **glibc 2.17 基线**链接：插件是 .so，宿主的 glibc 低于链接基线
       # 会直接拒绝装载。2.17 是 CentOS 7 / Ubuntu 16.04 时代的水位，钉在这儿意味着之后
@@ -163,11 +143,6 @@ jobs:
           }
           Write-Host "版本校验通过: $($pkg.name) $($pkg.version)"
 
-      # 离线单测。各仓联网冒烟用例都带 #[ignore]，不会在这里跑。
-      # 这里刻意不带 --target：用例跑在构建机自己的目标上最快，也没有"给老系统也能跑"
-      # 的诉求——基线只对交付的 .so 有意义。
-      - name: Test
-        run: cargo test --release
 
       # Windows：普通 release 构建
       - name: Build (Windows)
