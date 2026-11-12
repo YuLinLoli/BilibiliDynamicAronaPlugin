@@ -643,69 +643,112 @@ pub fn parse_nodes(dynamic: &Value) -> Vec<Node> {
         .collect()
 }
 
-/// 附加小卡。B 站按 `additional[].type` 给了七八种，字段名各不一样，
-/// 这里只取每种都存在的四格（标题/封面/跳转/一行说明），画成同一种小卡。
+/// 附加小卡。B 站给预约/投票/商品这类内容时 `additional` 有**两种形态**：
+/// - 数组（旧版接口）：`additional[]`，每项 `{type, item}`
+/// - 单对象（polymer web-dynamic，2026-11-12 实测）：`additional = {type, reserve: {…}}`
+///
+/// 之前只认数组——`as_array()` 对对象返回空，直播预约的整块信息（预约名/开播时间/
+/// 人数）因此三版全漏，卡片只剩 desc 里那句引导语。现在两种都吃，每项画同一种小卡。
 pub fn parse_additional(dynamic: &Value) -> Vec<Attached> {
-    let Some(items) = at(dynamic, &["additional"]).and_then(Value::as_array) else {
+    let Some(additional) = at(dynamic, &["additional"]) else {
         return Vec::new();
     };
-    items
+    let mut entries: Vec<&Value> = Vec::new();
+    if let Some(list) = additional.as_array() {
+        entries.extend(list.iter());
+    } else if additional.is_object() {
+        entries.push(additional);
+    }
+    entries
         .iter()
-        .filter_map(|entry| {
-            let type_str = text(entry, &["type"]).unwrap_or_default();
-            let head = match type_str.strip_prefix("ADDITIONAL_TYPE_")? {
-                "RESERVE" => "预约",
-                "VOTE" => "投票",
-                "GOODS" => "商品",
-                "UPOWER_LOTTERY" => "充电抽奖",
-                "UGC_SEASON" => "合集",
-                _ => "活动",
-            };
-            let item = entry.get("item")?;
-            let pick = |keys: &[&str]| text(item, keys);
-            // 投票和抽奖把内容挂在各自的子对象下，通用四格取不到再往那一层找一次
-            let nested = at(item, &["vote"])
-                .or_else(|| at(item, &["lottery"]))
-                .or_else(|| at(item, &["premiere"]))
-                .or_else(|| {
-                    item.get("items")
-                        .and_then(Value::as_array)
-                        .and_then(|list| list.first())
-                });
-            let title = pick(&["title"])
-                .or_else(|| pick(&["desc1"]))
-                .or_else(|| nested.and_then(|inner| text(inner, &["desc"])))
-                .or_else(|| nested.and_then(|inner| text(inner, &["title"])))
-                .unwrap_or_default();
-            // desc1/desc2 在 COMMON 下是裸字符串，在 RESERVE 下是 {text:…}，两种写法都认
-            let desc = ["desc2", "desc3"]
-                .iter()
-                .find_map(|key| pick(&[*key]).or_else(|| pick(&[*key, "text"])))
-                .or_else(|| pick(&["desc1", "text"]))
-                .or_else(|| nested.and_then(|inner| text(inner, &["desc", "text"])))
-                .or_else(|| {
-                    nested
-                        .and_then(|inner| text(inner, &["end_time"]))
-                        .map(|end| format!("结束时间 {end}"))
-                })
-                .unwrap_or_default();
-            let cover = pick(&["cover"])
-                .or_else(|| nested.and_then(|inner| text(inner, &["cover"])))
-                .unwrap_or_default();
-            if title.is_empty() && cover.is_empty() {
-                return None;
-            }
-            Some(Attached {
-                kind: head.to_string(),
-                desc,
-                title,
-                cover,
-                badge: pick(&["badge", "text"]).unwrap_or_default(),
-                url: pick(&["jump_url"]).unwrap_or_default(),
-                ..Default::default()
-            })
-        })
+        .filter_map(|entry| parse_one_additional(entry))
         .collect()
+}
+
+/// 单个附加项 → 附属卡。数组形态的载荷在 `item`；对象形态在同名子对象
+/// （`reserve`/`vote`/…）里，字段名各不一样，这里只取每种都存在的四格
+/// （标题/封面/跳转/一行说明）。
+fn parse_one_additional(entry: &Value) -> Option<Attached> {
+    let type_str = text(entry, &["type"]).unwrap_or_default();
+    let head = match type_str.strip_prefix("ADDITIONAL_TYPE_")? {
+        "RESERVE" => "直播订阅",
+        "VOTE" => "投票",
+        "GOODS" => "商品",
+        "UPOWER_LOTTERY" => "充电抽奖",
+        "UGC_SEASON" => "合集",
+        _ => "活动",
+    };
+    let item = entry.get("item").or_else(|| {
+        [
+            "reserve",
+            "vote",
+            "goods",
+            "lottery",
+            "premiere",
+            "ugc_season",
+        ]
+        .iter()
+        .find_map(|key| entry.get(key))
+    })?;
+    let pick = |keys: &[&str]| text(item, keys);
+    // 投票和抽奖把内容挂在各自的子对象下，通用四格取不到再往那一层找一次
+    let nested = at(item, &["vote"])
+        .or_else(|| at(item, &["lottery"]))
+        .or_else(|| at(item, &["premiere"]))
+        .or_else(|| {
+            item.get("items")
+                .and_then(Value::as_array)
+                .and_then(|list| list.first())
+        });
+    let title = pick(&["title"])
+        .or_else(|| pick(&["desc1"]))
+        .or_else(|| nested.and_then(|inner| text(inner, &["desc"])))
+        .or_else(|| nested.and_then(|inner| text(inner, &["title"])))
+        .unwrap_or_default();
+    // 直播预约是两行合成：desc1（开播时间）+ desc2（人数），对应 B 站原版式
+    // 「今天 18:30 直播  83人预约」；其余类型照旧走通用链（desc1/desc2/desc3
+    // 在 COMMON 下是裸字符串，在 RESERVE 下是 {text:…}，两种写法都认）
+    let desc = if type_str.ends_with("RESERVE") {
+        let first = pick(&["desc1"])
+            .or_else(|| pick(&["desc1", "text"]))
+            .unwrap_or_default();
+        let second = pick(&["desc2"])
+            .or_else(|| pick(&["desc2", "text"]))
+            .unwrap_or_default();
+        [first.trim(), second.trim()]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("  ")
+    } else {
+        ["desc2", "desc3"]
+            .iter()
+            .find_map(|key| pick(&[*key]).or_else(|| pick(&[*key, "text"])))
+            .or_else(|| pick(&["desc1", "text"]))
+            .or_else(|| nested.and_then(|inner| text(inner, &["desc", "text"])))
+            .or_else(|| {
+                nested
+                    .and_then(|inner| text(inner, &["end_time"]))
+                    .map(|end| format!("结束时间 {end}"))
+            })
+            .unwrap_or_default()
+    };
+    let cover = pick(&["cover"])
+        .or_else(|| nested.and_then(|inner| text(inner, &["cover"])))
+        .unwrap_or_default();
+    if title.is_empty() && cover.is_empty() {
+        return None;
+    }
+    Some(Attached {
+        kind: head.to_string(),
+        desc,
+        title,
+        cover,
+        badge: head.to_string(),
+        url: pick(&["jump_url"]).unwrap_or_default(),
+        ..Default::default()
+    })
 }
 
 /// 图片段：DRAW 走 items[].src，OPUS 走 pics[].url（新版）或 pics[].src（旧版）。
@@ -1205,24 +1248,25 @@ mod tests {
         );
     }
 
-    /// 直播预约动态：desc 只有引导语「点击预约按钮，不错过直播」，有效信息在
-    /// `major.live_rcmd.rcmd_style`——按用户定稿画成正文下的附属小卡（角标
-    /// 「直播订阅」），不进正文。
+    /// 直播预约（**对象形态**，2026-11-12 真实 detail 抓包）：additional 是单对象
+    /// `{type: ADDITIONAL_TYPE_RESERVE, reserve: {…}}`，desc 只有引导语。
+    /// 修复前 `as_array()` 对对象返回空，预约信息三版全漏。
     #[test]
-    fn live_reservation_becomes_an_attached_card() {
+    fn live_reservation_object_form_becomes_a_card() {
         let mut item = draw_item();
         item["modules"]["module_dynamic"]["desc"] = json!({"text": "点击预约按钮，不错过直播"});
-        item["modules"]["module_dynamic"]["major"] = json!({
-            "type": "MAJOR_TYPE_LIVE_RCMD",
-            "live_rcmd": {
-                "rcmd_style": {
-                    "type": 1,
-                    "title": "直播预约：千态杯第一天八强淘汰赛！",
-                    "desc_first": "今天 18:30 直播",
-                    "desc_second": "60人预约",
-                    "h5_url": "https://live.bilibili.com/h5/123"
-                }
-            }
+        item["modules"]["module_dynamic"]["additional"] = json!({
+            "reserve": {
+                "button": {"status": 1, "type": 2, "uncheck": {"text": "预约"}},
+                "desc1": {"style": 0, "text": "今天 18:30 直播"},
+                "desc2": {"style": 0, "text": "83人预约", "visible": true},
+                "reserve_total": 83,
+                "rid": 5873407,
+                "stype": 2,
+                "title": "直播预约：千恋杯第一天八强淘汰赛！",
+                "up_mid": 49533273
+            },
+            "type": "ADDITIONAL_TYPE_RESERVE"
         });
         let parsed = parse_item(&item).unwrap();
         // 正文保持 B 站原样那句引导语
@@ -1230,13 +1274,62 @@ mod tests {
         let card = parsed.extra.first().expect("预约小卡应在 extra 里");
         assert_eq!(card.kind, "直播订阅");
         assert!(
-            card.title.contains("千态杯第一天八强淘汰赛"),
+            card.title.contains("千恋杯第一天八强淘汰赛"),
             "预约名丢了：{:?}",
             card
         );
         assert!(card.desc.contains("18:30"), "开播时间丢了：{:?}", card);
-        assert!(card.desc.contains("60人预约"), "预约人数丢了：{:?}", card);
-        assert_eq!(card.url, "https://live.bilibili.com/h5/123");
+        assert!(card.desc.contains("83人预约"), "预约人数丢了：{:?}", card);
+    }
+
+    /// 旧版**数组形态**（每项 `{type, item}`）不能因为支持对象形态而回归。
+    #[test]
+    fn additional_array_form_still_parses() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["additional"] = json!([
+            {
+                "type": "ADDITIONAL_TYPE_RESERVE",
+                "item": {
+                    "title": "直播预约：千恋杯第一天八强淘汰赛！",
+                    "desc1": {"text": "今天 18:30 直播"},
+                    "desc2": {"text": "60人预约"}
+                }
+            }
+        ]);
+        let parsed = parse_item(&item).unwrap();
+        let card = parsed.extra.first().expect("数组形态的预约卡应在 extra 里");
+        assert_eq!(card.kind, "直播订阅");
+        assert!(card.title.contains("千恋杯"), "{:?}", card);
+        assert!(
+            card.desc.contains("18:30") && card.desc.contains("60人预约"),
+            "{:?}",
+            card
+        );
+    }
+
+    /// 直播预约以 major.live_rcmd.rcmd_style 形态出现时（另一路 API）同样进 extra。
+    #[test]
+    fn live_rcmd_style_form_still_becomes_a_card() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["desc"] = json!({"text": "点击预约按钮，不错过直播"});
+        item["modules"]["module_dynamic"]["major"] = json!({
+            "type": "MAJOR_TYPE_LIVE_RCMD",
+            "live_rcmd": {
+                "rcmd_style": {
+                    "type": 1,
+                    "title": "直播预约：千恋杯第一天八强淘汰赛！",
+                    "desc_first": "今天 18:30 直播",
+                    "desc_second": "60人预约",
+                    "h5_url": "https://live.bilibili.com/h5/123"
+                }
+            }
+        });
+        let parsed = parse_item(&item).unwrap();
+        assert_eq!(parsed.text, "点击预约按钮，不错过直播");
+        let card = parsed.extra.first().expect("预约小卡应在 extra 里");
+        assert_eq!(card.kind, "直播订阅");
+        assert!(card.title.contains("千恋杯第一天八强淘汰赛"), "{:?}", card);
+        assert!(card.desc.contains("18:30"), "{:?}", card);
     }
 
     /// 专栏要落成一张附属卡 + 卡上方那一格「专栏」，封面不许再往正文里塞一份。

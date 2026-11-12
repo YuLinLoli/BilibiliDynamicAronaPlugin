@@ -1400,3 +1400,78 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod live_reserve_diag {
+    use super::*;
+
+    /// 诊断「直播预约」动态在 detail 与 space feed 两种形态下的真实结构（2026-11-12
+    /// 用户报 0.1.10 的 /bili new 仍只画引导语）。落盘原始 JSON + 打印当前解析产物。
+    #[test]
+    #[ignore = "要联网访问 B 站"]
+    fn dump_live_reserve_shapes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let bili = Bili::new(AccountConfig::default(), 20);
+            let did = 1269704942488125441i64;
+            let data = bili
+                .call(
+                    DYNAMIC_DETAIL,
+                    &[
+                        ("timezone_offset", "-480"),
+                        ("id", &did.to_string()),
+                        ("features", "itemOpusStyle"),
+                    ],
+                    "https://t.bilibili.com/",
+                )
+                .await
+                .expect("detail 匿名可拉");
+            let out = std::env::temp_dir().join("bili-live-reserve-detail.json");
+            std::fs::write(&out, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+            println!("detail 原始 JSON -> {}", out.display());
+
+            let mid = data
+                .get("item")
+                .and_then(|item| item.get("modules"))
+                .and_then(|m| m.get("module_author"))
+                .and_then(|a| a.get("mid"))
+                .and_then(|v| v.as_i64())
+                .expect("detail 里应带作者 mid");
+            println!("作者 mid: {mid}");
+
+            let feed = bili.space(mid, "").await.expect("space feed 匿名可拉");
+            println!("feed 条数: {}", feed.len());
+            // feed 里这条：按 id 找；feed 的 Dynamic 是解析产物，直接打它的 text/extra
+            for item in &feed {
+                if item.id == did {
+                    println!(
+                        "feed 解析产物: text={:?} extra={} 张",
+                        item.text,
+                        item.extra.len()
+                    );
+                    for card in &item.extra {
+                        println!(
+                            "  卡: kind={:?} title={:?} desc={:?}",
+                            card.kind, card.title, card.desc
+                        );
+                    }
+                }
+            }
+
+            let parsed = crate::bili::model::parse_item(&data);
+            if let Some(parsed) = parsed {
+                println!(
+                    "detail 解析产物: text={:?} extra={} 张",
+                    parsed.text,
+                    parsed.extra.len()
+                );
+                for card in &parsed.extra {
+                    println!(
+                        "  卡: kind={:?} title={:?} desc={:?}",
+                        card.kind, card.title, card.desc
+                    );
+                }
+            }
+        });
+    }
+}
