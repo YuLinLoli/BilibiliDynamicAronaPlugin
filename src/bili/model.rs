@@ -386,6 +386,28 @@ fn opus_body(major: &Value) -> Option<String> {
     join_heading(&title, &summary)
 }
 
+/// 直播预约动态（用户点「预约」挂出来的那种）的正文。
+///
+/// 结构在 `major.live_rcmd.rcmd_style`：`title` 是预约名（B 站常带「直播预约：」前缀），
+/// `desc_first`/`desc_second` 是开播时间与预约人数。而 `desc.text` 只有「点击预约按钮，
+/// 不错过直播」这种引导语——不专门取预约模块，卡片上有效信息就全丢了（用户实测）。
+///
+/// 注意别和**开播的直播卡片**混了：那条路是 `live_rcmd.content`（字符串化 JSON，
+/// 里面有 `live_play_info`），走本文件下方的 LIVE 解析；预约是 `rcmd_style` 这条。
+fn live_reserve_body(major: &Value) -> Option<String> {
+    let style = at(major, &["live_rcmd", "rcmd_style"])?;
+    let title = text(style, &["title"]).unwrap_or_default();
+    let first = text(style, &["desc_first"]).unwrap_or_default();
+    let second = text(style, &["desc_second"]).unwrap_or_default();
+    let desc = [first.trim(), second.trim()]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("，");
+    join_heading(&title, &desc)
+}
+
 /// 标题 + 正文拼成一段。
 ///
 /// 重复时不写两遍：B 站经常让 `summary.text` 以标题开头（甚至整段等于标题），
@@ -413,11 +435,13 @@ fn join_heading(title: &str, body: &str) -> Option<String> {
 fn body_text(dynamic: &Value, major: &Value, nodes: &[Node]) -> String {
     let desc = text(dynamic, &["desc", "text"]).unwrap_or_default();
     let opus = opus_body(major).unwrap_or_default();
-    let picked = if opus.chars().count() >= desc.chars().count() {
-        opus
-    } else {
-        desc
-    };
+    let live_reserve = live_reserve_body(major).unwrap_or_default();
+    // 三源取长：预约动态的 desc 只有引导语，有效信息在 rcmd_style 里；其余情形
+    // 与旧的 desc/opus 取长一致——谁的信息量大听谁的
+    let picked = [desc, opus, live_reserve]
+        .into_iter()
+        .max_by_key(|candidate| candidate.chars().count())
+        .unwrap_or_default();
     if !picked.trim().is_empty() {
         return picked;
     }
@@ -1164,6 +1188,47 @@ mod tests {
         assert!(
             parsed.text.contains("老师，我们整理了几点说明"),
             "正文被 desc 里那行标题顶掉了：{}",
+            parsed.text
+        );
+    }
+
+    /// 直播预约动态：desc 只有引导语「点击预约按钮，不错过直播」，有效信息全在
+    /// `major.live_rcmd.rcmd_style`（预约名 + 开播时间 + 预约人数）。用户实测的
+    /// 卡片丢了整块预约信息，只剩引导语。
+    #[test]
+    fn live_reservation_info_is_not_dropped() {
+        let mut item = draw_item();
+        item["modules"]["module_dynamic"]["desc"] = json!({"text": "点击预约按钮，不错过直播"});
+        item["modules"]["module_dynamic"]["major"] = json!({
+            "type": "MAJOR_TYPE_LIVE_RCMD",
+            "live_rcmd": {
+                "rcmd_style": {
+                    "type": 1,
+                    "title": "直播预约：千态杯第一天八强淘汰赛！",
+                    "desc_first": "今天 18:30 直播",
+                    "desc_second": "60人预约"
+                }
+            }
+        });
+        let parsed = parse_item(&item).unwrap();
+        assert!(
+            parsed.text.contains("千态杯第一天八强淘汰赛"),
+            "预约名丢了：{}",
+            parsed.text
+        );
+        assert!(
+            parsed.text.contains("18:30"),
+            "开播时间丢了：{}",
+            parsed.text
+        );
+        assert!(
+            parsed.text.contains("60人预约"),
+            "预约人数丢了：{}",
+            parsed.text
+        );
+        assert!(
+            !parsed.text.contains("点击预约按钮"),
+            "不该只剩引导语：{}",
             parsed.text
         );
     }
