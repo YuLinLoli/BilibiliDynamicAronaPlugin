@@ -386,17 +386,21 @@ fn opus_body(major: &Value) -> Option<String> {
     join_heading(&title, &summary)
 }
 
-/// 直播预约动态（用户点「预约」挂出来的那种）的正文。
+/// 直播预约动态（用户点「预约」挂出来的那种）的附属卡。
 ///
 /// 结构在 `major.live_rcmd.rcmd_style`：`title` 是预约名（B 站常带「直播预约：」前缀），
 /// `desc_first`/`desc_second` 是开播时间与预约人数。而 `desc.text` 只有「点击预约按钮，
-/// 不错过直播」这种引导语——不专门取预约模块，卡片上有效信息就全丢了（用户实测）。
+/// 不错过直播」这种引导语——预约信息要走**附属卡**画在正文下面（用户定稿的样式，
+/// 角标「直播订阅」，与投稿视频那一档同一套框），不进正文。
 ///
 /// 注意别和**开播的直播卡片**混了：那条路是 `live_rcmd.content`（字符串化 JSON，
 /// 里面有 `live_play_info`），走本文件下方的 LIVE 解析；预约是 `rcmd_style` 这条。
-fn live_reserve_body(major: &Value) -> Option<String> {
+fn live_reserve_card(major: &Value) -> Option<Attached> {
     let style = at(major, &["live_rcmd", "rcmd_style"])?;
     let title = text(style, &["title"]).unwrap_or_default();
+    if title.is_empty() {
+        return None;
+    }
     let first = text(style, &["desc_first"]).unwrap_or_default();
     let second = text(style, &["desc_second"]).unwrap_or_default();
     let desc = [first.trim(), second.trim()]
@@ -404,8 +408,14 @@ fn live_reserve_body(major: &Value) -> Option<String> {
         .filter(|part| !part.is_empty())
         .copied()
         .collect::<Vec<_>>()
-        .join("，");
-    join_heading(&title, &desc)
+        .join("  ");
+    Some(Attached {
+        kind: "直播订阅".to_string(),
+        title,
+        desc,
+        url: text(style, &["h5_url"]).unwrap_or_default(),
+        ..Default::default()
+    })
 }
 
 /// 标题 + 正文拼成一段。
@@ -435,13 +445,11 @@ fn join_heading(title: &str, body: &str) -> Option<String> {
 fn body_text(dynamic: &Value, major: &Value, nodes: &[Node]) -> String {
     let desc = text(dynamic, &["desc", "text"]).unwrap_or_default();
     let opus = opus_body(major).unwrap_or_default();
-    let live_reserve = live_reserve_body(major).unwrap_or_default();
-    // 三源取长：预约动态的 desc 只有引导语，有效信息在 rcmd_style 里；其余情形
-    // 与旧的 desc/opus 取长一致——谁的信息量大听谁的
-    let picked = [desc, opus, live_reserve]
-        .into_iter()
-        .max_by_key(|candidate| candidate.chars().count())
-        .unwrap_or_default();
+    let picked = if opus.chars().count() >= desc.chars().count() {
+        opus
+    } else {
+        desc
+    };
     if !picked.trim().is_empty() {
         return picked;
     }
@@ -741,7 +749,12 @@ pub fn parse_item(item: &Value) -> Option<Dynamic> {
 
     let origin = item.get("orig").and_then(parse_item).map(Box::new);
     let nodes = parse_nodes(dynamic);
-    let extra = parse_additional(dynamic);
+    let mut extra = parse_additional(dynamic);
+    // 直播预约不走 additional，藏在 major.live_rcmd.rcmd_style 里——同样画成
+    // 正文下面的小卡，角标「直播订阅」（用户定稿）
+    if let Some(card) = live_reserve_card(&major) {
+        extra.push(card);
+    }
     let body = body_text(dynamic, &major, &nodes);
     let label = text(author, &["label"]).unwrap_or_default();
     // 内容看不到时 B 站只给一句话：屏蔽挂在 blocked.hint_text，已删除挂在 none.tips
@@ -1192,11 +1205,11 @@ mod tests {
         );
     }
 
-    /// 直播预约动态：desc 只有引导语「点击预约按钮，不错过直播」，有效信息全在
-    /// `major.live_rcmd.rcmd_style`（预约名 + 开播时间 + 预约人数）。用户实测的
-    /// 卡片丢了整块预约信息，只剩引导语。
+    /// 直播预约动态：desc 只有引导语「点击预约按钮，不错过直播」，有效信息在
+    /// `major.live_rcmd.rcmd_style`——按用户定稿画成正文下的附属小卡（角标
+    /// 「直播订阅」），不进正文。
     #[test]
-    fn live_reservation_info_is_not_dropped() {
+    fn live_reservation_becomes_an_attached_card() {
         let mut item = draw_item();
         item["modules"]["module_dynamic"]["desc"] = json!({"text": "点击预约按钮，不错过直播"});
         item["modules"]["module_dynamic"]["major"] = json!({
@@ -1206,31 +1219,24 @@ mod tests {
                     "type": 1,
                     "title": "直播预约：千态杯第一天八强淘汰赛！",
                     "desc_first": "今天 18:30 直播",
-                    "desc_second": "60人预约"
+                    "desc_second": "60人预约",
+                    "h5_url": "https://live.bilibili.com/h5/123"
                 }
             }
         });
         let parsed = parse_item(&item).unwrap();
+        // 正文保持 B 站原样那句引导语
+        assert_eq!(parsed.text, "点击预约按钮，不错过直播");
+        let card = parsed.extra.first().expect("预约小卡应在 extra 里");
+        assert_eq!(card.kind, "直播订阅");
         assert!(
-            parsed.text.contains("千态杯第一天八强淘汰赛"),
-            "预约名丢了：{}",
-            parsed.text
+            card.title.contains("千态杯第一天八强淘汰赛"),
+            "预约名丢了：{:?}",
+            card
         );
-        assert!(
-            parsed.text.contains("18:30"),
-            "开播时间丢了：{}",
-            parsed.text
-        );
-        assert!(
-            parsed.text.contains("60人预约"),
-            "预约人数丢了：{}",
-            parsed.text
-        );
-        assert!(
-            !parsed.text.contains("点击预约按钮"),
-            "不该只剩引导语：{}",
-            parsed.text
-        );
+        assert!(card.desc.contains("18:30"), "开播时间丢了：{:?}", card);
+        assert!(card.desc.contains("60人预约"), "预约人数丢了：{:?}", card);
+        assert_eq!(card.url, "https://live.bilibili.com/h5/123");
     }
 
     /// 专栏要落成一张附属卡 + 卡上方那一格「专栏」，封面不许再往正文里塞一份。

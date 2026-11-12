@@ -2664,6 +2664,17 @@ mod tests {
             badge: "专栏".to_string(),
         });
 
+        // 直播预约那条（用户实测 y千代 2026-11-12）：正文引导语 + rcmd_style 小卡
+        let mut reserve = sample("点击预约按钮，不错过直播");
+        reserve.images = Vec::new();
+        reserve.extra.push(Attached {
+            kind: "直播订阅".to_string(),
+            title: "直播预约：千态杯第一天八强淘汰赛！".to_string(),
+            desc: "今天 18:30 直播  60人预约".to_string(),
+            url: "https://live.bilibili.com/h5/123".to_string(),
+            ..Default::default()
+        });
+
         let out = std::env::temp_dir().join("arona-bili-cards");
         std::fs::create_dir_all(&out).unwrap();
         for (name, item) in [
@@ -2673,6 +2684,7 @@ mod tests {
             ("deco", &deco),
             ("article", &article),
             ("trio", &trio),
+            ("reserve", &reserve),
         ] {
             let file = out.join(format!("{name}.png"));
             std::fs::write(&file, dynamic_card(item, &art, &style, None)).unwrap();
