@@ -22,6 +22,7 @@ use super::canvas::{Canvas, Color};
 
 /// B 站表情的写法是 `[名字]`，名字没有超过这个长度的
 const EMOJI_MAX_LEN: usize = 16;
+const ZERO_WIDTH_SPACE: char = '\u{200b}';
 
 /// 卡片要的那一档字面：常规 + 可选粗体，实现全在框架的 [`arona::runtime::text::Typeface`]，
 /// 这一层只是把本插件的排版方法挂上去（`Style.face` 与各处调用都认这个类型）。
@@ -101,7 +102,8 @@ impl Typeface {
     }
 
     fn width_of(&self, text: &str, px: f32, bold: bool) -> f32 {
-        self.face(bold).text_width(text, px)
+        let face = self.face(bold);
+        glyph_chars(text).map(|ch| face.advance(ch, px)).sum()
     }
 
     /// 一行文字的宽度（表情按一个方块算）
@@ -122,7 +124,7 @@ impl Typeface {
         let reserve = face.advance('…', px);
         let mut out = String::new();
         let mut used = 0.0f32;
-        for ch in flat.chars() {
+        for ch in glyph_chars(&flat) {
             let width = face.advance(ch, px);
             if used + width + reserve > max_width {
                 break;
@@ -280,7 +282,7 @@ impl Unit {
         match &self.emoji {
             // 有图就按正方形一格占位，跟 draw 里贴图的口径一致
             Some(name) if emojis.contains(name) => px,
-            _ => self.text.chars().map(|ch| face.advance(ch, px)).sum(),
+            _ => glyph_chars(&self.text).map(|ch| face.advance(ch, px)).sum(),
         }
     }
 }
@@ -322,7 +324,10 @@ fn units(text: &str) -> Vec<Unit> {
         if !chunk.is_empty() {
             out.push(word(std::mem::take(&mut chunk)));
         }
-        out.push(word(ch.to_string()));
+        // 零宽空格可以断词，但不占宽度，也不送进字体的缺字回退。
+        if ch != ZERO_WIDTH_SPACE {
+            out.push(word(ch.to_string()));
+        }
         index += 1;
     }
     if !chunk.is_empty() {
@@ -466,6 +471,10 @@ fn trim_tail(row: &mut Vec<Token>) {
     }
 }
 
+fn glyph_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars().filter(|&ch| ch != ZERO_WIDTH_SPACE)
+}
+
 /// 字形按覆盖度混进画布
 fn glyphs(
     canvas: &mut Canvas,
@@ -477,7 +486,7 @@ fn glyphs(
     color: Color,
 ) {
     let mut pen = x;
-    for ch in text.chars() {
+    for ch in glyph_chars(text) {
         let (metrics, coverage) = face.rasterize(ch, px);
         let left = pen.round() as i32 + metrics.xmin;
         // fontdue 给的位图顶边在基线上方 ymax 处，而 Metrics 只有 ymin 与 height，
@@ -557,6 +566,28 @@ mod tests {
         let parts = units("hello 你好[笑]");
         let texts: Vec<&str> = parts.iter().map(|unit| unit.text.as_str()).collect();
         assert_eq!(texts, vec!["hello", " ", "你", "好", "[笑]"]);
+    }
+
+    #[test]
+    fn zero_width_space_does_not_add_a_token_or_glyph() {
+        let face = Typeface::discover("").unwrap();
+        let color = Color::rgb(0x22, 0x22, 0x22);
+        let background = Color::rgb(0xff, 0xff, 0xff);
+        let tag = "#蔚蓝档案#";
+        let raw = "#蔚蓝档案#\u{200b}";
+        let emojis = EmojiSet::default();
+        let width = face.measure(tag, 32.0, false, &emojis);
+        let flow = face.layout(&[Span::new(raw, color)], 32.0, false, width, None, &emojis);
+        assert_eq!(flow.rows(), 1);
+        assert_eq!(flow.rows[0].len(), tag.chars().count());
+        assert_eq!(face.measure(raw, 32.0, false, &emojis), width);
+        assert_eq!(face.truncate(raw, 32.0, false, width), raw);
+
+        let mut actual = Canvas::new(300, 50, background);
+        let mut expected = Canvas::new(300, 50, background);
+        face.draw_line(&mut actual, 8.0, 36.0, raw, 32.0, color, false);
+        face.draw_line(&mut expected, 8.0, 36.0, tag, 32.0, color, false);
+        assert!(actual.to_png() == expected.to_png());
     }
 
     #[test]
